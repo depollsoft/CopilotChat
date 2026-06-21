@@ -1,0 +1,88 @@
+import "dotenv/config";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { z } from "zod";
+
+const envBooleanSchema = z.preprocess((value) => {
+  if (value === undefined || value === "") return undefined;
+  if (typeof value !== "string") return value;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return value;
+}, z.boolean().default(true));
+
+const configSchema = z.object({
+  host: z.string().default("127.0.0.1"),
+  port: z.coerce.number().int().min(1).max(65535).default(4317),
+  dataDir: z.string().default(".data"),
+  workspaceRoot: z.string(),
+  bodyLimitBytes: z.coerce.number().int().min(1).default(50 * 1024 * 1024),
+  authMode: z.enum(["local", "github"]).default("local"),
+  apiToken: z.string().optional(),
+  githubClientId: z.string().optional(),
+  githubClientSecret: z.string().optional(),
+  sessionSecret: z.string().optional(),
+  publicUrl: z.string().url().optional(),
+  copilotProvider: z.enum(["auto", "sdk", "http", "cli", "echo"]).default("auto"),
+  copilotApiBaseUrl: z.string().optional(),
+  copilotApiToken: z.string().optional(),
+  copilotModel: z.string().default("gpt-4.1"),
+  copilotCliCommand: z.string().optional(),
+  copilotSdkCliPath: z.string().optional(),
+  copilotGitHubToken: z.string().optional(),
+  copilotGitHubTokenSource: z.string().optional(),
+  allowedOrigins: z.array(z.string()).default([]),
+  requireCsrf: envBooleanSchema,
+});
+export type AppConfig = z.infer<typeof configSchema>;
+export function loadConfig(): AppConfig {
+  const dataDir = path.resolve(process.env.COPILOTCHAT_DATA_DIR ?? ".data");
+  return configSchema.parse({
+    host: process.env.COPILOTCHAT_HOST,
+    port: process.env.COPILOTCHAT_PORT,
+    dataDir,
+    workspaceRoot: path.resolve(process.env.COPILOTCHAT_WORKSPACE_ROOT || path.join(dataDir, "registered-workspaces")),
+    bodyLimitBytes: process.env.COPILOTCHAT_BODY_LIMIT_BYTES,
+    authMode: process.env.COPILOTCHAT_AUTH_MODE,
+    apiToken: process.env.COPILOTCHAT_API_TOKEN,
+    githubClientId: process.env.GITHUB_CLIENT_ID,
+    githubClientSecret: process.env.GITHUB_CLIENT_SECRET,
+    sessionSecret: process.env.COPILOTCHAT_SESSION_SECRET,
+    publicUrl: process.env.COPILOTCHAT_PUBLIC_URL,
+    copilotProvider: process.env.COPILOT_PROVIDER,
+    copilotApiBaseUrl: process.env.COPILOT_API_BASE_URL,
+    copilotApiToken: process.env.COPILOT_API_TOKEN,
+    copilotModel: process.env.COPILOT_MODEL,
+    copilotCliCommand: process.env.COPILOT_CLI_COMMAND,
+    copilotSdkCliPath: resolveCopilotCliPath(),
+    copilotGitHubToken: process.env.COPILOT_GITHUB_TOKEN ?? process.env.GITHUB_COPILOT_TOKEN ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN,
+    copilotGitHubTokenSource: process.env.COPILOT_GITHUB_TOKEN ? "COPILOT_GITHUB_TOKEN" : process.env.GITHUB_COPILOT_TOKEN ? "GITHUB_COPILOT_TOKEN" : process.env.GH_TOKEN ? "GH_TOKEN" : process.env.GITHUB_TOKEN ? "GITHUB_TOKEN" : undefined,
+    allowedOrigins: (process.env.COPILOTCHAT_ALLOWED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
+    requireCsrf: process.env.COPILOTCHAT_REQUIRE_CSRF,
+  });
+}
+
+function resolveCopilotCliPath(): string | undefined {
+  const explicit = process.env.COPILOTCHAT_COPILOT_CLI_PATH ?? process.env.COPILOT_CLI_PATH;
+  if (explicit) return explicit;
+  return findExecutableOnPath("copilot");
+}
+
+function findExecutableOnPath(command: string): string | undefined {
+  const paths = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
+  const extensions = os.platform() === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT").split(";") : [""];
+  for (const entry of paths) {
+    for (const extension of extensions) {
+      const candidate = path.join(entry, `${command}${extension.toLowerCase()}`);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+  }
+  return undefined;
+}
