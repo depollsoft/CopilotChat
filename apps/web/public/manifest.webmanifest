@@ -1,0 +1,1 @@
+{"name":"CopilotChat","short_name":"CopilotChat","description":"A local-first GitHub Copilot chat, projects, skills, MCP, and cowork workspace app.","start_url":"/","display":"standalone","background_color":"#fbfaf7","theme_color":"#fbfaf7","icons":[{"src":"/icons/icon.svg","sizes":"any","type":"image/svg+xml","purpose":"any maskable"}]}
