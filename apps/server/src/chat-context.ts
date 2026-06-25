@@ -1,6 +1,7 @@
 import type { ProviderChatRequest, ProviderMessage, ProviderTitleTool } from "@copilotchat/provider";
 import type { Chat, SendMessageRequest } from "@copilotchat/shared";
 import { messageAttachmentSchema } from "@copilotchat/shared";
+import { buildConversationTools } from "./conversation-tools.js";
 import type { AppDatabase } from "./db.js";
 
 export interface ChatContextOptions { isolatedWorkspaceRoot: string; allowStdioMcp?: boolean }
@@ -27,6 +28,7 @@ export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: stri
     projectContext: project ? buildProjectContext(input.db, input.ownerId, project.id) : null,
     skills: input.db.enabledSkillManifests(input.ownerId, input.message.skillIds, input.chat.projectId, input.message.content),
     mcpServers: input.db.enabledMcpServers(input.ownerId, input.chat.projectId).filter((server) => input.context.allowStdioMcp || server.transport !== "stdio"),
+    tools: buildConversationTools({ db: input.db, ownerId: input.ownerId, chat: input.chat }),
     gitHubToken: input.gitHubToken,
     workingDirectory,
     titleTool: input.chat.titleManuallySet ? undefined : input.titleTool,
