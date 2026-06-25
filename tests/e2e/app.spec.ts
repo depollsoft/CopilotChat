@@ -675,7 +675,10 @@ test("agent questions and tool permissions are interactive, with auto-approval",
   await expect(urlPermission).toContainText("https://example.com/docs");
   await expect(urlPermission.locator(".interaction-detail")).toContainText("web.fetch");
   await expect(urlPermission.locator(".interaction-detail")).toContainText("GET");
-  await urlPermission.getByRole("button", { name: "Allow once" }).click();
+  await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await expect(page.locator(".thread .interaction-card.permission")).toHaveCount(0);
   await expect(page.locator(".msg.assistant").filter({ hasText: "Permission decision: approved." }).last()).toBeVisible({ timeout: 15000 });
 
   await page.getByRole("button", { name: "Open composer options" }).click();
@@ -717,6 +720,10 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
   await expect(page.getByRole("button", { name: "Open composer options" })).toBeEnabled();
   await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Attach files/ }).click();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "steer-note.txt", mimeType: "text/plain", buffer: Buffer.from("steer attachment") });
+  await expect(page.locator(".attachment-tray").filter({ hasText: "steer-note.txt" })).toBeVisible();
+  await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
   await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
   await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
@@ -728,7 +735,10 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".composer-action-tooltip").filter({ hasText: "currently running" })).toHaveCSS("opacity", "1");
   await steerButton.click({ force: true });
   await expect(page.locator(".pending-turn.steer").filter({ hasText: "Please steer this response." })).toContainText("Sent live");
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
   await page.getByPlaceholder(/Steer or queue/).fill("Queued follow up.");
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "queued-note.txt", mimeType: "text/plain", buffer: Buffer.from("queued attachment") });
+  await expect(page.locator(".attachment-tray").filter({ hasText: "queued-note.txt" })).toBeVisible();
   const queueButton = page.getByRole("button", { name: "Queue message" });
   await expect(queueButton).toBeEnabled();
   expect((await queueButton.boundingBox())?.width ?? 0).toBeLessThanOrEqual(44);
@@ -741,8 +751,11 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await page.keyboard.press("Enter");
   await expect(page.locator(".pending-turn.queue").filter({ hasText: "Queued follow up." })).toContainText(/queued|running|done/i);
   await expect(page.locator(".msg.assistant").filter({ hasText: "Steering received: Please steer this response." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Steering attachments: steer-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.user").filter({ hasText: "Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.user").filter({ hasText: "queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "You said: Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Attachments: queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
 });
 
 test("chat viewport follows live updates and can jump back to live", async ({ page }, testInfo) => {

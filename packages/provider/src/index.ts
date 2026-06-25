@@ -19,7 +19,7 @@ export type ProviderInteractionHandlers = {
   requestUserInput?: (request: ProviderUserInputRequest) => Promise<{ answer: string; wasFreeform: boolean }>;
   requestElicitation?: (request: ProviderElicitationRequest) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, ProviderElicitationValue> }>;
 };
-export type ProviderChatControls = { onSteer: (handler: (content: string) => void | Promise<void>) => () => void };
+export type ProviderChatControls = { onSteer: (handler: (message: ProviderMessage) => void | Promise<void>) => () => void };
 export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; permissionMode?: PermissionMode; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
 export type ProviderEvent =
   | { type: "delta"; text: string }
@@ -110,7 +110,7 @@ class SdkCopilotProvider implements CopilotProvider {
     catch (error) { await client.stop().catch(() => []); throw error; }
     const { session, resumed } = sessionData;
     yield { type: "session", sessionId: session.sessionId, workspacePath: session.workspacePath ?? null, resumed, infinite: true };
-    const unregisterSteer = request.controls?.onSteer((content) => session.send({ prompt: content, mode: "immediate" }).then(() => undefined));
+    const unregisterSteer = request.controls?.onSteer((message) => session.send({ prompt: message.content, mode: "immediate", attachments: sdkAttachments(message) }).then(() => undefined));
     const rootText: ProviderTextState = { length: 0, tail: "" };
     let rootTextClosed = false;
     const subagentText = new Map<string, ProviderTextState>();
@@ -193,8 +193,8 @@ class EchoProvider implements CopilotProvider {
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (request.sessionId) yield { type: "session", sessionId: request.sessionId, workspacePath: null, resumed: Boolean(request.resumeSession), infinite: false };
     const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
-    const steeringNotes: string[] = [];
-    const unregisterSteer = request.controls?.onSteer((content) => { steeringNotes.push(content); });
+    const steeringNotes: ProviderMessage[] = [];
+    const unregisterSteer = request.controls?.onSteer((message) => { steeringNotes.push(message); });
     const enabledSkills = request.skills?.map((skill) => skill.name).join(", ") || "none";
     const attachmentSummary = summarizeAttachments(lastUser?.attachments);
     const priorMessages = request.messages.slice(0, -1);
@@ -296,11 +296,11 @@ class EchoProvider implements CopilotProvider {
     ].filter((line, index, lines) => line || (lines[index - 1] && lines[index + 1])).join("\n");
     const streamDelayMs = /start a long response/i.test(lastUser?.content ?? "") ? 10 : 3;
     for (const token of chunkText(response, 24)) {
-      while (steeringNotes.length > 0) yield { type: "delta", text: `\n\nSteering received: ${steeringNotes.shift()}` };
+      while (steeringNotes.length > 0) yield { type: "delta", text: echoSteeringText(steeringNotes.shift()) };
       yield { type: "delta", text: token };
       await delay(streamDelayMs);
     }
-    while (steeringNotes.length > 0) yield { type: "delta", text: `\n\nSteering received: ${steeringNotes.shift()}` };
+    while (steeringNotes.length > 0) yield { type: "delta", text: echoSteeringText(steeringNotes.shift()) };
     unregisterSteer?.();
     if (/artifact/i.test(lastUser?.content ?? "")) yield { type: "artifact", title: "Generated artifact", kind: "markdown", content: `# Artifact\n\n${lastUser?.content ?? ""}` };
     yield { type: "done", usage: { provider: this.id } };
@@ -392,6 +392,11 @@ function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string)
 }
 function sdkAttachments(message?: ProviderMessage): MessageOptions["attachments"] | undefined { return message?.attachments?.map((attachment) => ({ type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.displayName })); }
 function summarizeAttachments(attachments?: ProviderAttachment[]): string { return attachments?.map((attachment) => `${attachment.displayName ?? "attachment"} (${attachment.mimeType}, ${formatBytes(attachment.data.length * 0.75)})`).join(", ") ?? ""; }
+function echoSteeringText(message?: ProviderMessage): string {
+  if (!message) return "";
+  const attachmentSummary = summarizeAttachments(message.attachments);
+  return `\n\nSteering received: ${message.content || "(no text)"}${attachmentSummary ? `\n\nSteering attachments: ${attachmentSummary}.` : ""}`;
+}
 function formatBytes(value: number): string { if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; if (value >= 1024) return `${Math.round(value / 1024)} KB`; return `${Math.max(0, Math.round(value))} B`; }
 function buildSystemContext(request: ProviderChatRequest): string { return [request.projectContext ? `Project context:\n${request.projectContext}` : "", request.workingDirectory ? `Active workspace: ${request.workingDirectory}\nSandbox: local filesystem and tool access must stay inside this workspace. Do not use paths outside it.` : "", request.titleTool ? `Conversation title: ${request.titleTool.currentTitle}\n${request.titleTool.required ? "You must call set_conversation_title after this first user message." : "Use the set_conversation_title tool whenever the conversation title should substantively change."} Titles must be concise, specific, and six words maximum. Do not mention that you are setting the title.` : "", request.artifactContext ?? "", ...(request.skills ?? []).map((skill) => [`Skill: ${skill.name}`, skill.description, skill.instructions, skill.workflow.length > 0 ? `Workflow:\n${skill.workflow.join("\n")}` : ""].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n"); }
 async function maybeRunEchoImportPreview(request: ProviderChatRequest, content: string): Promise<string> {
