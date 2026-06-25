@@ -715,6 +715,11 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open composer options" })).toBeEnabled();
+  await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Steer or queue/).fill("Please steer this response.");
   const steerButton = page.getByRole("button", { name: "Steer response" });
   await expect(steerButton).toBeEnabled();
