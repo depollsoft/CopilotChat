@@ -7,12 +7,13 @@ colors:
   surface-muted: "#f0f0f1"
   sidebar: "#f4f4f5"
   ink: "#202123"
-  ink-muted: "#6f6f76"
+  ink-muted: "#62626a"
   border: "#dedee3"
   border-strong: "#c8c8cf"
-  accent: "#10a37f"
+  accent: "#08795f"
   accent-text: "#ffffff"
   danger: "#b42318"
+  warning: "#946000"
   dark-bg: "#202123"
   dark-surface: "#2f3033"
   dark-surface-muted: "#343541"
@@ -24,6 +25,7 @@ colors:
   dark-accent: "#19c37d"
   dark-accent-text: "#041910"
   dark-danger: "#ff8a7a"
+  dark-warning: "#f0b45a"
 typography:
   display:
     fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
@@ -115,7 +117,7 @@ The system is dense enough for real work without becoming an admin console. Surf
 The palette is restrained product-neutral with a rare teal accent for action and status.
 
 ### Primary
-- **Copilot Teal** (#10a37f): Primary actions, selected states, running indicators, counts, and success status in the light theme.
+- **Copilot Teal** (#08795f): Primary actions, selected states, running indicators, counts, and success status in the light theme. It is deliberately darker than the original seed so white label text meets WCAG AA.
 - **Dark Copilot Teal** (#19c37d): The same semantic accent tuned for dark surfaces.
 
 ### Neutral
@@ -124,7 +126,7 @@ The palette is restrained product-neutral with a rare teal accent for action and
 - **Muted Surface** (#f0f0f1): Hover surfaces, chips, secondary controls, and nested panel backing.
 - **Sidebar Rail** (#f4f4f5): Navigation rail background in the light theme.
 - **Ink** (#202123): Primary text and high-emphasis controls.
-- **Muted Ink** (#6f6f76): Secondary labels, helper copy, timestamps, and inactive icons.
+- **Muted Ink** (#62626a): Secondary labels, helper copy, timestamps, and inactive icons.
 - **Quiet Border** (#dedee3): Default dividers, input borders, and card outlines.
 - **Strong Border** (#c8c8cf): Hover borders, dashed states, and higher-emphasis separators.
 - **Dark Workbench Background** (#202123): Dark theme app canvas.
@@ -137,7 +139,8 @@ The palette is restrained product-neutral with a rare teal accent for action and
 ### Tertiary
 - **Danger Red** (#b42318): Errors, destructive actions, setup warnings, and danger-zone surfaces.
 - **Dark Danger Red** (#ff8a7a): Danger states on dark surfaces.
-- **Warm Thinking Amber** (#d97706): In-progress or pending state where success and error are both wrong.
+- **Warm Thinking Amber** (#946000): In-progress or pending state where success and error are both wrong.
+- **Dark Warm Thinking Amber** (#f0b45a): Dark theme warning and running-state text.
 
 ### Named Rules
 
