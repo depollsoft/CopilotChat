@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-06-25T06:53:02.019Z",
+  "title": "Design System: CopilotChat",
+  "extensions": {
+    "colorMeta": {
+      "workbench-bg": {
+        "role": "neutral",
+        "displayName": "Workbench Background",
+        "canonical": "#f7f7f8",
+        "tonalRamp": ["oklch(18% 0.004 270)", "oklch(30% 0.004 270)", "oklch(42% 0.004 270)", "oklch(54% 0.004 270)", "oklch(66% 0.004 270)", "oklch(78% 0.004 270)", "oklch(90% 0.004 270)", "oklch(97% 0.004 270)"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Sheet Surface",
+        "canonical": "#ffffff",
+        "tonalRamp": ["oklch(18% 0 0)", "oklch(30% 0 0)", "oklch(42% 0 0)", "oklch(54% 0 0)", "oklch(66% 0 0)", "oklch(78% 0 0)", "oklch(90% 0 0)", "oklch(100% 0 0)"]
+      },
+      "surface-muted": {
+        "role": "neutral",
+        "displayName": "Muted Surface",
+        "canonical": "#f0f0f1",
+        "tonalRamp": ["oklch(18% 0.004 270)", "oklch(30% 0.004 270)", "oklch(42% 0.004 270)", "oklch(54% 0.004 270)", "oklch(66% 0.004 270)", "oklch(78% 0.004 270)", "oklch(90% 0.004 270)", "oklch(95% 0.004 270)"]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#202123",
+        "tonalRamp": ["oklch(15% 0.004 270)", "oklch(24% 0.004 270)", "oklch(34% 0.004 270)", "oklch(46% 0.004 270)", "oklch(58% 0.004 270)", "oklch(70% 0.004 270)", "oklch(82% 0.004 270)", "oklch(94% 0.004 270)"]
+      },
+      "accent": {
+        "role": "primary",
+        "displayName": "Copilot Teal",
+        "canonical": "#08795f",
+        "tonalRamp": ["oklch(18% 0.06 170)", "oklch(28% 0.08 170)", "oklch(38% 0.10 170)", "oklch(48% 0.12 170)", "oklch(58% 0.14 170)", "oklch(68% 0.12 170)", "oklch(80% 0.08 170)", "oklch(92% 0.04 170)"]
+      },
+      "danger": {
+        "role": "tertiary",
+        "displayName": "Danger Red",
+        "canonical": "#b42318",
+        "tonalRamp": ["oklch(18% 0.06 28)", "oklch(28% 0.09 28)", "oklch(38% 0.12 28)", "oklch(48% 0.15 28)", "oklch(58% 0.14 28)", "oklch(70% 0.10 28)", "oklch(82% 0.06 28)", "oklch(94% 0.03 28)"]
+      },
+      "warning": {
+        "role": "tertiary",
+        "displayName": "Warm Thinking Amber",
+        "canonical": "#946000",
+        "tonalRamp": ["oklch(18% 0.05 75)", "oklch(28% 0.07 75)", "oklch(38% 0.09 75)", "oklch(48% 0.10 75)", "oklch(58% 0.09 75)", "oklch(70% 0.07 75)", "oklch(82% 0.05 75)", "oklch(94% 0.03 75)"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display",
+        "purpose": "Welcome and project-level headings only."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "Drawer and modal titles."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Cards, rows, section titles, and important control labels."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Chat content, settings descriptions, helper text, and prose."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Status pills, metadata, timestamps, and compact annotations."
+      }
+    },
+    "shadows": [
+      {
+        "name": "ambient-overlay",
+        "value": "0 18px 50px rgb(0 0 0 / 14%)",
+        "purpose": "Light theme menus, drawers, auth panels, modals, and popovers."
+      },
+      {
+        "name": "dark-ambient-overlay",
+        "value": "0 18px 50px rgb(0 0 0 / 36%)",
+        "purpose": "Dark theme floating surfaces."
+      },
+      {
+        "name": "composer-lift",
+        "value": "0 14px 34px rgb(0 0 0 / 10%)",
+        "purpose": "The floating composer in light mode."
+      },
+      {
+        "name": "hover-lift",
+        "value": "0 12px 26px rgb(0 0 0 / 8%)",
+        "purpose": "Actionable cards that rise on hover."
+      }
+    ],
+    "motion": [
+      {
+        "name": "state-fast",
+        "value": "120ms ease",
+        "purpose": "Tooltips and small feedback transitions."
+      },
+      {
+        "name": "state-standard",
+        "value": "160ms ease",
+        "purpose": "Disclosure arrows, selected states, and compact component feedback."
+      },
+      {
+        "name": "nav-entry",
+        "value": "180ms ease",
+        "purpose": "Mobile sidebar entry and exit."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "mobile-shell",
+        "value": "880px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary action button using the rare teal accent.",
+      "html": "<button class=\"ds-btn-primary\">Send</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 8px 14px; border: 1px solid var(--accent, #08795f); border-radius: var(--radius-pill, 999px); background: var(--accent, #08795f); color: var(--accent-text, #fff); font: 700 15px/1.2 Inter, ui-sans-serif, system-ui, sans-serif; transition: background .16s ease, border-color .16s ease, transform .16s ease; } .ds-btn-primary:hover { background: color-mix(in srgb, var(--accent, #08795f) 88%, black); } .ds-btn-primary:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent, #08795f) 65%, transparent); outline-offset: 2px; } .ds-btn-primary:active { transform: translateY(1px); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Neutral action button for secondary settings and drawer actions.",
+      "html": "<button class=\"ds-btn-secondary\">Configure</button>",
+      "css": ".ds-btn-secondary { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: 8px 14px; border: 1px solid var(--border, #dedee3); border-radius: var(--radius-pill, 999px); background: var(--surface, #fff); color: var(--text, #202123); font: 700 15px/1.2 Inter, ui-sans-serif, system-ui, sans-serif; transition: background .16s ease, border-color .16s ease; } .ds-btn-secondary:hover { border-color: var(--border-strong, #c8c8cf); background: var(--surface-muted, #f0f0f1); } .ds-btn-secondary:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent, #08795f) 65%, transparent); outline-offset: 2px; }"
+    },
+    {
+      "name": "Text Field",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Default input field for settings, search, and editable metadata.",
+      "html": "<label class=\"ds-field\"><span>Project name</span><input value=\"Workspace\" /></label>",
+      "css": ".ds-field { display: grid; gap: 6px; color: var(--text, #202123); font: 700 13px/1.3 Inter, ui-sans-serif, system-ui, sans-serif; } .ds-field span { color: var(--text-muted, #62626a); } .ds-field input { min-height: 40px; border: 1px solid var(--border, #dedee3); border-radius: 12px; background: var(--surface, #fff); color: var(--text, #202123); padding: 10px 12px; font: 400 15px/1.4 Inter, ui-sans-serif, system-ui, sans-serif; } .ds-field input:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent, #08795f) 65%, transparent); outline-offset: 2px; }"
+    },
+    {
+      "name": "Neutral Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Flat product card with border-first hierarchy.",
+      "html": "<article class=\"ds-card\"><strong>Project memory</strong><p>Keep reusable instructions close to each workspace.</p></article>",
+      "css": ".ds-card { display: grid; gap: 8px; padding: 15px; border: 1px solid var(--border, #dedee3); border-radius: 18px; background: var(--surface, #fff); color: var(--text, #202123); box-shadow: 0 1px 0 rgb(0 0 0 / 3%); font-family: Inter, ui-sans-serif, system-ui, sans-serif; } .ds-card strong { font-size: 15px; line-height: 1.25; } .ds-card p { margin: 0; color: var(--text-muted, #62626a); font-size: 13px; line-height: 1.45; } .ds-card:hover { border-color: var(--border-strong, #c8c8cf); }"
+    },
+    {
+      "name": "Status Chip",
+      "kind": "chip",
+      "refersTo": "chip",
+      "description": "Compact state chip for selected, running, or contextual flags.",
+      "html": "<span class=\"ds-chip\">Running</span>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; min-height: 30px; padding: 0 12px; border-radius: var(--radius-pill, 999px); background: color-mix(in srgb, var(--accent, #08795f) 16%, var(--surface, #fff)); color: var(--accent, #08795f); font: 800 12px/1 Inter, ui-sans-serif, system-ui, sans-serif; letter-spacing: .04em; text-transform: uppercase; }"
+    },
+    {
+      "name": "Sidebar Row",
+      "kind": "nav",
+      "description": "Rounded navigation row for chats, projects, and app sections.",
+      "html": "<button class=\"ds-sidebar-row\"><span>Research notes</span><small>2m ago</small></button>",
+      "css": ".ds-sidebar-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; min-height: 44px; padding: 0 10px; border: 0; border-radius: 12px; background: transparent; color: var(--text, #202123); text-align: left; font-family: Inter, ui-sans-serif, system-ui, sans-serif; } .ds-sidebar-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; } .ds-sidebar-row small { color: var(--text-muted, #62626a); } .ds-sidebar-row:hover, .ds-sidebar-row:focus-visible { background: var(--surface-muted, #f0f0f1); outline: none; } .ds-sidebar-row:focus-visible { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #08795f) 65%, transparent); }"
+    },
+    {
+      "name": "Activity Card",
+      "kind": "custom",
+      "description": "Collapsible tool or subagent activity surface.",
+      "html": "<details class=\"ds-activity\" open><summary><span>Tool call</span><b>succeeded</b></summary><p>Searched local conversation history.</p></details>",
+      "css": ".ds-activity { border: 1px solid var(--border, #dedee3); border-radius: 14px; background: color-mix(in srgb, var(--surface-muted, #f0f0f1) 54%, transparent); overflow: hidden; color: var(--text, #202123); font-family: Inter, ui-sans-serif, system-ui, sans-serif; } .ds-activity summary { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 40px; padding: 8px 11px; cursor: pointer; list-style: none; font-size: 13px; font-weight: 780; } .ds-activity summary::-webkit-details-marker { display: none; } .ds-activity b { color: var(--accent, #08795f); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; } .ds-activity p { margin: 0; padding: 0 12px 12px; color: var(--text-muted, #62626a); font-size: 14px; line-height: 1.55; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Local Workbench",
+    "overview": "CopilotChat's interface is a quiet workbench for local AI-assisted development. The visual system uses restrained neutrals, familiar product controls, and a single teal accent so the user's conversation, project context, tool state, and permissions remain the center of attention.\n\nThe system is dense enough for real work without becoming an admin console. Surfaces layer through tonal contrast, borders, and measured shadows; motion exists for status and feedback rather than spectacle. It explicitly rejects SaaS marketing gloss, over-decorated AI chat chrome, and distracting motion.",
+    "keyCharacteristics": [
+      "Restrained light and dark themes with the same semantic token vocabulary.",
+      "One sans-serif family across headings, body, controls, and labels.",
+      "Rounded, tactile controls with consistent hover and focus affordances.",
+      "Floating composer and header controls that preserve conversation space.",
+      "Clear status treatment for provider state, streaming, permissions, and tool activity."
+    ],
+    "rules": [
+      {
+        "name": "The One Accent Rule",
+        "body": "Teal is for primary action, selection, and status. It must not become general decoration.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tonal Layer Rule",
+        "body": "Depth starts with `--surface`, `--surface-muted`, `--sidebar`, and `--border`; shadows come after tonal hierarchy, not before it.",
+        "section": "colors"
+      },
+      {
+        "name": "The Single Family Rule",
+        "body": "Do not introduce display fonts for UI chrome. Product confidence comes from tuned weights and spacing inside one sans family.",
+        "section": "typography"
+      },
+      {
+        "name": "The Label Restraint Rule",
+        "body": "Uppercase labels are for compact metadata and status only. They should not become section decoration.",
+        "section": "typography"
+      },
+      {
+        "name": "The Earned Elevation Rule",
+        "body": "A shadow must signal a real stacking or interaction state. Static nested cards should use borders and tonal layers instead.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do preserve the quiet, capable, local-first posture from PRODUCT.md.",
+      "Do use teal only for primary actions, selection, success, and live/running indicators.",
+      "Do keep focus states visible on every keyboard-reachable control.",
+      "Do use tonal layers and borders before adding new shadows.",
+      "Do preserve reduced-motion support for cursor, pulse, and status animations.",
+      "Do keep the composer and header controls floating without stealing space from the conversation."
+    ],
+    "donts": [
+      "Don't use SaaS marketing gloss, over-decorated AI chat chrome, or distracting motion.",
+      "Don't add gradient text, decorative glassmorphism, or purple/neon AI assistant tropes.",
+      "Don't make teal a decorative wash across inactive surfaces.",
+      "Don't introduce a display font for buttons, labels, data, or navigation.",
+      "Don't use side-stripe borders as card or alert accents.",
+      "Don't turn settings and project surfaces into dense admin-console layouts."
+    ]
+  }
+}

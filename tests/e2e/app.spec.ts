@@ -6,8 +6,9 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers full management flow.");
   const workspace = testInfo.outputPath("workspace"); fs.mkdirSync(workspace, { recursive: true }); fs.writeFileSync(path.join(workspace, "note.txt"), "hello\n");
   await page.goto("/"); await expect(page.getByText(/Back at it/i)).toBeVisible();
-  page.once("dialog", (dialog) => dialog.accept(`Project ${testInfo.project.name}`));
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
+  await page.getByRole("dialog", { name: "New project" }).getByLabel("Project name").fill(`Project ${testInfo.project.name}`);
+  await page.getByRole("button", { name: "Create project" }).click();
   for (const label of ["Project", "Skills", "Workspace", "Tool permissions"]) {
     await page.getByRole("button", { name: "Open composer options" }).click();
     await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: new RegExp(label) }).click();
@@ -30,11 +31,11 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
   await page.getByRole("button", { name: "Manage" }).click();
   await page.getByRole("button", { name: "New skill" }).click();
-  await page.getByPlaceholder("Code review").fill(`Skill ${testInfo.project.name}`);
-  await page.getByPlaceholder("A short summary").fill("E2E skill");
-  await page.getByPlaceholder("Tell the assistant how to act when this skill is on.").fill("Mention the selected skill.");
-  await page.getByPlaceholder("Activation rules, one per line, e.g. User asks for a review").fill("User says hello from e2e");
-  await page.getByLabel("network").check();
+  await page.getByLabel("Skill name").fill(`Skill ${testInfo.project.name}`);
+  await page.getByLabel("Short description").fill("E2E skill");
+  await page.getByLabel("Instructions").fill("Mention the selected skill.");
+  await page.getByLabel("Activation rules").fill("User says hello from e2e");
+  await page.getByLabel("Network").check();
   await page.getByRole("button", { name: "Install skill" }).click();
   await page.getByRole("button", { name: new RegExp(`Skill ${testInfo.project.name}`) }).click();
   await page.getByRole("tab", { name: /^Tools$/ }).click();
@@ -102,7 +103,7 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.locator(".msg.assistant").filter({ hasText: "You said: Edited hello from e2e." }).getByRole("button", { name: "Retry response" }).click();
   await expect(assistantMessages.filter({ hasText: "You said: Edited hello from e2e." }).last()).toBeVisible();
   await expect(assistantMessages.filter({ hasText: "Messages in context: 1." }).last()).toBeVisible();
-  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true }); page.once("dialog", (d) => d.accept(`Renamed ${testInfo.project.name}`)); await page.getByRole("button", { name: "Rename", exact: true }).click(); await expect(page.locator(".sidebar-row-title").filter({ hasText: `Renamed ${testInfo.project.name}` }).first()).toBeVisible();
+  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true }); await page.getByRole("button", { name: "Rename", exact: true }).click(); await page.getByRole("dialog", { name: "Rename chat" }).getByLabel("Chat title").fill(`Renamed ${testInfo.project.name}`); await page.getByRole("button", { name: "Save title" }).click(); await expect(page.locator(".sidebar-row-title").filter({ hasText: `Renamed ${testInfo.project.name}` }).first()).toBeVisible();
 });
 
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
@@ -159,8 +160,9 @@ test("project navigation shows editable context and project chats", async ({ pag
   test.skip(testInfo.project.name !== "desktop", "Desktop covers project landing page.");
   await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
-  page.once("dialog", (dialog) => dialog.accept("Landing project"));
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
+  await page.getByRole("dialog", { name: "New project" }).getByLabel("Project name").fill("Landing project");
+  await page.getByRole("button", { name: "Create project" }).click();
   await expect(page).toHaveURL(/\/projects\/[^/]+$/);
   const projectUrl = page.url();
   await page.reload();
@@ -337,10 +339,10 @@ test("installed skills auto-trigger by rules and explicit name", async ({ page }
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
   await page.getByRole("button", { name: "Manage" }).click();
   await page.getByRole("button", { name: "New skill" }).click();
-  await page.getByPlaceholder("Code review").fill("Haiku helper");
-  await page.getByPlaceholder("A short summary").fill("Writes tiny poems.");
-  await page.getByPlaceholder("Tell the assistant how to act when this skill is on.").fill("When active, mention haiku helper.");
-  await page.getByPlaceholder("Activation rules, one per line, e.g. User asks for a review").fill("User asks for a poem");
+  await page.getByLabel("Skill name").fill("Haiku helper");
+  await page.getByLabel("Short description").fill("Writes tiny poems.");
+  await page.getByLabel("Instructions").fill("When active, mention haiku helper.");
+  await page.getByLabel("Activation rules").fill("User asks for a poem");
   await page.getByRole("button", { name: "Install skill" }).click();
   await expect(page.locator(".toggle-card").filter({ hasText: "Haiku helper" })).toContainText("installed");
   await page.getByRole("button", { name: "Close" }).click();
@@ -362,8 +364,9 @@ test("assistant can auto-title chats until the user renames them", async ({ page
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "Durable chat naming patterns across products" }).first()).toBeVisible();
   await expect(page.getByText("set_conversation_title")).toHaveCount(0);
   await page.locator(".sidebar-row.active .sidebar-row-menu").click({ force: true });
-  page.once("dialog", (dialog) => dialog.accept("Manual title stays"));
   await page.getByRole("button", { name: "Rename", exact: true }).click();
+  await page.getByRole("dialog", { name: "Rename chat" }).getByLabel("Chat title").fill("Manual title stays");
+  await page.getByRole("button", { name: "Save title" }).click();
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "Manual title stays" }).first()).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("A completely different topic should not overwrite this manual title.");
   await page.getByRole("button", { name: "Send" }).click();
@@ -649,7 +652,7 @@ test("task lists show progress and can collapse", async ({ page }, testInfo) => 
   await expect(taskList.locator(".task-list-items")).toBeHidden();
 });
 
-test("agent questions and tool permissions are interactive, with yolo mode", async ({ page }, testInfo) => {
+test("agent questions and tool permissions are interactive, with auto-approval", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers agent interaction prompts.");
   await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
@@ -672,13 +675,16 @@ test("agent questions and tool permissions are interactive, with yolo mode", asy
   await expect(urlPermission).toContainText("https://example.com/docs");
   await expect(urlPermission.locator(".interaction-detail")).toContainText("web.fetch");
   await expect(urlPermission.locator(".interaction-detail")).toContainText("GET");
-  await urlPermission.getByRole("button", { name: "Allow once" }).click();
+  await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await expect(page.locator(".thread .interaction-card.permission")).toHaveCount(0);
   await expect(page.locator(".msg.assistant").filter({ hasText: "Permission decision: approved." }).last()).toBeVisible({ timeout: 15000 });
 
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
-  await page.getByRole("button", { name: "Enable YOLO mode" }).click();
-  await expect(page.getByRole("button", { name: "YOLO mode tool permissions" })).toBeVisible();
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please request permission.");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(/Allow shell permission/)).toHaveCount(0);
@@ -712,6 +718,15 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Open composer options" })).toBeEnabled();
+  await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Attach files/ }).click();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "steer-note.txt", mimeType: "text/plain", buffer: Buffer.from("steer attachment") });
+  await expect(page.locator(".attachment-tray").filter({ hasText: "steer-note.txt" })).toBeVisible();
+  await page.getByRole("button", { name: "Open composer options" }).click();
+  await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Steer or queue/).fill("Please steer this response.");
   const steerButton = page.getByRole("button", { name: "Steer response" });
   await expect(steerButton).toBeEnabled();
@@ -720,7 +735,10 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".composer-action-tooltip").filter({ hasText: "currently running" })).toHaveCSS("opacity", "1");
   await steerButton.click({ force: true });
   await expect(page.locator(".pending-turn.steer").filter({ hasText: "Please steer this response." })).toContainText("Sent live");
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
   await page.getByPlaceholder(/Steer or queue/).fill("Queued follow up.");
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "queued-note.txt", mimeType: "text/plain", buffer: Buffer.from("queued attachment") });
+  await expect(page.locator(".attachment-tray").filter({ hasText: "queued-note.txt" })).toBeVisible();
   const queueButton = page.getByRole("button", { name: "Queue message" });
   await expect(queueButton).toBeEnabled();
   expect((await queueButton.boundingBox())?.width ?? 0).toBeLessThanOrEqual(44);
@@ -733,8 +751,11 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await page.keyboard.press("Enter");
   await expect(page.locator(".pending-turn.queue").filter({ hasText: "Queued follow up." })).toContainText(/queued|running|done/i);
   await expect(page.locator(".msg.assistant").filter({ hasText: "Steering received: Please steer this response." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Steering attachments: steer-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.user").filter({ hasText: "Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.user").filter({ hasText: "queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "You said: Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Attachments: queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
 });
 
 test("chat viewport follows live updates and can jump back to live", async ({ page }, testInfo) => {

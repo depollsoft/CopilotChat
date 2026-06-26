@@ -135,7 +135,7 @@ describe("createCopilotProvider", () => {
       mcpServers: [],
       interactions: {
         requestPermission: async () => {
-          throw new Error("YOLO should skip per-tool permission prompts.");
+          throw new Error("Auto-approval should skip per-tool permission prompts.");
         },
       },
     }));
