@@ -1,4 +1,4 @@
-import type { CopilotProvider, ProviderChatControls, ProviderChatRequest, ProviderElicitationRequest, ProviderElicitationValue, ProviderEvent, ProviderPermissionRequest, ProviderTaskListItem, ProviderUserInputRequest } from "@copilotchat/provider";
+import type { CopilotProvider, ProviderChatControls, ProviderChatRequest, ProviderElicitationRequest, ProviderElicitationValue, ProviderEvent, ProviderMessage, ProviderPermissionRequest, ProviderTaskListItem, ProviderUserInputRequest } from "@copilotchat/provider";
 import { titleFromContent } from "@copilotchat/shared";
 import type { ActiveResponseInputRequest, Chat, ChatMessage, PermissionMode, SendMessageRequest } from "@copilotchat/shared";
 import type { FastifyReply } from "fastify";
@@ -107,6 +107,12 @@ export class ActiveChatResponses {
     const response = this.active.get(chatId);
     return response?.enqueue(request) ?? null;
   }
+  setPermissionMode(chatId: string, permissionMode: PermissionMode): boolean {
+    const response = this.active.get(chatId);
+    if (!response) return false;
+    response.setPermissionMode(permissionMode);
+    return true;
+  }
 
   async steer(chatId: string, request: ActiveResponseInputRequest): Promise<PendingTurn | null> {
     const response = this.active.get(chatId);
@@ -188,7 +194,8 @@ export class ActiveChatResponse {
   private titleWasSet = false;
   private readonly interactionResolvers = new Map<string, InteractionResolver>();
   private readonly queuedTurns: QueuedTurn[] = [];
-  private steerHandler: ((content: string) => void | Promise<void>) | null = null;
+  private steerHandler: ((message: ProviderMessage) => void | Promise<void>) | null = null;
+  private permissionModeOverride: PermissionMode | null = null;
 
   constructor(readonly chatId: string) {}
   get signal(): AbortSignal { return this.controller.signal; }
@@ -201,7 +208,8 @@ export class ActiveChatResponse {
   }
 
   decorateProviderRequest(request: ProviderChatRequest): ProviderChatRequest {
-    return { ...request, titleTool: this.wrapTitleTool(request.titleTool), interactions: this.createInteractions(request.permissionMode ?? "ask"), controls: this.createControls() };
+    this.permissionModeOverride = request.permissionMode ?? "ask";
+    return { ...request, titleTool: this.wrapTitleTool(request.titleTool), interactions: this.createInteractions(), controls: this.createControls() };
   }
 
   wrapTitleTool(titleTool: ProviderChatRequest["titleTool"]): ProviderChatRequest["titleTool"] {
@@ -249,7 +257,7 @@ export class ActiveChatResponse {
   async steer(request: ActiveResponseInputRequest): Promise<PendingTurn> {
     const turn = this.createPendingTurn("steer", request.content, this.steerHandler ? "sent" : "queued");
     this.pendingTurns = [...this.pendingTurns, turn];
-    if (this.steerHandler) await this.steerHandler(request.content);
+    if (this.steerHandler) await this.steerHandler(providerMessageForActiveInput(request));
     else this.queuedTurns.push({ ...turn, mode: "queue", status: "queued", request: queueRequest(request) });
     this.emitPendingTurns();
     return turn;
@@ -276,10 +284,27 @@ export class ActiveChatResponse {
     }
   }
 
-  createInteractions(permissionMode: PermissionMode): ProviderChatRequest["interactions"] {
+  setPermissionMode(permissionMode: PermissionMode): void {
+    this.permissionModeOverride = permissionMode;
+    if (permissionMode !== "yolo") return;
+    const pendingPermissionIds = this.interactions.filter((interaction) => interaction.kind === "permission").map((interaction) => interaction.id);
+    for (const id of pendingPermissionIds) {
+      const resolver = this.interactionResolvers.get(id);
+      if (!resolver) continue;
+      this.interactionResolvers.delete(id);
+      resolver.resolve({ action: "approve" });
+    }
+    if (pendingPermissionIds.length > 0) {
+      const pending = new Set(pendingPermissionIds);
+      this.interactions = this.interactions.filter((interaction) => !pending.has(interaction.id));
+      this.emit("interaction", { interactions: this.interactions });
+    }
+  }
+
+  createInteractions(): ProviderChatRequest["interactions"] {
     return {
       requestPermission: async (request) => {
-        if (permissionMode === "yolo") return "approve";
+        if (this.permissionModeOverride === "yolo") return "approve";
         return await this.requestPermission(request);
       },
       requestUserInput: (request) => this.requestUserInput(request),
@@ -659,6 +684,9 @@ function limitActivityValue(value: unknown, depth = 0, stringLimit = activityStr
 }
 function queueRequest(request: ActiveResponseInputRequest): SendMessageRequest {
   return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, permissionMode: request.permissionMode };
+}
+function providerMessageForActiveInput(request: ActiveResponseInputRequest): ProviderMessage {
+  return { role: "user", content: request.content, attachments: request.attachments?.map((attachment) => ({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name })) };
 }
 function normalizeArtifactKind(kind: string): "text" | "markdown" | "code" | "json" | "mermaid" | "html" | "file-bundle" {
   return kind === "html" || kind === "json" || kind === "mermaid" || kind === "code" || kind === "text" || kind === "file-bundle" ? kind : "markdown";

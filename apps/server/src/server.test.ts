@@ -11,6 +11,7 @@ import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
+import { buildConversationTools } from "./conversation-tools.js";
 import { ActiveChatResponses } from "./responses.js";
 import { ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
@@ -839,5 +840,89 @@ describe("chat provider context", () => {
       fs.rmSync(workspace, { recursive: true, force: true });
       fs.rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe("conversation query tools", () => {
+  it("searches conversations across, within, and outside the current project", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const projectA = db.createProject(owner.id, { name: "Alpha", description: null, instructions: "" });
+    const projectB = db.createProject(owner.id, { name: "Beta", description: null, instructions: "" });
+    const chatA = db.createChat(owner.id, { title: "Alpha chat", projectId: projectA.id, workspaceId: null });
+    const chatB = db.createChat(owner.id, { title: "Beta chat", projectId: projectB.id, workspaceId: null });
+    const general = db.createChat(owner.id, { title: "General chat", projectId: null, workspaceId: null });
+    db.addMessage({ chatId: chatA.id, role: "assistant", content: "Alpha decided to use SQLite for storage.", provider: "echo" });
+    db.addMessage({ chatId: chatB.id, role: "assistant", content: "Beta decided to use SQLite for storage.", provider: "echo" });
+    db.addMessage({ chatId: general.id, role: "assistant", content: "General notes about SQLite storage.", provider: "echo" });
+
+    const all = db.searchConversations(owner.id, "SQLite", { scope: "all", currentProjectId: projectA.id });
+    expect(all.map((result) => result.chatId).sort()).toEqual([chatA.id, chatB.id, general.id].sort());
+    expect(all.find((result) => result.chatId === chatB.id)?.projectName).toBe("Beta");
+    expect(all.find((result) => result.chatId === general.id)?.projectId).toBeNull();
+
+    const current = db.searchConversations(owner.id, "SQLite", { scope: "current_project", currentProjectId: projectA.id });
+    expect(current.map((result) => result.chatId)).toEqual([chatA.id]);
+
+    const others = db.searchConversations(owner.id, "SQLite", { scope: "other_projects", currentProjectId: projectA.id });
+    expect(others.map((result) => result.chatId).sort()).toEqual([chatB.id, general.id].sort());
+
+    expect(db.searchConversations(owner.id, "   ", { scope: "all", currentProjectId: null })).toEqual([]);
+  });
+
+  it("excludes the current chat and lists recent conversations with message counts", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Widgets", description: null, instructions: "" });
+    const current = db.createChat(owner.id, { title: "Current chat", projectId: project.id, workspaceId: null });
+    const past = db.createChat(owner.id, { title: "Past chat", projectId: project.id, workspaceId: null });
+    db.addMessage({ chatId: current.id, role: "user", content: "Talk about Widgets" });
+    db.addMessage({ chatId: past.id, role: "assistant", content: "Earlier Widgets discussion." });
+
+    const search = db.searchConversations(owner.id, "widgets", { scope: "all", currentProjectId: project.id, excludeChatId: current.id });
+    expect(search.map((result) => result.chatId)).toEqual([past.id]);
+
+    const recent = db.listRecentConversations(owner.id, { scope: "all", currentProjectId: project.id, excludeChatId: current.id });
+    expect(recent.map((conversation) => conversation.chatId)).toContain(past.id);
+    expect(recent.map((conversation) => conversation.chatId)).not.toContain(current.id);
+    expect(recent.find((conversation) => conversation.chatId === past.id)?.messageCount).toBe(1);
+    expect(recent.find((conversation) => conversation.chatId === past.id)?.projectName).toBe("Widgets");
+  });
+
+  it("reads a conversation transcript scoped to the owner", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Source", projectId: null, workspaceId: null });
+    db.addMessage({ chatId: chat.id, role: "user", content: "Question one" });
+    db.addMessage({ chatId: chat.id, role: "assistant", content: "Answer one" });
+
+    const transcript = db.getConversationTranscript(owner.id, chat.id);
+    expect(transcript.messageCount).toBe(2);
+    expect(transcript.truncated).toBe(false);
+    expect(transcript.messages.map((message) => message.content)).toEqual(["Question one", "Answer one"]);
+    expect(() => db.getConversationTranscript(owner.id, "missing-chat")).toThrow();
+  });
+
+  it("exposes conversation query tools to the model and resolves their handlers", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Alpha", description: null, instructions: "" });
+    const sourceChat = db.createChat(owner.id, { title: "Source chat", projectId: project.id, workspaceId: null });
+    db.addMessage({ chatId: sourceChat.id, role: "assistant", content: "Remember the migration plan details." });
+    const activeChat = db.createChat(owner.id, { title: "Active chat", projectId: project.id, workspaceId: null });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat: activeChat, message: { content: "What did we say?", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+    expect((request.tools ?? []).map((tool) => tool.name)).toEqual(["search_past_conversations", "list_recent_conversations", "get_conversation"]);
+
+    const tools = buildConversationTools({ db, ownerId: owner.id, chat: activeChat });
+    const search = tools.find((tool) => tool.name === "search_past_conversations")!.handler({ query: "migration" }) as { count: number; results: Array<{ chatId: string }> };
+    expect(search.count).toBe(1);
+    expect(search.results[0]?.chatId).toBe(sourceChat.id);
+
+    const list = tools.find((tool) => tool.name === "list_recent_conversations")!.handler({}) as { conversations: Array<{ chatId: string }> };
+    expect(list.conversations.map((conversation) => conversation.chatId)).toContain(sourceChat.id);
+
+    const transcript = tools.find((tool) => tool.name === "get_conversation")!.handler({ chatId: sourceChat.id }) as { messages: Array<{ content: string }> };
+    expect(transcript.messages[0]?.content).toContain("migration plan");
   });
 });
