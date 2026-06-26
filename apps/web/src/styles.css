@@ -11,6 +11,8 @@
   --accent: #10a37f;
   --accent-text: #ffffff;
   --danger: #b42318;
+  --danger-solid: #d92d20;
+  --danger-solid-text: #ffffff;
   --shadow: 0 18px 50px rgb(0 0 0 / 14%);
   --radius-sm: 8px;
   --radius: 14px;
@@ -33,6 +35,8 @@
   --accent: #19c37d;
   --accent-text: #041910;
   --danger: #ff8a7a;
+  --danger-solid: #e5484d;
+  --danger-solid-text: #ffffff;
   --shadow: 0 18px 50px rgb(0 0 0 / 36%);
 }
 
@@ -387,12 +391,16 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 @keyframes cursor-pulse { 50% { opacity: .72; transform: scaleY(.82); box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent) 5%, transparent); } }
 @keyframes intent-sparkle { 50% { opacity: .62; transform: rotate(16deg) scale(.88); } }
 @keyframes intent-dot { 50% { opacity: 1; transform: translateY(-1px) scale(1.35); } }
+@keyframes app-dialog-in { from { opacity: 0; transform: translateY(8px) scale(.985); } }
+@keyframes app-dialog-scrim-in { from { opacity: 0; } }
 
 @media (prefers-reduced-motion: reduce) {
   .cursor,
   .cursor-wrap.with-intent .cursor,
   .cursor-wrap.with-intent .cursor-sparkles svg,
-  .cursor-wrap.with-intent .cursor-sparkles span { animation: none; }
+  .cursor-wrap.with-intent .cursor-sparkles span,
+  .app-dialog,
+  .app-dialog-scrim { animation: none; }
 }
 
 .composer-shell { position: absolute; left: 0; right: 0; bottom: 0; z-index: 18; padding: 22px 16px calc(10px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to bottom, transparent, var(--bg) 50%, var(--bg)); pointer-events: none; }
@@ -505,6 +513,8 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .btn-primary:hover { background: color-mix(in srgb, var(--accent) 88%, black); border-color: var(--accent); }
 .btn-ghost { background: transparent; }
+.btn-danger-solid { background: var(--danger-solid); border-color: var(--danger-solid); color: var(--danger-solid-text); }
+.btn-danger-solid:hover { background: color-mix(in srgb, var(--danger-solid) 88%, black); border-color: color-mix(in srgb, var(--danger-solid) 88%, black); }
 .btn-sm { font-size: calc(13px * var(--text-scale)); }
 .tag { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: var(--radius-pill); background: var(--surface); color: var(--text); font-size: calc(12px * var(--text-scale)); }
 .tag.success { background: color-mix(in srgb, var(--accent) 20%, var(--surface)); }
@@ -551,6 +561,16 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .editor-modal-body { min-height: 0; display: grid; grid-template-rows: auto auto minmax(0,1fr); gap: 10px; padding: 16px; background: color-mix(in srgb, var(--surface) 86%, var(--bg)); }
 .editor-modal-body textarea { min-height: 360px; resize: none; font-size: calc(15px * var(--text-scale)); line-height: 1.55; }
 .editor-modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 16px; border-top: 1px solid var(--border); }
+.app-dialog-scrim { z-index: 79; animation: app-dialog-scrim-in .16s ease; }
+.app-dialog { position: fixed; inset: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); margin: auto; z-index: 80; display: flex; flex-direction: column; width: min(440px, calc(100vw - 32px)); height: max-content; max-height: calc(100vh - 32px); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); overflow: hidden; animation: app-dialog-in .16s ease; }
+.app-dialog-head { padding: 22px 22px 0; }
+.app-dialog-head h2 { margin: 0; font-size: calc(19px * var(--text-scale)); letter-spacing: -.01em; }
+.app-dialog.is-danger .app-dialog-head h2 { color: var(--danger); }
+.app-dialog-head p { margin: 8px 0 0; color: var(--text-muted); font-size: calc(14px * var(--text-scale)); line-height: 1.5; }
+.app-dialog-body { padding: 16px 22px 0; }
+.app-dialog-body label { display: block; margin-bottom: 6px; color: var(--text-muted); font-size: calc(13px * var(--text-scale)); }
+.app-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; padding: 22px; }
+.app-dialog-actions .btn { min-width: 92px; }
 .auth-card.warning { outline: 2px solid color-mix(in srgb, var(--danger) 28%, transparent); }
 .auth-card.ready { outline: 2px solid color-mix(in srgb, var(--accent) 24%, transparent); }
 .command-block { margin: 0; max-width: 100%; overflow: auto; padding: 12px; border-radius: 12px; background: #111827; color: #f9fafb; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; }

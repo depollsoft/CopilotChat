@@ -6,8 +6,10 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers full management flow.");
   const workspace = testInfo.outputPath("workspace"); fs.mkdirSync(workspace, { recursive: true }); fs.writeFileSync(path.join(workspace, "note.txt"), "hello\n");
   await page.goto("/"); await expect(page.getByText(/Back at it/i)).toBeVisible();
-  page.once("dialog", (dialog) => dialog.accept(`Project ${testInfo.project.name}`));
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
+  const createProjectDialog = page.getByRole("dialog", { name: "New project" });
+  await createProjectDialog.getByRole("textbox").fill(`Project ${testInfo.project.name}`);
+  await createProjectDialog.getByRole("button", { name: "Create" }).click();
   for (const label of ["Project", "Skills", "Workspace", "Tool permissions"]) {
     await page.getByRole("button", { name: "Open composer options" }).click();
     await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: new RegExp(label) }).click();
@@ -102,7 +104,19 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.locator(".msg.assistant").filter({ hasText: "You said: Edited hello from e2e." }).getByRole("button", { name: "Retry response" }).click();
   await expect(assistantMessages.filter({ hasText: "You said: Edited hello from e2e." }).last()).toBeVisible();
   await expect(assistantMessages.filter({ hasText: "Messages in context: 1." }).last()).toBeVisible();
-  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true }); page.once("dialog", (d) => d.accept(`Renamed ${testInfo.project.name}`)); await page.getByRole("button", { name: "Rename", exact: true }).click(); await expect(page.locator(".sidebar-row-title").filter({ hasText: `Renamed ${testInfo.project.name}` }).first()).toBeVisible();
+  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true }); await page.getByRole("button", { name: "Rename", exact: true }).click(); const renameChatDialog = page.getByRole("dialog", { name: "Rename chat" }); await renameChatDialog.getByRole("textbox").fill(`Renamed ${testInfo.project.name}`); await renameChatDialog.getByRole("button", { name: "Rename" }).click(); await expect(page.locator(".sidebar-row-title").filter({ hasText: `Renamed ${testInfo.project.name}` }).first()).toBeVisible();
+  const renamedTitle = `Renamed ${testInfo.project.name}`;
+  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true });
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  const deleteChatDialog = page.getByRole("alertdialog", { name: "Delete chat?" });
+  await expect(deleteChatDialog).toBeVisible();
+  await deleteChatDialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("alertdialog", { name: "Delete chat?" })).toHaveCount(0);
+  await expect(page.locator(".sidebar-row-title").filter({ hasText: renamedTitle }).first()).toBeVisible();
+  await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true });
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await page.getByRole("alertdialog", { name: "Delete chat?" }).getByRole("button", { name: "Delete" }).click();
+  await expect(page.locator(".sidebar-row-title").filter({ hasText: renamedTitle })).toHaveCount(0);
 });
 
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
@@ -159,8 +173,10 @@ test("project navigation shows editable context and project chats", async ({ pag
   test.skip(testInfo.project.name !== "desktop", "Desktop covers project landing page.");
   await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
-  page.once("dialog", (dialog) => dialog.accept("Landing project"));
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
+  const landingProjectDialog = page.getByRole("dialog", { name: "New project" });
+  await landingProjectDialog.getByRole("textbox").fill("Landing project");
+  await landingProjectDialog.getByRole("button", { name: "Create" }).click();
   await expect(page).toHaveURL(/\/projects\/[^/]+$/);
   const projectUrl = page.url();
   await page.reload();
@@ -362,8 +378,10 @@ test("assistant can auto-title chats until the user renames them", async ({ page
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "Durable chat naming patterns across products" }).first()).toBeVisible();
   await expect(page.getByText("set_conversation_title")).toHaveCount(0);
   await page.locator(".sidebar-row.active .sidebar-row-menu").click({ force: true });
-  page.once("dialog", (dialog) => dialog.accept("Manual title stays"));
   await page.getByRole("button", { name: "Rename", exact: true }).click();
+  const manualRenameDialog = page.getByRole("dialog", { name: "Rename chat" });
+  await manualRenameDialog.getByRole("textbox").fill("Manual title stays");
+  await manualRenameDialog.getByRole("button", { name: "Rename" }).click();
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "Manual title stays" }).first()).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("A completely different topic should not overwrite this manual title.");
   await page.getByRole("button", { name: "Send" }).click();
