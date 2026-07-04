@@ -89,7 +89,7 @@ export const messageSchema = z.object({
   role: z.enum(chatRoles),
   content: z.string(),
   provider: z.string().nullable(),
-  metadata: z.record(z.unknown()).default({}),
+  metadata: z.record(z.string(), z.unknown()).default({}),
   createdAt: z.string(),
 });
 export type ChatMessage = z.infer<typeof messageSchema>;
@@ -173,19 +173,19 @@ export type Workspace = z.infer<typeof workspaceSchema>;
 
 export const toolRunSchema = z.object({
   id: z.string(), ownerId: z.string(), chatId: z.string().nullable(), workspaceId: z.string().nullable(), toolName: z.string(),
-  status: z.enum(["queued", "running", "succeeded", "failed", "cancelled"]), input: z.record(z.unknown()).default({}), output: z.record(z.unknown()).default({}), error: z.string().nullable(), createdAt: z.string(), updatedAt: z.string(),
+  status: z.enum(["queued", "running", "succeeded", "failed", "cancelled"]), input: z.record(z.string(), z.unknown()).default({}), output: z.record(z.string(), z.unknown()).default({}), error: z.string().nullable(), createdAt: z.string(), updatedAt: z.string(),
 });
 export type ToolRun = z.infer<typeof toolRunSchema>;
 
 export const importSourceSchema = z.enum(["chatgpt", "claude", "gemini", "auto"]);
 export type ImportSource = z.infer<typeof importSourceSchema>;
-export const importedMessageSchema = z.object({ role: z.enum(["user", "assistant", "system", "tool"]), content: z.string(), createdAt: z.string().nullable().default(null), metadata: z.record(z.unknown()).default({}) });
+export const importedMessageSchema = z.object({ role: z.enum(["user", "assistant", "system", "tool"]), content: z.string(), createdAt: z.string().nullable().default(null), metadata: z.record(z.string(), z.unknown()).default({}) });
 export type ImportedMessage = z.infer<typeof importedMessageSchema>;
-export const importedProjectReferenceSchema = z.object({ sourceId: z.string().nullable().default(null), title: z.string(), content: z.string(), createdAt: z.string().nullable().default(null), metadata: z.record(z.unknown()).default({}) });
+export const importedProjectReferenceSchema = z.object({ sourceId: z.string().nullable().default(null), title: z.string(), content: z.string(), createdAt: z.string().nullable().default(null), metadata: z.record(z.string(), z.unknown()).default({}) });
 export type ImportedProjectReference = z.infer<typeof importedProjectReferenceSchema>;
-export const importedProjectSchema = z.object({ source: z.enum(["chatgpt", "claude", "gemini"]), sourceId: z.string().nullable(), name: z.string(), description: z.string().nullable().default(null), instructions: z.string().nullable().default(null), memory: z.string().nullable().default(null), references: z.array(importedProjectReferenceSchema).default([]), metadata: z.record(z.unknown()).default({}) });
+export const importedProjectSchema = z.object({ source: z.enum(["chatgpt", "claude", "gemini"]), sourceId: z.string().nullable(), name: z.string(), description: z.string().nullable().default(null), instructions: z.string().nullable().default(null), memory: z.string().nullable().default(null), references: z.array(importedProjectReferenceSchema).default([]), metadata: z.record(z.string(), z.unknown()).default({}) });
 export type ImportedProject = z.infer<typeof importedProjectSchema>;
-export const importedConversationSchema = z.object({ source: z.enum(["chatgpt", "claude", "gemini"]), sourceId: z.string().nullable(), projectSourceId: z.string().nullable().default(null), title: z.string(), createdAt: z.string().nullable().default(null), updatedAt: z.string().nullable().default(null), messages: z.array(importedMessageSchema), artifacts: z.array(artifactSchema.omit({ ownerId: true })).default([]), reusableHelpers: z.array(skillManifestSchema).default([]), metadata: z.record(z.unknown()).default({}) });
+export const importedConversationSchema = z.object({ source: z.enum(["chatgpt", "claude", "gemini"]), sourceId: z.string().nullable(), projectSourceId: z.string().nullable().default(null), title: z.string(), createdAt: z.string().nullable().default(null), updatedAt: z.string().nullable().default(null), messages: z.array(importedMessageSchema), artifacts: z.array(artifactSchema.omit({ ownerId: true })).default([]), reusableHelpers: z.array(skillManifestSchema).default([]), metadata: z.record(z.string(), z.unknown()).default({}) });
 export type ImportedConversation = z.infer<typeof importedConversationSchema>;
 export const importPreviewSchema = z.object({ source: z.enum(["chatgpt", "claude", "gemini"]), conversations: z.array(importedConversationSchema), projects: z.array(importedProjectSchema).default([]), warnings: z.array(z.string()).default([]) });
 export type ImportPreview = z.infer<typeof importPreviewSchema>;

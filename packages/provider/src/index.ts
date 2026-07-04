@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest } from "@copilotchat/shared";
-import { CopilotClient } from "@github/copilot-sdk";
+import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, MCPServerConfig, MessageOptions, ModelInfo, PermissionHandler, SessionConfig, SessionEvent, SessionFsFileInfo, SessionFsProvider, Tool } from "@github/copilot-sdk";
 
 export interface ProviderAttachment { type: "blob"; data: string; mimeType: string; displayName?: string }
@@ -102,7 +102,7 @@ class SdkCopilotProvider implements CopilotProvider {
     const lastUserMessage = [...request.messages].reverse().find((message) => message.role === "user");
     const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
     if (request.workingDirectory) sessionOptions.workingDirectory = request.workingDirectory;
-    if (request.workingDirectory) sessionOptions.createSessionFsHandler = () => new RootBoundSessionFsProvider(request.workingDirectory!);
+    if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
     const mcpServers = mapMcpServers(request.mcpServers ?? []);
     if (Object.keys(mcpServers).length > 0) sessionOptions.mcpServers = mcpServers;
     let sessionData: { session: CopilotSession; resumed: boolean };
@@ -354,7 +354,7 @@ class CliCopilotProvider implements CopilotProvider {
 function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null): CopilotClientOptions | undefined {
   if (!gitHubToken && !cliPath && !sandboxRoot) return undefined;
   const options: CopilotClientOptions = {};
-  if (cliPath) options.cliPath = cliPath;
+  if (cliPath) options.connection = RuntimeConnection.forStdio({ path: cliPath });
   if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: ".copilotchat-session", conventions: process.platform === "win32" ? "windows" : "posix" };
   if (gitHubToken) {
     options.gitHubToken = gitHubToken;

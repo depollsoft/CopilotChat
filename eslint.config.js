@@ -17,6 +17,7 @@ export default tseslint.config(
       "scripts/*.mjs",
       "packages/provider/scripts/*.mjs",
       "vitest.config.ts",
+      "playwright.config.ts",
       "pnpm-lock.yaml",
     ],
   },
