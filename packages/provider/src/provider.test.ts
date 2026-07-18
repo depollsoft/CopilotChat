@@ -1,7 +1,8 @@
 import type { ProviderEvent } from "./index.js";
+import type { ModelInfo } from "@github/copilot-sdk";
 import http from "node:http";
 import { describe, expect, it } from "vitest";
-import { createCopilotProvider } from "./index.js";
+import { createCopilotProvider, mapSdkModelInfo } from "./index.js";
 
 describe("createCopilotProvider", () => {
   it("uses SDK provider by default", async () => {
@@ -23,6 +24,7 @@ describe("createCopilotProvider", () => {
       sessionId: "copilotchat-test",
       resumeSession: true,
       model: "gpt-test",
+      contextTier: "long_context",
       projectContext: "Use the project voice.",
       skills: [],
       mcpServers: [],
@@ -33,6 +35,37 @@ describe("createCopilotProvider", () => {
     expect(text).toContain("Provider session: copilotchat-test (resume).");
     expect(text).toContain("Previous context: user: First question | assistant: First answer");
     expect(text).toContain("Project context: Use the project voice.");
+    expect(text).toContain("Context size: long_context.");
+  });
+  it("maps configurable model effort and long-context tiers from SDK metadata", () => {
+    const model: ModelInfo = {
+      id: "gpt-test",
+      name: "GPT Test",
+      capabilities: {
+        supports: { vision: false, reasoningEffort: true },
+        limits: { max_context_window_tokens: 128_000, max_prompt_tokens: 120_000 },
+      },
+      supportedReasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "low",
+      billing: {
+        tokenPrices: {
+          maxPromptTokens: 114_000,
+          longContext: { maxPromptTokens: 950_000 },
+        },
+      },
+    };
+
+    expect(mapSdkModelInfo(model)).toEqual({
+      id: "gpt-test",
+      name: "GPT Test",
+      supportsReasoningEffort: true,
+      supportedReasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "low",
+      supportsLongContext: true,
+      contextWindowTokens: 128_000,
+      maxPromptTokens: 114_000,
+      longContextMaxPromptTokens: 950_000,
+    });
   });
   it("emits reasoning and tool events from the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });

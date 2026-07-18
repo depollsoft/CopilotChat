@@ -50,13 +50,14 @@ describe("chat provider context", () => {
     db.addMessage({ chatId: chat.id, role: "assistant", content: "First answer", provider: "echo" });
     db.addMessage({ chatId: chat.id, role: "user", content: "Second question" });
 
-    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Second question", model: "gpt-test", reasoningEffort: "high", skillIds: [] }, defaultModel: "fallback", gitHubToken: "gh-token", context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Second question", model: "gpt-test", reasoningEffort: "high", contextTier: "long_context", skillIds: [] }, defaultModel: "fallback", gitHubToken: "gh-token", context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
 
     expect(request.projectContext).toContain("Use launch project rules.");
     expect(request.model).toBe("gpt-test");
     expect(request.reasoningEffort).toBe("high");
+    expect(request.contextTier).toBe("long_context");
     expect(request.gitHubToken).toBe("gh-token");
-    expect(request.sessionId).toBe(`copilotchat-${owner.id}-${chat.id}`);
+    expect(request.sessionId).toMatch(new RegExp(`^copilotchat-${owner.id}-${chat.id}-[0-9a-f-]{36}$`));
     expect(request.resumeSession).toBe(false);
     expect(request.workingDirectory).toBe(`/tmp/isolated/${chat.id}`);
     expect(request.messages.map((message) => `${message.role}:${message.content}`)).toEqual(["user:First question", "assistant:First answer", "user:Second question"]);
@@ -65,13 +66,14 @@ describe("chat provider context", () => {
   it("uses saved chat model choices when a request does not override them", () => {
     const db = createTestDb();
     const owner = db.getOwner();
-    const chat = db.createChat(owner.id, { title: "Model chat", projectId: null, workspaceId: null, model: "gpt-5-mini", reasoningEffort: "high" });
+    const chat = db.createChat(owner.id, { title: "Model chat", projectId: null, workspaceId: null, model: "gpt-5-mini", reasoningEffort: "high", contextTier: "long_context" });
     db.addMessage({ chatId: chat.id, role: "user", content: "Use saved model" });
 
     const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Use saved model", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
 
     expect(request.model).toBe("gpt-5-mini");
     expect(request.reasoningEffort).toBe("high");
+    expect(request.contextTier).toBe("long_context");
   });
 
   it("filters stdio MCP servers when stdio is not allowed", () => {
@@ -542,15 +544,20 @@ describe("chat provider context", () => {
   it("persists chat model choices and clears stale provider sessions when they change", () => {
     const db = createTestDb();
     const owner = db.getOwner();
-    const chat = db.createChat(owner.id, { title: "Model chat", projectId: null, workspaceId: null, model: "gpt-4.1", reasoningEffort: "medium" });
+    const chat = db.createChat(owner.id, { title: "Model chat", projectId: null, workspaceId: null, model: "gpt-4.1", reasoningEffort: "medium", contextTier: "default" });
     db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "old-session", providerSessionWorkspacePath: "/tmp/old" });
 
-    const updated = db.updateChat(owner.id, chat.id, { model: "gpt-5-mini", reasoningEffort: "high" });
+    const updated = db.updateChat(owner.id, chat.id, { model: "gpt-5-mini", reasoningEffort: "high", contextTier: "long_context" });
 
     expect(updated.model).toBe("gpt-5-mini");
     expect(updated.reasoningEffort).toBe("high");
+    expect(updated.contextTier).toBe("long_context");
     expect(updated.providerSessionId).toBeNull();
     expect(updated.providerSessionWorkspacePath).toBeNull();
+    db.addMessage({ chatId: updated.id, role: "user", content: "Use the new settings" });
+    const nextRequest = buildProviderChatRequest({ db, ownerId: owner.id, chat: updated, message: { content: "Use the new settings", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+    expect(nextRequest.sessionId).not.toBe("old-session");
+    expect(nextRequest.resumeSession).toBe(false);
   });
 
   it("applies project scope from a message request before provider context is built", () => {

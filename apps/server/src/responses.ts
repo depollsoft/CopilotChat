@@ -683,7 +683,7 @@ function limitActivityValue(value: unknown, depth = 0, stringLimit = activityStr
   return limited;
 }
 function queueRequest(request: ActiveResponseInputRequest): SendMessageRequest {
-  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, permissionMode: request.permissionMode };
+  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, contextTier: request.contextTier, permissionMode: request.permissionMode };
 }
 function providerMessageForActiveInput(request: ActiveResponseInputRequest): ProviderMessage {
   return { role: "user", content: request.content, attachments: request.attachments?.map((attachment) => ({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name })) };

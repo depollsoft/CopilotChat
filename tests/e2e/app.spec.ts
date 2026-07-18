@@ -52,15 +52,22 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.getByRole("button", { name: "Use in chat" }).click();
   await page.getByPlaceholder("Command").fill("ls -1"); await page.getByRole("button", { name: "Run" }).click(); await expect(page.getByText("note.txt")).toBeVisible();
   await page.getByRole("button", { name: "Close" }).click();
-  const modelSelect = page.getByLabel("Model", { exact: true });
-  const modelValue = await modelSelect.evaluate((select) => (select as HTMLSelectElement).options[(select as HTMLSelectElement).selectedIndex]?.value ?? "");
-  const effortSelect = page.getByLabel("Reasoning effort");
+  await page.getByRole("button", { name: /Model picker:/ }).click();
+  const modelPicker = page.getByRole("dialog", { name: "Model picker" });
+  const selectedModel = modelPicker.locator('[data-model-id][aria-selected="true"]');
+  const modelValue = (await selectedModel.getAttribute("data-model-id")) ?? "";
+  await modelPicker.locator('[data-model-id="gpt-5-mini"]').click();
+  await expect(modelPicker.getByLabel("Context size")).toHaveCount(0);
+  await modelPicker.locator(`[data-model-id="${modelValue}"]`).click();
+  const effortSelect = modelPicker.getByLabel("Reasoning effort");
   const effortValues = await effortSelect.evaluate((select) => Array.from((select as HTMLSelectElement).options).map((option) => option.value));
   const effortValue = effortValues.includes("high") ? "high" : effortValues[effortValues.length - 1] ?? "default";
   await effortSelect.selectOption(effortValue);
+  await modelPicker.getByLabel("Context size").selectOption("long_context");
+  await page.keyboard.press("Escape");
   await expect(page.getByRole("button", { name: /Context:/ })).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Hello from e2e.");
-  await expect(page.getByRole("button", { name: /Context: Estimated [1-9][0-9]* of/ })).toContainText(/<1%|[1-9][0-9]*%/);
+  await expect(page.getByRole("button", { name: /Context: .*Estimated [1-9][0-9]* of/ })).toContainText(/<1%|[1-9][0-9]*%/);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page).toHaveURL(/\/chats\/[^/]+$/);
   const assistantMessages = page.locator(".msg.assistant .msg-body");
@@ -88,6 +95,7 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   expect(dateBarriers.length).toBeGreaterThanOrEqual(1);
   expect(dateBarriers.every((barrier) => barrier.text.trim().length > 0 && !Number.isNaN(Date.parse(barrier.dateTime)))).toBe(true);
   await expect(assistantMessages.filter({ hasText: `Reasoning effort: ${effortValue}` }).last()).toBeVisible();
+  await expect(assistantMessages.filter({ hasText: "Context size: long_context." }).last()).toBeVisible();
   await expect(assistantMessages.filter({ hasText: "Project context: Project instructions: Use e2e project rules." }).last()).toBeVisible();
   await expect(assistantMessages.filter({ hasText: `Enabled skills: Skill ${testInfo.project.name}.` }).last()).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Use the previous answer as context.");
@@ -106,9 +114,24 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.locator(".sidebar-row.active[data-chat-id] .sidebar-row-menu").click({ force: true }); await page.getByRole("button", { name: "Rename", exact: true }).click(); await page.getByRole("dialog", { name: "Rename chat" }).getByLabel("Chat title").fill(`Renamed ${testInfo.project.name}`); await page.getByRole("button", { name: "Save title" }).click(); await expect(page.locator(".sidebar-row-title").filter({ hasText: `Renamed ${testInfo.project.name}` }).first()).toBeVisible();
 });
 
+test("project model defaults apply to the first turn", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers project model defaults.");
+  await page.goto("/");
+  await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
+  await page.getByRole("dialog", { name: "New project" }).getByLabel("Project name").fill("Project model default");
+  await page.getByRole("button", { name: "Create project" }).click();
+  await page.getByLabel("Project default model").selectOption("gpt-5-mini");
+  await expect(page.getByText("Project default model saved")).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Use the project model.");
+  await page.getByRole("button", { name: "Send" }).click();
+  const response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("gpt-5-mini");
+  await expect(response).toContainText("Context size: default.");
+});
+
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile shell coverage only runs in mobile project.");
-  await page.goto("/"); await expect(page.locator("body")).toBeVisible(); await expect(page.getByLabel("Model", { exact: true })).toBeVisible(); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
+  await page.goto("/"); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
 });
 
 test("composer pickers stay within the mobile viewport", async ({ page }, testInfo) => {

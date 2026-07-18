@@ -6,6 +6,8 @@ export const chatRoles = ["system", "user", "assistant", "tool"] as const;
 export type ChatRole = (typeof chatRoles)[number];
 export const reasoningEffortSchema = z.enum(["default", "none", "low", "medium", "high", "xhigh", "max"]);
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
+export const contextTierSchema = z.enum(["default", "long_context"]);
+export type ContextTier = z.infer<typeof contextTierSchema>;
 export const permissionModeSchema = z.enum(["ask", "yolo"]);
 export type PermissionMode = z.infer<typeof permissionModeSchema>;
 
@@ -64,6 +66,7 @@ export const chatSchema = z.object({
   providerSessionWorkspacePath: z.string().nullable(),
   model: z.string().nullable(),
   reasoningEffort: reasoningEffortSchema.nullable(),
+  contextTier: contextTierSchema.nullable(),
   title: z.string(),
   titleManuallySet: z.boolean().default(false),
   archived: z.boolean(),
@@ -192,7 +195,7 @@ export type ImportPreview = z.infer<typeof importPreviewSchema>;
 export const importDraftSchema = z.object({ id: z.string(), fileName: z.string(), source: importSourceSchema, encoding: z.enum(["text", "base64"]), createdAt: z.string() });
 export type ImportDraft = z.infer<typeof importDraftSchema>;
 
-export const providerModelSchema = z.object({ id: z.string(), name: z.string(), supportsReasoningEffort: z.boolean().default(false), supportedReasoningEfforts: z.array(z.string()).default([]), defaultReasoningEffort: z.string().optional(), contextWindowTokens: z.number().int().positive().optional(), maxPromptTokens: z.number().int().positive().optional() });
+export const providerModelSchema = z.object({ id: z.string(), name: z.string(), supportsReasoningEffort: z.boolean().default(false), supportedReasoningEfforts: z.array(z.string()).default([]), defaultReasoningEffort: z.string().optional(), supportsLongContext: z.boolean().default(false), contextWindowTokens: z.number().int().positive().optional(), maxPromptTokens: z.number().int().positive().optional(), longContextMaxPromptTokens: z.number().int().positive().optional() });
 export type ProviderModel = z.infer<typeof providerModelSchema>;
 export const providerStatusSchema = z.object({ id: z.string(), label: z.string(), available: z.boolean(), details: z.string(), capabilities: z.array(z.string()).default([]), models: z.array(providerModelSchema).default([]), defaultModel: z.string().optional() });
 export type ProviderStatus = z.infer<typeof providerStatusSchema>;
@@ -200,7 +203,7 @@ export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 export const appStateSchema = z.object({ owner: ownerSchema, projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
 export type AppState = z.infer<typeof appStateSchema>;
 
-export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), permissionMode: permissionModeSchema.optional() });
+export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
 export type SendMessageRequest = z.infer<typeof sendMessageRequestSchema>;
 export const activeResponseInputRequestSchema = sendMessageRequestSchema.extend({ mode: z.enum(["steer", "queue"]) });
 export type ActiveResponseInputRequest = z.infer<typeof activeResponseInputRequestSchema>;
@@ -228,9 +231,9 @@ export const conversationTranscriptMessageSchema = z.object({ id: z.string(), ro
 export type ConversationTranscriptMessage = z.infer<typeof conversationTranscriptMessageSchema>;
 export const conversationTranscriptSchema = z.object({ chatId: z.string(), title: z.string(), projectId: z.string().nullable(), projectName: z.string().nullable(), messageCount: z.number().int().nonnegative(), truncated: z.boolean(), messages: z.array(conversationTranscriptMessageSchema) });
 export type ConversationTranscript = z.infer<typeof conversationTranscriptSchema>;
-export const createChatRequestSchema = z.object({ title: z.string().min(1), projectId: z.string().optional().nullable(), workspaceId: z.string().optional().nullable(), model: z.string().min(1).optional().nullable(), reasoningEffort: reasoningEffortSchema.optional().nullable() });
+export const createChatRequestSchema = z.object({ title: z.string().min(1), projectId: z.string().optional().nullable(), workspaceId: z.string().optional().nullable(), model: z.string().min(1).optional().nullable(), reasoningEffort: reasoningEffortSchema.optional().nullable(), contextTier: contextTierSchema.optional().nullable() });
 export type CreateChatRequest = z.infer<typeof createChatRequestSchema>;
-export const updateChatRequestSchema = z.object({ title: z.string().min(1).optional(), archived: z.boolean().optional(), projectId: z.string().optional().nullable(), workspaceId: z.string().optional().nullable(), model: z.string().min(1).optional().nullable(), reasoningEffort: reasoningEffortSchema.optional().nullable(), favorite: z.boolean().optional() });
+export const updateChatRequestSchema = z.object({ title: z.string().min(1).optional(), archived: z.boolean().optional(), projectId: z.string().optional().nullable(), workspaceId: z.string().optional().nullable(), model: z.string().min(1).optional().nullable(), reasoningEffort: reasoningEffortSchema.optional().nullable(), contextTier: contextTierSchema.optional().nullable(), favorite: z.boolean().optional() });
 export type UpdateChatRequest = z.infer<typeof updateChatRequestSchema>;
 export const createArtifactRequestSchema = z.object({ projectId: z.string().optional().nullable(), chatId: z.string().optional().nullable(), messageId: z.string().optional().nullable(), title: z.string().min(1), kind: artifactKindSchema, language: z.string().optional().nullable(), content: z.string() });
 export type CreateArtifactRequest = z.infer<typeof createArtifactRequestSchema>;
