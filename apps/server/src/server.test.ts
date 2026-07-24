@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { CopilotProvider } from "@copilotchat/provider";
 import type { ImportPreview, MessageAttachment } from "@copilotchat/shared";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
@@ -37,6 +38,24 @@ describe("loadConfig", () => {
     } finally {
       if (previous === undefined) delete process.env.COPILOTCHAT_REQUIRE_CSRF;
       else process.env.COPILOTCHAT_REQUIRE_CSRF = previous;
+    }
+  });
+  it("treats empty optional deployment values as unset", () => {
+    const previousPublicUrl = process.env.COPILOTCHAT_PUBLIC_URL;
+    const tokenVariables = ["COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const;
+    const previousTokens = tokenVariables.map((name) => [name, process.env[name]] as const);
+    try {
+      process.env.COPILOTCHAT_PUBLIC_URL = "";
+      for (const name of tokenVariables) process.env[name] = "";
+      expect(loadConfig().publicUrl).toBeUndefined();
+      expect(loadConfig().copilotGitHubToken).toBeUndefined();
+    } finally {
+      if (previousPublicUrl === undefined) delete process.env.COPILOTCHAT_PUBLIC_URL;
+      else process.env.COPILOTCHAT_PUBLIC_URL = previousPublicUrl;
+      for (const [name, value] of previousTokens) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
     }
   });
 
@@ -207,6 +226,40 @@ describe("chat provider context", () => {
     expect(db.listChats(bob.id).map((chat) => chat.title)).toEqual(["Bob chat"]);
     expect(db.listSkills(alice.id).length).toBeGreaterThan(0);
     expect(db.listSkills(bob.id).length).toBeGreaterThan(0);
+  });
+
+  it("stores GitHub OAuth tokens per owner", () => {
+    const db = createTestDb();
+    const alice = db.getOrCreateGitHubOwner({ login: "alice", displayName: "Alice", avatarUrl: null });
+    const bob = db.getOrCreateGitHubOwner({ login: "bob", displayName: "Bob", avatarUrl: null });
+
+    db.setGitHubAuth(alice.id, { accessToken: "alice-token", login: "alice", displayName: "Alice", avatarUrl: null });
+    db.setGitHubAuth(bob.id, { accessToken: "bob-token", login: "bob", displayName: "Bob", avatarUrl: null });
+
+    expect(db.hasGitHubAuth(alice.id)).toBe(true);
+    expect(db.hasGitHubAuth(bob.id)).toBe(true);
+    expect(db.getGitHubToken(alice.id)).toBe("alice-token");
+    expect(db.getGitHubToken(bob.id)).toBe("bob-token");
+  });
+
+  it("migrates a persistent legacy GitHub token to owner-scoped storage", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-legacy-db-"));
+    const legacy = new Database(path.join(dir, "copilotchat.sqlite"));
+    legacy.exec(`
+      CREATE TABLE owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE auth_tokens (provider TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES ('local', 'local', 'Local user', NULL, 'local', '2026-01-01T00:00:00.000Z');
+      INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', 'local', 'legacy-token', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `);
+    legacy.close();
+    const db = new AppDatabase(dir);
+    tempDbs.push({ db, dir });
+    const alice = db.getOrCreateGitHubOwner({ login: "alice", displayName: "Alice", avatarUrl: null });
+
+    db.setGitHubAuth(alice.id, { accessToken: "alice-token", login: "alice", displayName: "Alice", avatarUrl: null });
+
+    expect(db.getGitHubToken("local")).toBe("legacy-token");
+    expect(db.getGitHubToken(alice.id)).toBe("alice-token");
   });
 
   it("keeps large artifact content out of app state", () => {

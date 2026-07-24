@@ -23,23 +23,43 @@ By default data is stored in `.data/`. Set `COPILOTCHAT_DATA_DIR` to change it.
 
 ## Docker
 
+The checked-in Compose file uses the published GHCR image by default, keeps all state in a named volume, and can also build the same image locally:
+
 ```bash
-docker compose up --build
+cp .env.example .env
+docker compose pull
+docker compose up -d
 ```
 
-Docker Compose publishes on `127.0.0.1:4317` by default and stores state in the `copilotchat-data` volume. Cowork/workspace mode needs host folders mounted into the container before they can be registered. In GitHub auth mode, registered workspaces must live under `COPILOTCHAT_WORKSPACE_ROOT/<github-login>/`. If exposing on a VPN/LAN interface, set `COPILOTCHAT_ALLOWED_ORIGINS` to the exact browser origins.
+Use `docker compose up -d --build` instead to build from the current checkout. The service listens on `127.0.0.1:4317` by default; change `COPILOTCHAT_BIND_ADDRESS` and `COPILOTCHAT_PORT` in `.env` when placing it behind a reverse proxy or exposing it on a trusted network. Application state, OAuth tokens, imports, artifacts, and SQLite files persist in the `copilotchat-data` volume across container replacement.
 
-For self-hosted multi-user access, set `COPILOTCHAT_AUTH_MODE=github`, `COPILOTCHAT_PUBLIC_URL`, `COPILOTCHAT_SESSION_SECRET`, `GITHUB_CLIENT_ID`, and `GITHUB_CLIENT_SECRET`. Configure the GitHub OAuth app callback URL as:
+For direct GitHub login, create a GitHub OAuth App and set these values in `.env`:
+
+```dotenv
+COPILOTCHAT_AUTH_MODE=github
+COPILOTCHAT_PUBLIC_URL=https://chat.example.com
+COPILOTCHAT_SESSION_SECRET=replace-with-a-long-random-value
+GITHUB_CLIENT_ID=your-oauth-client-id
+GITHUB_CLIENT_SECRET=your-oauth-client-secret
+```
+
+Generate the session secret with `openssl rand -hex 32`. Configure the OAuth App homepage as the public URL and its callback URL as:
 
 ```text
-https://your-host.example.com/api/auth/github/callback
+https://chat.example.com/api/auth/github/callback
 ```
 
-Each signed-in GitHub login gets an isolated owner record, so chats, projects, skills, MCP servers, workspaces, imports, and artifacts are scoped by login. Published images are available from GitHub Container Registry after merges to `main`:
+The OAuth token is stored in the persistent volume and passed to the Copilot SDK for that user, so each signed-in account uses its own Copilot subscription. Chats, projects, skills, MCP servers, workspaces, imports, artifacts, tokens, and provider status are isolated by GitHub login. Cowork/workspace mode requires host folders to be mounted into the container before registration; in GitHub auth mode each registered path must be under `COPILOTCHAT_WORKSPACE_ROOT/<github-login>/`.
+
+For a single-user local deployment, leave `COPILOTCHAT_AUTH_MODE=local` and set `COPILOT_GITHUB_TOKEN` instead. If exposing the app beyond localhost, use HTTPS and set `COPILOTCHAT_ALLOWED_ORIGINS` to the exact browser origins.
+
+GitHub Actions publishes `latest`, `main`, `sha-*`, and version tags to GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/OWNER/REPOSITORY:main
+docker pull ghcr.io/depollsoft/copilotchat:latest
 ```
+
+GHCR packages may need to be made public once after their first publication for anonymous pulls.
 
 ## Environment
 
@@ -47,6 +67,10 @@ docker pull ghcr.io/OWNER/REPOSITORY:main
 | --- | --- | --- |
 | `COPILOTCHAT_HOST` | `127.0.0.1` | Server bind host |
 | `COPILOTCHAT_PORT` | `4317` | Server port |
+| `COPILOTCHAT_BIND_ADDRESS` | `127.0.0.1` | Host interface used by Docker Compose |
+| `COPILOTCHAT_IMAGE` | `ghcr.io/depollsoft/copilotchat:latest` | Image used by Docker Compose |
+| `COPILOTCHAT_VOLUME_NAME` | `copilotchat-data` | Persistent Docker volume name |
+| `COPILOTCHAT_CONTAINER_WORKSPACE_ROOT` | `/data/registered-workspaces` | Container workspace root used by Docker Compose |
 | `COPILOTCHAT_DATA_DIR` | `.data` | SQLite database and runtime data |
 | `COPILOTCHAT_WORKSPACE_ROOT` | `.data/registered-workspaces` | Base folder for GitHub-mode registered workspaces; each login is confined to a subfolder |
 | `COPILOTCHAT_BODY_LIMIT_BYTES` | `52428800` | Maximum API request body size |
@@ -55,7 +79,7 @@ docker pull ghcr.io/OWNER/REPOSITORY:main
 | `COPILOTCHAT_ALLOWED_ORIGINS` | localhost origins | Comma-separated browser origins allowed to call the API |
 | `COPILOTCHAT_PUBLIC_URL` | request origin | Public base URL for OAuth redirects, e.g. `https://chat.example.com` |
 | `COPILOTCHAT_SESSION_SECRET` | empty | Required when `COPILOTCHAT_AUTH_MODE=github`; signs session cookies |
-| `COPILOT_GITHUB_TOKEN` | empty | Recommended token env var for Copilot SDK auth in `pnpm dev` |
+| `COPILOT_GITHUB_TOKEN` | empty | Recommended token for Copilot SDK auth in local or non-interactive deployments |
 | `GITHUB_COPILOT_TOKEN` | empty | Token injected by some Copilot launcher sessions; also supported |
 | `COPILOTCHAT_COPILOT_CLI_PATH` | auto-detected from PATH | Copilot CLI executable for the SDK to use |
 | `COPILOTCHAT_REQUIRE_CSRF` | `true` | Require `X-CopilotChat-CSRF: 1` for mutating API requests |

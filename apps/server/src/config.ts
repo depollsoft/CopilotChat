@@ -39,6 +39,13 @@ const configSchema = z.object({
 export type AppConfig = z.infer<typeof configSchema>;
 export function loadConfig(): AppConfig {
   const dataDir = path.resolve(process.env.COPILOTCHAT_DATA_DIR ?? ".data");
+  const copilotToken = [
+    ["COPILOT_GITHUB_TOKEN", optionalEnv(process.env.COPILOT_GITHUB_TOKEN)],
+    ["GITHUB_COPILOT_TOKEN", optionalEnv(process.env.GITHUB_COPILOT_TOKEN)],
+    ["GH_TOKEN", optionalEnv(process.env.GH_TOKEN)],
+    ["GITHUB_TOKEN", optionalEnv(process.env.GITHUB_TOKEN)],
+  ] as const;
+  const configuredToken = copilotToken.find((entry) => entry[1]);
   return configSchema.parse({
     host: process.env.COPILOTCHAT_HOST,
     port: process.env.COPILOTCHAT_PORT,
@@ -46,22 +53,27 @@ export function loadConfig(): AppConfig {
     workspaceRoot: path.resolve(process.env.COPILOTCHAT_WORKSPACE_ROOT || path.join(dataDir, "registered-workspaces")),
     bodyLimitBytes: process.env.COPILOTCHAT_BODY_LIMIT_BYTES,
     authMode: process.env.COPILOTCHAT_AUTH_MODE,
-    apiToken: process.env.COPILOTCHAT_API_TOKEN,
-    githubClientId: process.env.GITHUB_CLIENT_ID,
-    githubClientSecret: process.env.GITHUB_CLIENT_SECRET,
-    sessionSecret: process.env.COPILOTCHAT_SESSION_SECRET,
-    publicUrl: process.env.COPILOTCHAT_PUBLIC_URL,
+    apiToken: optionalEnv(process.env.COPILOTCHAT_API_TOKEN),
+    githubClientId: optionalEnv(process.env.GITHUB_CLIENT_ID),
+    githubClientSecret: optionalEnv(process.env.GITHUB_CLIENT_SECRET),
+    sessionSecret: optionalEnv(process.env.COPILOTCHAT_SESSION_SECRET),
+    publicUrl: optionalEnv(process.env.COPILOTCHAT_PUBLIC_URL),
     copilotProvider: process.env.COPILOT_PROVIDER,
-    copilotApiBaseUrl: process.env.COPILOT_API_BASE_URL,
-    copilotApiToken: process.env.COPILOT_API_TOKEN,
+    copilotApiBaseUrl: optionalEnv(process.env.COPILOT_API_BASE_URL),
+    copilotApiToken: optionalEnv(process.env.COPILOT_API_TOKEN),
     copilotModel: process.env.COPILOT_MODEL,
-    copilotCliCommand: process.env.COPILOT_CLI_COMMAND,
+    copilotCliCommand: optionalEnv(process.env.COPILOT_CLI_COMMAND),
     copilotSdkCliPath: resolveCopilotCliPath(),
-    copilotGitHubToken: process.env.COPILOT_GITHUB_TOKEN ?? process.env.GITHUB_COPILOT_TOKEN ?? process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN,
-    copilotGitHubTokenSource: process.env.COPILOT_GITHUB_TOKEN ? "COPILOT_GITHUB_TOKEN" : process.env.GITHUB_COPILOT_TOKEN ? "GITHUB_COPILOT_TOKEN" : process.env.GH_TOKEN ? "GH_TOKEN" : process.env.GITHUB_TOKEN ? "GITHUB_TOKEN" : undefined,
+    copilotGitHubToken: configuredToken?.[1],
+    copilotGitHubTokenSource: configuredToken?.[0],
     allowedOrigins: (process.env.COPILOTCHAT_ALLOWED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
     requireCsrf: process.env.COPILOTCHAT_REQUIRE_CSRF,
   });
+}
+
+function optionalEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed || undefined;
 }
 
 function resolveCopilotCliPath(): string | undefined {

@@ -30,15 +30,15 @@ const db = new AppDatabase(config.dataDir);
 const isolatedWorkspaceRoot = path.join(config.dataDir, "isolated-workspaces");
 const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"));
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
-const provider = createCopilotProvider({ provider: config.copilotProvider, apiBaseUrl: config.copilotApiBaseUrl, apiToken: config.copilotApiToken, model: config.copilotModel, cliCommand: config.copilotCliCommand, sdkCliPath: config.copilotSdkCliPath, gitHubToken: config.copilotGitHubToken });
+const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
 const app = Fastify({ logger: true, bodyLimit: config.bodyLimitBytes });
 const requestOwners = new WeakMap<FastifyRequest, Owner>();
 const sessionCookieName = "copilotchat_session";
 const oauthStateCookieName = "copilotchat_oauth_state";
 const providerStatusTtlMs = 5 * 60_000;
-let providerStatusCache: { status: ProviderStatus; expiresAt: number } | null = null;
-let providerStatusInFlight: Promise<ProviderStatus> | null = null;
+const providerStatusCache = new Map<string, { credentialKey: string; status: ProviderStatus; expiresAt: number }>();
+const providerStatusInFlight = new Map<string, { credentialKey: string; promise: Promise<ProviderStatus> }>();
 const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...config.allowedOrigins]);
 await app.register(cors, {
   delegator: (request, callback) => {
@@ -52,6 +52,7 @@ await app.register(cors, {
 });
 app.addHook("preHandler", async (request, reply) => {
   if (!request.raw.url?.startsWith(apiPrefix)) return;
+  if (config.authMode === "github" && isGitHubDevicePath(request.raw.url)) { reply.code(404).send({ error: "Not found" }); return; }
   const bearerOk = Boolean(config.apiToken && request.headers.authorization === `Bearer ${config.apiToken}`);
   if (config.authMode === "github" && !isAuthExemptPath(request.raw.url)) {
     const owner = bearerOk ? db.getOwner() : readSessionOwner(request);
@@ -68,20 +69,22 @@ const githubDevicePollResponseSchema = z.union([z.object({ access_token: z.strin
 const githubUserSchema = z.object({ login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
 async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
   const attachments = validateMessageAttachments(input);
+  const gitHubToken = gitHubTokenForOwner(ownerId);
+  if (config.authMode === "github" && !gitHubToken) throw new Error("GitHub authentication has expired. Sign in with GitHub again.");
   let chat = applyChatTurnScope(db, ownerId, chatId, input);
   if (input.model !== undefined || input.reasoningEffort !== undefined || input.contextTier !== undefined) chat = db.updateChat(ownerId, chat.id, { model: input.model ?? chat.model, reasoningEffort: input.reasoningEffort ?? chat.reasoningEffort, contextTier: input.contextTier ?? chat.contextTier });
   const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
   if (!existingUserMessage && attachments.length > 0) db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
   if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
   const titleRequired = !chat.titleManuallySet && db.listMessages(chat.id).filter((message) => message.role === "user").length <= 1;
-  const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken: db.getGitHubToken() ?? config.copilotGitHubToken ?? null, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
+  const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
   attachImportGuidance(ownerId, input, providerRequest);
   await fs.promises.mkdir(providerRequest.workingDirectory ?? isolatedWorkspaceRoot, { recursive: true });
   providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
   return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
 }
 app.get(`${apiPrefix}/health`, async () => ({ ok: true, name: "CopilotChat", time: new Date().toISOString() }));
-app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: config.authMode === "github" ? Boolean(owner) : db.hasGitHubAuth(), apiTokenRequired: Boolean(config.apiToken), copilotTokenSource: config.copilotGitHubTokenSource ?? null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
+app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, apiTokenRequired: Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
 app.get(`${apiPrefix}/auth/github/login`, async (request, reply) => {
   if (!config.githubClientId || !config.githubClientSecret) throw new Error("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are required for GitHub login.");
   const state = randomBytes(24).toString("base64url");
@@ -101,6 +104,8 @@ app.get(`${apiPrefix}/auth/github/callback`, async (request, reply) => {
   if (!userResponse.ok) throw new Error(`GitHub user lookup failed: ${userResponse.status} ${await userResponse.text()}`);
   const githubUser = githubUserSchema.parse(await userResponse.json());
   const owner = db.getOrCreateGitHubOwner({ login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
+  db.setGitHubAuth(owner.id, { accessToken: token.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
+  providerStatusCache.delete(owner.id);
   reply.header("Set-Cookie", [cookie(sessionCookieName, signSession(owner), 60 * 60 * 24 * 30), clearCookie(oauthStateCookieName)]);
   reply.redirect("/");
 });
@@ -109,7 +114,7 @@ app.post(`${apiPrefix}/auth/github/device/start`, async () => { if (!config.gith
 app.post(`${apiPrefix}/auth/github/device/poll`, async (request) => { if (!config.githubClientId) throw new Error("GITHUB_CLIENT_ID is required for GitHub OAuth device flow."); const body = z.object({ deviceCode: z.string().min(1) }).parse(request.body); const response = await fetch("https://github.com/login/oauth/access_token", { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ client_id: config.githubClientId, device_code: body.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }) }); if (!response.ok) throw new Error(`GitHub token exchange failed: ${response.status} ${await response.text()}`); const tokenResponse = githubDevicePollResponseSchema.parse(await response.json()); if ("error" in tokenResponse) { if (tokenResponse.error === "authorization_pending" || tokenResponse.error === "slow_down") return { status: tokenResponse.error }; throw new Error(tokenResponse.error_description ?? tokenResponse.error); } const userResponse = await fetch("https://api.github.com/user", { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${tokenResponse.access_token}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!userResponse.ok) throw new Error(`GitHub user lookup failed: ${userResponse.status} ${await userResponse.text()}`); const githubUser = githubUserSchema.parse(await userResponse.json()); return { status: "authenticated", owner: db.setGitHubAuth({ accessToken: tokenResponse.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url }) }; });
 app.get(`${apiPrefix}/state`, async (request) => {
   const owner = ownerFor(request);
-  const state = db.getState(await cachedProviderStatus(), [], owner.id);
+  const state = db.getState(await cachedProviderStatus(owner.id), [], owner.id);
   const chatIds = new Set([...state.chats, ...state.archivedChats].map((chat) => chat.id));
   return { ...state, activeChatIds: activeResponses.chatIds().filter((id) => chatIds.has(id)) };
 });
@@ -214,6 +219,7 @@ function isAuthExemptPath(rawUrl: string): boolean {
   const pathname = rawUrl.split("?")[0] ?? rawUrl;
   return pathname === `${apiPrefix}/health` || pathname === `${apiPrefix}/auth/status` || pathname === `${apiPrefix}/auth/logout` || pathname.startsWith(`${apiPrefix}/auth/github/`);
 }
+function isGitHubDevicePath(rawUrl: string): boolean { return (rawUrl.split("?")[0] ?? rawUrl).startsWith(`${apiPrefix}/auth/github/device/`); }
 function ownerFor(request: FastifyRequest): Owner { return requestOwners.get(request) ?? db.getOwner(); }
 function ownerForOptional(request: FastifyRequest): Owner | null {
   if (config.authMode !== "github") return db.getOwner();
@@ -271,19 +277,31 @@ function publicOrigin(request: FastifyRequest): string {
 function validateMcpTransportForMode(transport: "stdio" | "http" | "sse"): void {
   if (config.authMode === "github" && transport === "stdio") throw new Error("stdio MCP servers are disabled in GitHub auth mode.");
 }
-async function cachedProviderStatus(): Promise<ProviderStatus> {
-  const now = Date.now();
-  if (providerStatusCache && providerStatusCache.expiresAt > now) return providerStatusCache.status;
-  refreshProviderStatus();
-  return providerStatusCache?.status ?? loadingProviderStatus();
+function createConfiguredProvider(gitHubToken?: string) {
+  return createCopilotProvider({ provider: config.copilotProvider, apiBaseUrl: config.copilotApiBaseUrl, apiToken: config.copilotApiToken, model: config.copilotModel, cliCommand: config.copilotCliCommand, sdkCliPath: config.copilotSdkCliPath, gitHubToken });
 }
-function refreshProviderStatus(): void {
-  providerStatusInFlight ??= provider.status().then((status) => {
-    providerStatusCache = { status, expiresAt: Date.now() + providerStatusTtlMs };
+function gitHubTokenForOwner(ownerId: string): string | null { return db.getGitHubToken(ownerId) ?? (config.authMode === "local" ? config.copilotGitHubToken ?? null : null); }
+function providerCredentialKey(token: string | null): string { return createHmac("sha256", config.sessionSecret ?? "local-provider-cache").update(token ?? "").digest("base64url"); }
+async function cachedProviderStatus(ownerId: string): Promise<ProviderStatus> {
+  const now = Date.now();
+  const token = gitHubTokenForOwner(ownerId);
+  const credentialKey = providerCredentialKey(token);
+  const cached = providerStatusCache.get(ownerId);
+  if (cached?.credentialKey === credentialKey && cached.expiresAt > now) return cached.status;
+  if (config.authMode === "github" && !token) return missingGitHubOAuthStatus();
+  refreshProviderStatus(ownerId, token, credentialKey);
+  return cached?.credentialKey === credentialKey ? cached.status : loadingProviderStatus();
+}
+function refreshProviderStatus(ownerId: string, token: string | null, credentialKey: string): void {
+  if (providerStatusInFlight.get(ownerId)?.credentialKey === credentialKey) return;
+  const statusPromise = createConfiguredProvider(token ?? undefined).status().then((status) => {
+    if (providerCredentialKey(gitHubTokenForOwner(ownerId)) === credentialKey) providerStatusCache.set(ownerId, { credentialKey, status, expiresAt: Date.now() + providerStatusTtlMs });
     return status;
-  }).finally(() => { providerStatusInFlight = null; });
+  }).finally(() => { if (providerStatusInFlight.get(ownerId)?.promise === statusPromise) providerStatusInFlight.delete(ownerId); });
+  providerStatusInFlight.set(ownerId, { credentialKey, promise: statusPromise });
 }
 function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
+function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
 function validateMessageAttachments(input: SendMessageRequest): MessageAttachment[] {
   const attachments = input.attachments ?? [];
   if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
