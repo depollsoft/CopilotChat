@@ -674,7 +674,7 @@ function sdkFailureDetails(error: unknown, options: ProviderFactoryOptions): str
   const detectedCli = options.sdkCliPath ? ` Detected Copilot CLI: ${options.sdkCliPath}.` : " No copilot executable was found on PATH.";
   const authHint = /auth/i.test(message)
     ? options.gitHubToken
-      ? " The supplied GitHub OAuth token was rejected or does not have Copilot access. Sign in again and verify that the GitHub account has an active Copilot subscription."
+      ? " The supplied GitHub token was rejected or does not have Copilot access. Verify the token and confirm that the GitHub account has an active Copilot subscription."
       : " No usable Copilot auth was found. Run `copilot login` or `gh auth login` in the same terminal that starts the app, or set `COPILOT_GITHUB_TOKEN`, then restart `pnpm dev`."
     : "";
   return `Copilot SDK model discovery failed: ${message}.${detectedCli}${authHint}`;

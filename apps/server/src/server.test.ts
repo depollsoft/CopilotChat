@@ -284,8 +284,9 @@ describe("chat provider context", () => {
     const content = "large artifact\n".repeat(1000);
     const artifact = db.createArtifact(owner.id, { title: "Large notes", kind: "markdown", content });
 
-    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], defaultModel: "gpt-test" });
+    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], defaultModel: "gpt-test" }, [], owner.id, "github");
 
+    expect(state.authMode).toBe("github");
     expect(state.artifacts[0]).toMatchObject({ id: artifact.id, title: "Large notes", contentLength: content.length });
     expect(state.artifacts[0]?.contentPreview.length).toBeLessThan(content.length);
     expect(JSON.stringify(state)).not.toContain(content);

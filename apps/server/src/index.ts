@@ -39,7 +39,8 @@ const oauthStateCookieName = "copilotchat_oauth_state";
 const providerStatusTtlMs = 5 * 60_000;
 const providerStatusCache = new Map<string, { credentialKey: string; status: ProviderStatus; expiresAt: number }>();
 const providerStatusInFlight = new Map<string, { credentialKey: string; promise: Promise<ProviderStatus> }>();
-const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...config.allowedOrigins]);
+const configuredPublicOrigin = config.publicUrl ? new URL(config.publicUrl).origin : null;
+const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...(configuredPublicOrigin ? [configuredPublicOrigin] : []), ...config.allowedOrigins]);
 await app.register(cors, {
   delegator: (request, callback) => {
     const origin = request.headers.origin;
@@ -55,7 +56,7 @@ app.addHook("preHandler", async (request, reply) => {
   if (config.authMode === "github" && isGitHubDevicePath(request.raw.url)) { reply.code(404).send({ error: "Not found" }); return; }
   const bearerOk = Boolean(config.apiToken && request.headers.authorization === `Bearer ${config.apiToken}`);
   if (config.authMode === "github" && !isAuthExemptPath(request.raw.url)) {
-    const owner = bearerOk ? db.getOwner() : readSessionOwner(request);
+    const owner = readSessionOwner(request);
     if (!owner) { reply.code(401).send({ error: "Login required", loginUrl: `${apiPrefix}/auth/github/login` }); return; }
     requestOwners.set(request, owner);
   } else if (config.apiToken && !bearerOk && config.authMode !== "github") {
@@ -84,7 +85,7 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessa
   return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
 }
 app.get(`${apiPrefix}/health`, async () => ({ ok: true, name: "CopilotChat", time: new Date().toISOString() }));
-app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, apiTokenRequired: Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
+app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, apiTokenRequired: config.authMode === "local" && Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
 app.get(`${apiPrefix}/auth/github/login`, async (request, reply) => {
   if (!config.githubClientId || !config.githubClientSecret) throw new Error("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are required for GitHub login.");
   const state = randomBytes(24).toString("base64url");
@@ -119,7 +120,7 @@ app.post(`${apiPrefix}/auth/github/device/start`, async () => { if (!config.gith
 app.post(`${apiPrefix}/auth/github/device/poll`, async (request) => { if (!config.githubClientId) throw new Error("GITHUB_CLIENT_ID is required for GitHub OAuth device flow."); const body = z.object({ deviceCode: z.string().min(1) }).parse(request.body); const response = await fetch("https://github.com/login/oauth/access_token", { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ client_id: config.githubClientId, device_code: body.deviceCode, grant_type: "urn:ietf:params:oauth:grant-type:device_code" }) }); if (!response.ok) throw new Error(`GitHub token exchange failed: ${response.status} ${await response.text()}`); const tokenResponse = githubDevicePollResponseSchema.parse(await response.json()); if ("error" in tokenResponse) { if (tokenResponse.error === "authorization_pending" || tokenResponse.error === "slow_down") return { status: tokenResponse.error }; throw new Error(tokenResponse.error_description ?? tokenResponse.error); } const userResponse = await fetch("https://api.github.com/user", { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${tokenResponse.access_token}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!userResponse.ok) throw new Error(`GitHub user lookup failed: ${userResponse.status} ${await userResponse.text()}`); const githubUser = githubUserSchema.parse(await userResponse.json()); return { status: "authenticated", owner: db.setGitHubAuth({ accessToken: tokenResponse.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url }) }; });
 app.get(`${apiPrefix}/state`, async (request) => {
   const owner = ownerFor(request);
-  const state = db.getState(await cachedProviderStatus(owner.id), [], owner.id);
+  const state = db.getState(await cachedProviderStatus(owner.id), [], owner.id, config.authMode);
   const chatIds = new Set([...state.chats, ...state.archivedChats].map((chat) => chat.id));
   return { ...state, activeChatIds: activeResponses.chatIds().filter((id) => chatIds.has(id)) };
 });

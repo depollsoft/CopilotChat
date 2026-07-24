@@ -72,13 +72,12 @@ GHCR packages may need to be made public once after their first publication for 
 | `COPILOTCHAT_PORT` | `4317` | Server port |
 | `COPILOTCHAT_BIND_ADDRESS` | `127.0.0.1` | Host interface used by Docker Compose |
 | `COPILOTCHAT_IMAGE` | `ghcr.io/depollsoft/copilotchat:latest` | Image used by Docker Compose |
-| `COPILOTCHAT_VOLUME_NAME` | `copilotchat-data` | Persistent Docker volume name |
 | `COPILOTCHAT_CONTAINER_WORKSPACE_ROOT` | `/data/registered-workspaces` | Container workspace root used by Docker Compose |
 | `COPILOTCHAT_DATA_DIR` | `.data` | SQLite database and runtime data |
 | `COPILOTCHAT_WORKSPACE_ROOT` | `.data/registered-workspaces` | Base folder for GitHub-mode registered workspaces; each login is confined to a subfolder |
 | `COPILOTCHAT_BODY_LIMIT_BYTES` | `52428800` | Maximum API request body size |
 | `COPILOTCHAT_AUTH_MODE` | `local` | `local` or `github` |
-| `COPILOTCHAT_API_TOKEN` | empty | Optional API bearer token for exposed installs |
+| `COPILOTCHAT_API_TOKEN` | empty | Optional API bearer token for exposed local-auth installs |
 | `COPILOTCHAT_ALLOWED_ORIGINS` | localhost origins | Comma-separated browser origins allowed to call the API |
 | `COPILOTCHAT_PUBLIC_URL` | request origin | Public base URL for OAuth redirects, e.g. `https://chat.example.com` |
 | `COPILOTCHAT_SESSION_SECRET` | empty | Required when `COPILOTCHAT_AUTH_MODE=github`; signs session cookies |

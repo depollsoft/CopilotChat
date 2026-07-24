@@ -35,4 +35,3 @@ services:
 
 volumes:
   copilotchat-data:
-    name: ${COPILOTCHAT_VOLUME_NAME:-copilotchat-data}
