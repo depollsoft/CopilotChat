@@ -6,6 +6,7 @@ import type { AppState, Artifact, ArtifactSummary, Chat, ChatMessage, Conversati
 import { builtInSkills } from "./builtins.js";
 
 type Row = Record<string, unknown>;
+type GitHubAuthInput = { accessToken: string; login: string; displayName: string | null; avatarUrl: string | null };
 const maxMessageMetadataLength = 25_000_000;
 
 export class AppDatabase {
@@ -14,22 +15,34 @@ export class AppDatabase {
 
   getOwner(): Owner { const row = this.db.prepare("SELECT * FROM owners ORDER BY created_at LIMIT 1").get() as Row | undefined; if (!row) throw new Error("Local owner was not initialized."); return mapOwner(row); }
   getOwnerById(ownerId: string): Owner { const row = this.db.prepare("SELECT * FROM owners WHERE id = ?").get(ownerId) as Row | undefined; if (!row) throw new Error("Owner not found."); return mapOwner(row); }
-  getOrCreateGitHubOwner(input: { login: string; displayName: string | null; avatarUrl: string | null }): Owner {
-    const id = `github:${input.login.toLowerCase()}`;
-    const existing = this.db.prepare("SELECT * FROM owners WHERE id = ?").get(id) as Row | undefined;
+  getGitHubOwnerByProviderId(providerUserId: string): Owner | null { const row = this.db.prepare("SELECT * FROM owners WHERE auth_provider = 'github' AND provider_user_id = ?").get(providerUserId) as Row | undefined; return row ? mapOwner(row) : null; }
+  getLegacyGitHubOwnerById(ownerId: string): Owner | null { const row = this.db.prepare("SELECT * FROM owners WHERE id = ? AND auth_provider = 'github' AND provider_user_id IS NULL").get(ownerId) as Row | undefined; return row ? mapOwner(row) : null; }
+  getLegacyGitHubOwnerByLogin(login: string): Owner | null { const row = this.db.prepare("SELECT * FROM owners WHERE id = ? AND auth_provider = 'github' AND provider_user_id IS NULL").get(`github:${login.toLowerCase()}`) as Row | undefined; return row ? mapOwner(row) : null; }
+  getOrCreateGitHubOwner(input: { providerUserId: string; login: string; displayName: string | null; avatarUrl: string | null; legacyOwnerId?: string | null }): Owner {
+    const existing = this.db.prepare("SELECT * FROM owners WHERE auth_provider = 'github' AND provider_user_id = ?").get(input.providerUserId) as Row | undefined;
     const now = iso();
     if (existing) {
-      this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ?, auth_provider = 'github' WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, id);
-      return this.getOwnerById(id);
+      this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ? WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, String(existing.id));
+      return this.getOwnerById(String(existing.id));
     }
-    this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, ?, ?, ?, 'github', ?)").run(id, input.login, input.displayName, input.avatarUrl, now);
+    if (input.legacyOwnerId) {
+      const legacy = this.db.prepare("SELECT id FROM owners WHERE id = ? AND auth_provider = 'github' AND provider_user_id IS NULL").get(input.legacyOwnerId) as Row | undefined;
+      if (legacy) {
+        this.db.prepare("UPDATE owners SET provider_user_id = ?, login = ?, display_name = ?, avatar_url = ? WHERE id = ?").run(input.providerUserId, input.login, input.displayName, input.avatarUrl, input.legacyOwnerId);
+        return this.getOwnerById(input.legacyOwnerId);
+      }
+    }
+    const id = `github-id:${input.providerUserId}`;
+    this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, provider_user_id, created_at) VALUES (?, ?, ?, ?, 'github', ?, ?)").run(id, input.login, input.displayName, input.avatarUrl, input.providerUserId, now);
     for (const skill of builtInSkills) this.upsertSkill(id, skill, true, null);
     return this.getOwnerById(id);
   }
-  hasGitHubAuth(): boolean { return Boolean(this.db.prepare("SELECT 1 FROM auth_tokens WHERE provider = 'github' LIMIT 1").get() as Row | undefined); }
-  getGitHubToken(): string | null { const row = this.db.prepare("SELECT access_token FROM auth_tokens WHERE provider = 'github' LIMIT 1").get() as Row | undefined; return nullableString(row?.access_token); }
-  setGitHubAuth(input: { accessToken: string; login: string; displayName: string | null; avatarUrl: string | null }): Owner { const now = iso(); const ownerId = this.getOwner().id; this.db.prepare(`INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET access_token = excluded.access_token, updated_at = excluded.updated_at`).run(ownerId, input.accessToken, now, now); this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ?, auth_provider = 'github' WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, ownerId); return this.getOwner(); }
-  getState(provider: ProviderStatus, activeChatIds: string[] = [], ownerId = this.getOwner().id): AppState { const owner = this.getOwnerById(ownerId); return { owner, projects: this.listProjects(owner.id), projectReferences: this.listProjectReferences(owner.id), projectChatReferences: this.listProjectChatReferences(owner.id), chats: this.listChats(owner.id), archivedChats: this.listArchivedChats(owner.id), artifacts: this.listArtifactSummaries(owner.id), skills: this.listSkills(owner.id), mcpServers: this.listMcpServers(owner.id), workspaces: this.listWorkspaces(owner.id), provider, activeChatIds }; }
+  hasGitHubAuth(ownerId = this.getOwner().id): boolean { return Boolean(this.db.prepare("SELECT 1 FROM auth_tokens WHERE provider = 'github' AND owner_id = ?").get(ownerId) as Row | undefined); }
+  getGitHubToken(ownerId = this.getOwner().id): string | null { const row = this.db.prepare("SELECT access_token FROM auth_tokens WHERE provider = 'github' AND owner_id = ?").get(ownerId) as Row | undefined; return nullableString(row?.access_token); }
+  setGitHubAuth(input: GitHubAuthInput): Owner;
+  setGitHubAuth(ownerId: string, input: GitHubAuthInput): Owner;
+  setGitHubAuth(ownerOrInput: string | GitHubAuthInput, explicitInput?: GitHubAuthInput): Owner { const ownerId = typeof ownerOrInput === "string" ? ownerOrInput : this.getOwner().id; const input = typeof ownerOrInput === "string" ? explicitInput : ownerOrInput; if (!input) throw new Error("GitHub auth details are required."); const now = iso(); this.getOwnerById(ownerId); this.db.prepare(`INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', ?, ?, ?, ?) ON CONFLICT(provider, owner_id) DO UPDATE SET access_token = excluded.access_token, updated_at = excluded.updated_at`).run(ownerId, input.accessToken, now, now); this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ?, auth_provider = 'github' WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, ownerId); return this.getOwnerById(ownerId); }
+  getState(provider: ProviderStatus, activeChatIds: string[] = [], ownerId = this.getOwner().id, authMode: AppState["authMode"] = "local"): AppState { const owner = this.getOwnerById(ownerId); return { owner, authMode, projects: this.listProjects(owner.id), projectReferences: this.listProjectReferences(owner.id), projectChatReferences: this.listProjectChatReferences(owner.id), chats: this.listChats(owner.id), archivedChats: this.listArchivedChats(owner.id), artifacts: this.listArtifactSummaries(owner.id), skills: this.listSkills(owner.id), mcpServers: this.listMcpServers(owner.id), workspaces: this.listWorkspaces(owner.id), provider, activeChatIds }; }
 
   listProjects(ownerId: string): Project[] { return (this.db.prepare("SELECT * FROM projects WHERE owner_id = ? ORDER BY favorite DESC, updated_at DESC").all(ownerId) as Row[]).map(mapProject); }
   createProject(ownerId: string, input: CreateProjectRequest): Project { const now = iso(); const id = randomUUID(); this.db.prepare("INSERT INTO projects (id, owner_id, name, description, instructions, memory, default_model, favorite, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)").run(id, ownerId, input.name, input.description ?? null, input.instructions ?? null, input.memory ?? null, input.defaultModel ?? null, now, now); return this.getProject(ownerId, id); }
@@ -145,8 +158,8 @@ export class AppDatabase {
   close(): void { this.db.close(); }
 
   private migrate(): void { this.db.exec(`
-    CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS auth_tokens (provider TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, provider_user_id TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS auth_tokens (provider TEXT NOT NULL, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (provider, owner_id));
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT, instructions TEXT, memory TEXT, default_model TEXT, favorite INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_chat_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, source_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, title TEXT NOT NULL, excerpt TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -158,9 +171,23 @@ export class AppDatabase {
     CREATE TABLE IF NOT EXISTS skills (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 1, built_in INTEGER NOT NULL DEFAULT 0, manifest TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS mcp_servers (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, transport TEXT NOT NULL, command TEXT, args TEXT NOT NULL DEFAULT '[]', url TEXT, tools TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS tool_runs (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL, workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL, tool_name TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, output TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-  `); this.ensureColumn("projects", "memory", "TEXT"); this.ensureColumn("projects", "default_model", "TEXT"); this.ensureColumn("projects", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "workspace_id", "TEXT REFERENCES workspaces(id) ON DELETE SET NULL"); this.ensureColumn("chats", "provider_session_id", "TEXT"); this.ensureColumn("chats", "provider_session_workspace_path", "TEXT"); this.ensureColumn("chats", "model", "TEXT"); this.ensureColumn("chats", "reasoning_effort", "TEXT"); this.ensureColumn("chats", "context_tier", "TEXT"); this.ensureColumn("chats", "title_manually_set", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("artifacts", "file_path", "TEXT"); this.ensureColumn("mcp_servers", "tools", "TEXT NOT NULL DEFAULT '[]'"); this.migrateLegacyPinsToFavorites(); }
+  `); this.ensureColumn("owners", "provider_user_id", "TEXT"); this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS owners_auth_provider_user_id ON owners(auth_provider, provider_user_id) WHERE provider_user_id IS NOT NULL"); this.migrateAuthTokensToOwnerScope(); this.ensureColumn("projects", "memory", "TEXT"); this.ensureColumn("projects", "default_model", "TEXT"); this.ensureColumn("projects", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "workspace_id", "TEXT REFERENCES workspaces(id) ON DELETE SET NULL"); this.ensureColumn("chats", "provider_session_id", "TEXT"); this.ensureColumn("chats", "provider_session_workspace_path", "TEXT"); this.ensureColumn("chats", "model", "TEXT"); this.ensureColumn("chats", "reasoning_effort", "TEXT"); this.ensureColumn("chats", "context_tier", "TEXT"); this.ensureColumn("chats", "title_manually_set", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("artifacts", "file_path", "TEXT"); this.ensureColumn("mcp_servers", "tools", "TEXT NOT NULL DEFAULT '[]'"); this.migrateLegacyPinsToFavorites(); }
   private clearProjectProviderSessions(ownerId: string, projectId: string, updatedAt: string): void { this.db.prepare("UPDATE chats SET provider_session_id = NULL, provider_session_workspace_path = NULL, updated_at = ? WHERE owner_id = ? AND project_id = ?").run(updatedAt, ownerId, projectId); }
   private ensureColumn(table: string, column: string, definition: string): void { const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]; if (!rows.some((row) => row.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`); }
+  private migrateAuthTokensToOwnerScope(): void {
+    const columns = this.db.prepare("PRAGMA table_info(auth_tokens)").all() as Row[];
+    const provider = columns.find((column) => column.name === "provider");
+    const ownerId = columns.find((column) => column.name === "owner_id");
+    if (Number(provider?.pk) !== 1 || Number(ownerId?.pk) === 2) return;
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE auth_tokens_owner_scoped (provider TEXT NOT NULL, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (provider, owner_id));
+        INSERT INTO auth_tokens_owner_scoped (provider, owner_id, access_token, created_at, updated_at) SELECT provider, owner_id, access_token, created_at, updated_at FROM auth_tokens;
+        DROP TABLE auth_tokens;
+        ALTER TABLE auth_tokens_owner_scoped RENAME TO auth_tokens;
+      `);
+    })();
+  }
   private migrateLegacyPinsToFavorites(): void { for (const table of ["projects", "chats"]) { const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]; if (rows.some((row) => row.name === "pinned")) this.db.prepare(`UPDATE ${table} SET favorite = 1 WHERE pinned = 1`).run(); } }
   private seed(): void { const existing = this.db.prepare("SELECT id FROM owners LIMIT 1").get() as Row | undefined; const now = iso(); const ownerId = typeof existing?.id === "string" ? existing.id : "local"; if (!existing) this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, 'local', 'Local user', NULL, 'local', ?)").run(ownerId, now); for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null); }
 }

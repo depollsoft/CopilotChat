@@ -1,13 +1,16 @@
 services:
   copilotchat:
-    build: .
+    image: ${COPILOTCHAT_IMAGE:-ghcr.io/depollsoft/copilotchat:latest}
+    build:
+      context: .
+    restart: unless-stopped
     ports:
-      - "127.0.0.1:4317:4317"
+      - "${COPILOTCHAT_BIND_ADDRESS:-127.0.0.1}:${COPILOTCHAT_PORT:-4317}:4317"
     environment:
       COPILOTCHAT_HOST: 0.0.0.0
       COPILOTCHAT_PORT: 4317
       COPILOTCHAT_DATA_DIR: /data
-      COPILOTCHAT_WORKSPACE_ROOT: ${COPILOTCHAT_WORKSPACE_ROOT:-/data/registered-workspaces}
+      COPILOTCHAT_WORKSPACE_ROOT: ${COPILOTCHAT_CONTAINER_WORKSPACE_ROOT:-/data/registered-workspaces}
       COPILOTCHAT_BODY_LIMIT_BYTES: ${COPILOTCHAT_BODY_LIMIT_BYTES:-52428800}
       COPILOT_PROVIDER: ${COPILOT_PROVIDER:-auto}
       COPILOT_API_BASE_URL: ${COPILOT_API_BASE_URL:-}
@@ -19,12 +22,17 @@ services:
       COPILOTCHAT_SESSION_SECRET: ${COPILOTCHAT_SESSION_SECRET:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      COPILOTCHAT_ALLOWED_GITHUB_LOGINS: ${COPILOTCHAT_ALLOWED_GITHUB_LOGINS:-}
       COPILOTCHAT_API_TOKEN: ${COPILOTCHAT_API_TOKEN:-}
       COPILOTCHAT_ALLOWED_ORIGINS: ${COPILOTCHAT_ALLOWED_ORIGINS:-}
+      COPILOTCHAT_REQUIRE_CSRF: ${COPILOTCHAT_REQUIRE_CSRF:-true}
+      COPILOT_GITHUB_TOKEN: ${COPILOT_GITHUB_TOKEN:-}
     volumes:
       - copilotchat-data:/data
-      # Mount host folders here for cowork/workspace mode, then register the mounted path in the UI.
+      # Local mode example: mount a host folder here, then register the container path in the UI.
       # - ./example-workspace:/workspaces/example
+      # GitHub mode: mount owner folders below COPILOTCHAT_CONTAINER_WORKSPACE_ROOT/<workspace-directory>/.
+      # - ./owner-workspaces:/data/registered-workspaces/github-id-123456
 
 volumes:
   copilotchat-data:
