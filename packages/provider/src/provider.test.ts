@@ -1,8 +1,11 @@
 import type { ProviderEvent } from "./index.js";
+import { CopilotClient } from "@github/copilot-sdk";
 import type { ModelInfo } from "@github/copilot-sdk";
 import http from "node:http";
-import { describe, expect, it } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo } from "./index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCopilotProvider, mapSdkModelInfo, summarizeSdkFailureMessage } from "./index.js";
+
+afterEach(() => { vi.restoreAllMocks(); });
 
 describe("createCopilotProvider", () => {
   it("uses SDK provider by default", async () => {
@@ -12,6 +15,36 @@ describe("createCopilotProvider", () => {
   it("can use echo provider explicitly", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
     expect((await provider.status()).id).toBe("echo");
+  });
+  it("extracts actionable CLI failures without returning bundled source", () => {
+    const source = "minified-source ".repeat(5000);
+    const message = summarizeSdkFailureMessage(new Error(`CLI server exited with code 1 stderr: ^ Error: decoy ${source} ^\n\nError: Persistence error: I/O error: Permission denied (os error 13) at Object.writeKey (file:///app/app.js:83:684) at async start (file:///app/app.js:100:1) Node.js v22.23.1`));
+
+    expect(message).toBe("Error: Persistence error: I/O error: Permission denied (os error 13)");
+    expect(message).not.toContain("minified-source");
+    expect(message.length).toBeLessThan(200);
+  });
+  it("preserves actionable messages containing the word at", () => {
+    expect(summarizeSdkFailureMessage(new Error("Open the device page at https://github.com/login/device"))).toBe("Open the device page at https://github.com/login/device");
+  });
+  it("stops the SDK client when startup fails", async () => {
+    vi.spyOn(CopilotClient.prototype, "start").mockRejectedValueOnce(new Error("startup failed"));
+    const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+
+    const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
+
+    expect(status.available).toBe(false);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+  it("stops the SDK client when model discovery fails", async () => {
+    vi.spyOn(CopilotClient.prototype, "start").mockResolvedValueOnce();
+    vi.spyOn(CopilotClient.prototype, "listModels").mockRejectedValueOnce(new Error("model discovery failed"));
+    const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+
+    const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
+
+    expect(status.available).toBe(false);
+    expect(stop).toHaveBeenCalledOnce();
   });
   it("passes project context and prior messages through the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
