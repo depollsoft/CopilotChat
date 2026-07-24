@@ -27,6 +27,10 @@ describe("createCopilotProvider", () => {
   it("preserves actionable messages containing the word at", () => {
     expect(summarizeSdkFailureMessage(new Error("Open the device page at https://github.com/login/device"))).toBe("Open the device page at https://github.com/login/device");
   });
+  it("only removes a standalone Node version footer", () => {
+    expect(summarizeSdkFailureMessage(new Error("SyntaxError: unsupported syntax\nNode.js v22.23.1"))).toBe("SyntaxError: unsupported syntax");
+    expect(summarizeSdkFailureMessage(new Error("Unsupported Node.js v20; upgrade to v22"))).toBe("Unsupported Node.js v20; upgrade to v22");
+  });
   it("stops the SDK client when startup fails", async () => {
     vi.spyOn(CopilotClient.prototype, "start").mockRejectedValueOnce(new Error("startup failed"));
     const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
