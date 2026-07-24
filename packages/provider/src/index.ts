@@ -686,10 +686,10 @@ export function summarizeSdkFailureMessage(error: unknown): string {
   const markers = Array.from(message.matchAll(/\^\s*Error:\s*/g));
   const marker = markers.at(-1);
   if (marker?.index !== undefined) message = message.slice(marker.index + marker[0].lastIndexOf("Error:"));
-  const nodeVersion = message.search(/\s+Node\.js v\d/);
-  if (nodeVersion >= 0) message = message.slice(0, nodeVersion);
   const stack = message.search(/\s+at\s+(?:async\s+)?(?:[^\s(]+\s+\((?:file:\/\/|\/|node:)[^)]+:\d+:\d+\)|(?:file:\/\/|\/|node:)\S+:\d+:\d+)/);
   if (stack >= 0) message = message.slice(0, stack);
+  const nodeVersionFooter = message.search(/(?:^|\r?\n)\s*Node\.js v\d+(?:\.\d+){1,2}\s*$/);
+  if (nodeVersionFooter >= 0) message = message.slice(0, nodeVersionFooter);
   message = message.replace(/\s+/g, " ").trim();
   const limit = 800;
   return message.length > limit ? `[truncated] ${message.slice(-limit)}` : message;
