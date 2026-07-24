@@ -1,4 +1,5 @@
 name: CI
+run-name: ${{ inputs.publish && inputs.commit_sha && format('CI publish {0}', inputs.commit_sha) || 'CI' }}
 
 on:
   pull_request:
@@ -13,12 +14,18 @@ on:
         description: Publish the image after validating the selected ref
         type: boolean
         default: false
+      commit_sha:
+        description: Exact commit to validate and publish
+        type: string
+        default: ""
 
 jobs:
   build-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.4
@@ -55,6 +62,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -68,13 +77,52 @@ jobs:
       (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     needs: build-test
+    concurrency:
+      group: docker-publish-${{ github.repository }}-${{ github.event_name == 'workflow_dispatch' && 'refs/heads/main' || github.ref }}
+      cancel-in-progress: true
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Verify publish commit
+        id: publish-guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_SHA: ${{ inputs.commit_sha }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -z "${EXPECTED_SHA}" ]]; then
+            echo "workflow_dispatch publication requires commit_sha" >&2
+            exit 1
+          fi
+
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          current_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${default_branch}" --jq '.sha')"
+          if [[ "${current_sha}" != "${EXPECTED_SHA}" ]]; then
+            echo "Skipping stale publication for ${EXPECTED_SHA}; ${default_branch} is ${current_sha}."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
+        if: steps.publish-guard.outputs.publish == 'true'
+        with:
+          ref: ${{ inputs.commit_sha || github.sha }}
       - uses: docker/setup-buildx-action@v3
+        if: steps.publish-guard.outputs.publish == 'true'
+      - name: Resolve image SHA
+        if: steps.publish-guard.outputs.publish == 'true'
+        id: image-sha
+        env:
+          IMAGE_SHA: ${{ inputs.commit_sha || github.sha }}
+        run: echo "short=${IMAGE_SHA:0:7}" >> "$GITHUB_OUTPUT"
       - uses: docker/metadata-action@v5
+        if: steps.publish-guard.outputs.publish == 'true'
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
@@ -84,13 +132,15 @@ jobs:
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ steps.image-sha.outputs.short }}
       - uses: docker/login-action@v3
+        if: steps.publish-guard.outputs.publish == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/build-push-action@v6
+        if: steps.publish-guard.outputs.publish == 'true'
         with:
           context: .
           push: true
