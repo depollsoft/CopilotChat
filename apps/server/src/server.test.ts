@@ -51,6 +51,15 @@ describe("loadConfig", () => {
       expect(isAllowedCorsOrigin("https://configured.example", "127.0.0.1:4328", configuredOrigins)).toBe(true);
     });
 
+    it("blocks matching non-localhost origins to prevent DNS rebinding", () => {
+      expect(isAllowedCorsOrigin("http://attacker.example:4328", "attacker.example:4328", configuredOrigins)).toBe(false);
+    });
+
+    it("blocks localhost tunnel origins when the forwarded host or scheme differs", () => {
+      expect(isAllowedCorsOrigin("http://preview.localhost:35151", "other.localhost:35151", configuredOrigins)).toBe(false);
+      expect(isAllowedCorsOrigin("ftp://preview.localhost:35151", "preview.localhost:35151", configuredOrigins)).toBe(false);
+    });
+
     it("blocks unrelated browser origins", () => {
       expect(isAllowedCorsOrigin("https://malicious.example", "127.0.0.1:4328", configuredOrigins)).toBe(false);
     });
