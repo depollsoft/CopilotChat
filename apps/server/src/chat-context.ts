@@ -16,9 +16,8 @@ export function applyChatTurnScope(db: AppDatabase, ownerId: string, chatId: str
 
 export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: string; chat: Chat; message: SendMessageRequest; defaultModel: string; gitHubToken: string | null; context: ChatContextOptions; titleTool?: ProviderTitleTool }): ProviderChatRequest {
   const project = input.chat.projectId ? input.db.getProject(input.ownerId, input.chat.projectId) : null;
-  const workspace = input.chat.workspaceId ? input.db.getWorkspace(input.ownerId, input.chat.workspaceId) : null;
-  const messages: ProviderMessage[] = input.db.listMessages(input.chat.id, { includeAttachmentData: true }).map((message) => ({ role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) }));
-  const workingDirectory = workspace?.rootPath ?? isolatedChatWorkspace(input.context.isolatedWorkspaceRoot, input.chat.id);
+  const messages: ProviderMessage[] = input.db.listMessages(input.chat.id, { includeAttachmentData: true, includeAttachmentFilePaths: true }).map((message) => ({ role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) }));
+  const workingDirectory = chatWorkingDirectory(input.db, input.ownerId, input.chat, input.context.isolatedWorkspaceRoot);
   return {
     messages,
     sessionId: input.chat.providerSessionId ?? newProviderSessionId(input.ownerId, input.chat.id),
@@ -40,7 +39,12 @@ export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: stri
 function readProviderAttachments(metadata: Record<string, unknown>): ProviderMessage["attachments"] {
   const parsed = messageAttachmentSchema.array().safeParse(metadata.attachments);
   if (!parsed.success || parsed.data.length === 0) return undefined;
-  return parsed.data.flatMap((attachment) => attachment.data ? [{ type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name }] : []);
+  const attachments: NonNullable<ProviderMessage["attachments"]> = [];
+  for (const attachment of parsed.data) {
+    if (attachment.filePath) attachments.push({ type: "file", path: attachment.filePath, displayName: attachment.name, size: attachment.size });
+    else if (attachment.data) attachments.push({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name, size: attachment.size });
+  }
+  return attachments;
 }
 
 function newProviderSessionId(ownerId: string, chatId: string): string {
@@ -49,6 +53,10 @@ function newProviderSessionId(ownerId: string, chatId: string): string {
 
 export function isolatedChatWorkspace(root: string, chatId: string): string {
   return `${root.replace(/\/+$/, "")}/${chatId.replace(/[^a-zA-Z0-9_.-]/g, "-")}`;
+}
+
+export function chatWorkingDirectory(db: AppDatabase, ownerId: string, chat: Chat, isolatedWorkspaceRoot: string): string {
+  return chat.workspaceId ? db.getWorkspace(ownerId, chat.workspaceId).rootPath : isolatedChatWorkspace(isolatedWorkspaceRoot, chat.id);
 }
 
 function buildProjectContext(db: AppDatabase, ownerId: string, projectId: string): string | null {

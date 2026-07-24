@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { CopilotProvider, ProviderChatControls, ProviderChatRequest, ProviderElicitationRequest, ProviderElicitationValue, ProviderEvent, ProviderMessage, ProviderPermissionRequest, ProviderTaskListItem, ProviderUserInputRequest } from "@copilotchat/provider";
 import { titleFromContent } from "@copilotchat/shared";
 import type { ActiveResponseInputRequest, Chat, ChatMessage, PermissionMode, SendMessageRequest } from "@copilotchat/shared";
@@ -12,6 +14,10 @@ type StreamListener = {
 };
 type StreamEvent = { event: string; data: unknown };
 type ActiveTurn = { chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest };
+export type InternalSendMessageRequest = SendMessageRequest & { uploadClaimId?: string };
+type InternalActiveResponseInputRequest = ActiveResponseInputRequest & { uploadClaimId?: string };
+type ResponseCleanup = { id: string; run: () => Promise<void> };
+type ResponseResources = { temporaryFiles?: string[]; cleanup?: ResponseCleanup };
 type PendingTurn = {
   id: string;
   mode: "steer" | "queue";
@@ -19,7 +25,7 @@ type PendingTurn = {
   status: "queued" | "sent" | "running" | "done" | "failed";
   createdAt: string;
 };
-type QueuedTurn = PendingTurn & { request: SendMessageRequest };
+type QueuedTurn = PendingTurn & { request: InternalSendMessageRequest };
 type PendingInteraction = {
   id: string;
   kind: "permission" | "user-input" | "elicitation";
@@ -62,7 +68,7 @@ export class ActiveChatResponses {
   has(chatId: string): boolean { return this.active.has(chatId); }
   chatIds(): string[] { return [...this.active.keys()]; }
 
-  start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: SendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
+  start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
     const existing = this.active.get(input.chat.id);
     if (existing) return existing;
     const response = new ActiveChatResponse(input.chat.id);
@@ -103,9 +109,10 @@ export class ActiveChatResponses {
     return response.resolveInteraction(interactionId, resolution);
   }
 
-  enqueue(chatId: string, request: ActiveResponseInputRequest): PendingTurn | null {
+  enqueue(chatId: string, request: InternalActiveResponseInputRequest, resources?: ResponseResources): PendingTurn | null {
     const response = this.active.get(chatId);
-    return response?.enqueue(request) ?? null;
+    if (!response || !response.trackResources(resources)) return null;
+    return response.enqueue(request);
   }
   setPermissionMode(chatId: string, permissionMode: PermissionMode): boolean {
     const response = this.active.get(chatId);
@@ -114,12 +121,18 @@ export class ActiveChatResponses {
     return true;
   }
 
-  async steer(chatId: string, request: ActiveResponseInputRequest): Promise<PendingTurn | null> {
+  async steer(chatId: string, request: InternalActiveResponseInputRequest, fallbackRequest: InternalActiveResponseInputRequest = request, resources?: ResponseResources): Promise<{ turn: PendingTurn; delivered: boolean } | null> {
     const response = this.active.get(chatId);
-    return response ? await response.steer(request) : null;
+    return response ? await response.steer(request, fallbackRequest, resources) : null;
   }
 
-  private async run(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: SendMessageRequest) => Promise<ActiveTurn> }): Promise<void> {
+  trackTemporaryFiles(chatId: string, filePaths: string[]): boolean {
+    const response = this.active.get(chatId);
+    if (!response) return false;
+    return response.trackTemporaryFiles(filePaths);
+  }
+
+  private async run(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): Promise<void> {
     let turn: ActiveTurn = { chat: input.chat, userMessage: input.userMessage, providerRequest: input.providerRequest };
     try {
       while (!response.cancelled) {
@@ -134,6 +147,11 @@ export class ActiveChatResponses {
       if (response.cancelled) response.emit("done", { ok: false, cancelled: true });
       else response.emit("error", { message: (error as Error).message });
     } finally {
+      try {
+        await response.cleanupResources();
+      } catch (error) {
+        response.emit("error", { message: `Could not clean temporary attachments: ${(error as Error).message}` });
+      }
       response.close();
       if (this.active.get(input.chat.id) === response) this.active.delete(input.chat.id);
     }
@@ -182,6 +200,9 @@ export class ActiveChatResponses {
 export class ActiveChatResponse {
   readonly controller = new AbortController();
   readonly listeners = new Set<StreamListener>();
+  private readonly temporaryFiles = new Set<string>();
+  private readonly cleanupTasks = new Map<string, () => Promise<void>>();
+  private finalizing = false;
   assistantContent = "";
   activities: AssistantActivity[] = [];
   interactions: PendingInteraction[] = [];
@@ -246,7 +267,7 @@ export class ActiveChatResponse {
     return appended;
   }
 
-  enqueue(request: ActiveResponseInputRequest): PendingTurn {
+  enqueue(request: InternalActiveResponseInputRequest): PendingTurn {
     const turn = this.createPendingTurn("queue", request.content);
     this.pendingTurns = [...this.pendingTurns, turn];
     this.queuedTurns.push({ ...turn, request: queueRequest(request) });
@@ -254,13 +275,15 @@ export class ActiveChatResponse {
     return turn;
   }
 
-  async steer(request: ActiveResponseInputRequest): Promise<PendingTurn> {
-    const turn = this.createPendingTurn("steer", request.content, this.steerHandler ? "sent" : "queued");
+  async steer(request: InternalActiveResponseInputRequest, fallbackRequest: InternalActiveResponseInputRequest = request, resources?: ResponseResources): Promise<{ turn: PendingTurn; delivered: boolean } | null> {
+    const steerHandler = this.steerHandler;
+    if (!this.trackResources({ cleanup: resources?.cleanup, temporaryFiles: steerHandler ? resources?.temporaryFiles : undefined })) return null;
+    const turn = this.createPendingTurn("steer", request.content, steerHandler ? "sent" : "queued");
     this.pendingTurns = [...this.pendingTurns, turn];
-    if (this.steerHandler) await this.steerHandler(providerMessageForActiveInput(request));
-    else this.queuedTurns.push({ ...turn, mode: "queue", status: "queued", request: queueRequest(request) });
+    if (steerHandler) await steerHandler(providerMessageForActiveInput(request));
+    else this.queuedTurns.push({ ...turn, mode: "queue", status: "queued", request: queueRequest(fallbackRequest) });
     this.emitPendingTurns();
-    return turn;
+    return { turn, delivered: Boolean(steerHandler) };
   }
 
   nextQueued(): QueuedTurn | null {
@@ -443,6 +466,54 @@ export class ActiveChatResponse {
       try { listener.reply.raw.end(); } catch { /* already closed */ }
     }
     this.listeners.clear();
+  }
+
+  trackResources(resources?: ResponseResources): boolean {
+    if (this.finalizing) return false;
+    if (resources?.cleanup) this.cleanupTasks.set(resources.cleanup.id, resources.cleanup.run);
+    if (resources?.temporaryFiles) for (const filePath of resources.temporaryFiles) this.temporaryFiles.add(filePath);
+    return true;
+  }
+
+  trackTemporaryFiles(filePaths: string[]): boolean {
+    if (this.finalizing) return false;
+    for (const filePath of filePaths) this.temporaryFiles.add(filePath);
+    return true;
+  }
+
+  async cleanupTemporaryFiles(): Promise<void> {
+    const filePaths = [...this.temporaryFiles];
+    this.temporaryFiles.clear();
+    const errors: unknown[] = [];
+    for (const filePath of filePaths) {
+      try {
+        await fs.rm(filePath, { force: true });
+        await fs.rmdir(path.dirname(filePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, "Temporary attachment cleanup failed.");
+  }
+
+  async cleanupResources(): Promise<void> {
+    this.finalizing = true;
+    const errors: unknown[] = [];
+    try {
+      await this.cleanupTemporaryFiles();
+    } catch (error) {
+      errors.push(error);
+    }
+    const tasks = [...this.cleanupTasks.values()];
+    this.cleanupTasks.clear();
+    for (const task of tasks) {
+      try {
+        await task();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, "Active response resource cleanup failed.");
   }
 
   private findToolActivity(id: string | null | undefined, toolName: string): AssistantActivity | undefined {
@@ -682,11 +753,20 @@ function limitActivityValue(value: unknown, depth = 0, stringLimit = activityStr
   if (entries.length > activityObjectKeyLimit) limited.__truncated = `${entries.length - activityObjectKeyLimit} fields omitted`;
   return limited;
 }
-function queueRequest(request: ActiveResponseInputRequest): SendMessageRequest {
-  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, contextTier: request.contextTier, permissionMode: request.permissionMode };
+function queueRequest(request: InternalActiveResponseInputRequest): InternalSendMessageRequest {
+  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, contextTier: request.contextTier, permissionMode: request.permissionMode, uploadClaimId: request.uploadClaimId };
 }
-function providerMessageForActiveInput(request: ActiveResponseInputRequest): ProviderMessage {
-  return { role: "user", content: request.content, attachments: request.attachments?.map((attachment) => ({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name })) };
+function providerMessageForActiveInput(request: InternalActiveResponseInputRequest): ProviderMessage {
+  const attachments: NonNullable<ProviderMessage["attachments"]> = [];
+  for (const attachment of request.attachments ?? []) {
+    if (attachment.filePath) attachments.push({ type: "file", path: attachment.filePath, displayName: attachment.name, size: attachment.size });
+    else if (attachment.data) attachments.push({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name, size: attachment.size });
+  }
+  return {
+    role: "user",
+    content: request.content,
+    attachments: attachments.length > 0 ? attachments : undefined,
+  };
 }
 function normalizeArtifactKind(kind: string): "text" | "markdown" | "code" | "json" | "mermaid" | "html" | "file-bundle" {
   return kind === "html" || kind === "json" || kind === "mermaid" || kind === "code" || kind === "text" || kind === "file-bundle" ? kind : "markdown";

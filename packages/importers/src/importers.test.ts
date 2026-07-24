@@ -33,9 +33,9 @@ describe("previewImport", () => {
     zip.file("conversations.json", JSON.stringify([{ uuid: "chat-1", name: "Research chat", chat_messages: [{ uuid: "m1", sender: "human", text: "Question about the Research project" }] }]));
     zip.file("projects/project-1.json", JSON.stringify({ uuid: "project-1", name: "Research", description: "Project notes", prompt_template: "Use project instructions.", docs: [{ uuid: "doc-1", filename: "Brief.md", content: "# Brief" }] }));
     zip.file("memories.json", JSON.stringify([{ conversations_memory: "Remember imported context." }]));
-    const content = Buffer.from(await zip.generateAsync({ type: "uint8array" })).toString("base64");
+    const bytes = await zip.generateAsync({ type: "uint8array" });
 
-    const preview = await previewImportPayload("auto", "claude-export.zip", content, "base64");
+    const preview = await previewImportPayload("auto", "claude-export.zip", bytes, "base64");
 
     expect(preview.source).toBe("claude");
     expect(preview.conversations).toHaveLength(1);

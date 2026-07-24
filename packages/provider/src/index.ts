@@ -5,7 +5,9 @@ import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest
 import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, MCPServerConfig, MessageOptions, ModelInfo, PermissionHandler, SessionConfig, SessionEvent, SessionFsFileInfo, SessionFsProvider, Tool } from "@github/copilot-sdk";
 
-export interface ProviderAttachment { type: "blob"; data: string; mimeType: string; displayName?: string }
+export type ProviderAttachment =
+  | { type: "file"; path: string; displayName?: string; size?: number }
+  | { type: "blob"; data: string; mimeType: string; displayName?: string; size?: number };
 export interface ProviderMessage { role: ChatRole; content: string; attachments?: ProviderAttachment[] }
 export interface ProviderTool { name: string; description: string; parameters: Record<string, unknown>; skipPermission?: boolean; handler: (args: unknown) => unknown }
 export type ProviderPermissionRequest = { kind: string; toolCallId?: string | null; toolName?: string | null; fileName?: string | null; fullCommandText?: string | null; url?: string | null; details?: Record<string, unknown>; raw: unknown };
@@ -392,8 +394,8 @@ function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string)
     latestUserMessage,
   ].filter(Boolean).join("\n\n");
 }
-function sdkAttachments(message?: ProviderMessage): MessageOptions["attachments"] | undefined { return message?.attachments?.map((attachment) => ({ type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.displayName })); }
-function summarizeAttachments(attachments?: ProviderAttachment[]): string { return attachments?.map((attachment) => `${attachment.displayName ?? "attachment"} (${attachment.mimeType}, ${formatBytes(attachment.data.length * 0.75)})`).join(", ") ?? ""; }
+function sdkAttachments(message?: ProviderMessage): MessageOptions["attachments"] | undefined { return message?.attachments?.map((attachment) => attachment.type === "file" ? { type: "file" as const, path: attachment.path, displayName: attachment.displayName } : { type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.displayName }); }
+function summarizeAttachments(attachments?: ProviderAttachment[]): string { return attachments?.map((attachment) => `${attachment.displayName ?? "attachment"} (${attachment.type === "file" ? "file" : attachment.mimeType}, ${formatBytes(attachment.size ?? (attachment.type === "blob" ? attachment.data.length * 0.75 : 0))})${attachment.type === "file" ? ` at ${attachment.path}` : ""}`).join(", ") ?? ""; }
 function echoSteeringText(message?: ProviderMessage): string {
   if (!message) return "";
   const attachmentSummary = summarizeAttachments(message.attachments);

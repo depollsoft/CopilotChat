@@ -265,7 +265,7 @@ function App(): React.ReactElement {
       setPendingTurns([]);
     }
   }
-  function turnBody(content: string, chat: Chat, skillIds = selectedSkillIds, attachments: MessageAttachment[] = [], chatSettings?: Chat): Record<string, unknown> { return { content, attachments, projectId: chat.projectId, workspaceId: chat.workspaceId ?? activeWorkspaceId, skillIds, model: chatSettings?.model ?? selectedModel, reasoningEffort: chatSettings?.reasoningEffort ?? reasoningEffort, contextTier: chatSettings?.contextTier ?? contextTier, permissionMode }; }
+  function turnBody(content: string, chat: Chat, skillIds = selectedSkillIds, attachments: MessageAttachment[] = [], chatSettings?: Chat): Record<string, unknown> { return { content, attachments: attachments.map(attachmentForRequest), projectId: chat.projectId, workspaceId: chat.workspaceId ?? activeWorkspaceId, skillIds, model: chatSettings?.model ?? selectedModel, reasoningEffort: chatSettings?.reasoningEffort ?? reasoningEffort, contextTier: chatSettings?.contextTier ?? contextTier, permissionMode }; }
   function initializeSeenChatUpdates(next: AppState): void {
     if (seenInitializedRef.current) return;
     seenInitializedRef.current = true;
@@ -316,8 +316,8 @@ function App(): React.ReactElement {
   }
   async function startGuidedImport(file: File): Promise<void> {
     try {
-      const isZip = file.name.toLowerCase().endsWith(".zip");
-      const draft = await api<ImportDraft>("/api/imports/drafts", { method: "POST", body: { source: "auto", fileName: file.name, content: isZip ? await fileToBase64(file) : await file.text(), encoding: isZip ? "base64" : "text" } }, apiToken);
+      const uploaded = await uploadFile(file, apiToken);
+      const draft = await api<ImportDraft>("/api/imports/drafts", { method: "POST", body: { source: "auto", uploadId: uploaded.uploadId } }, apiToken);
       const importSkillId = state?.skills.find((skill) => skill.manifest.id === IMPORT_ASSISTANT_SKILL_ID || skill.id === IMPORT_ASSISTANT_SKILL_ID)?.id ?? "";
       const skillIds = importSkillId ? [importSkillId] : [];
       if (importSkillId) setSelectedSkillIds((current) => current.includes(importSkillId) ? current : [...current, importSkillId]);
@@ -353,7 +353,7 @@ function App(): React.ReactElement {
             ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); composerRef.current?.focus(); }} />
             : <div className="thread">{renderThreadMessages()}<PendingTurns turns={pendingTurns}/>{streamingText || streamingActivities.length > 0 ? <Message streaming activities={streamingActivities} message={{ id: "streaming", chatId: selectedChatId ?? "", role: "assistant", content: streamingText, provider: provider.id, metadata: {}, createdAt: new Date().toISOString() }} /> : null}{busy && !streamingText && streamingActivities.length === 0 ? <Thinking /> : null}<InteractionDock interactions={pendingInteractions} onResolve={(interaction, resolution) => void resolveInteraction(interaction, resolution)} /></div>}
       </div>
-      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onSubmit={(content, attachments) => void (busy ? sendWhileBusy("queue", content, attachments) : sendMessage(content, { attachments }))} onSteer={(content, attachments) => void sendWhileBusy("steer", content, attachments)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
+      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onUploadFile={(file) => uploadFile(file, apiToken)} onDiscardAttachment={(attachment) => discardUploadedFile(attachment, apiToken)} onSubmit={(content, attachments) => void (busy ? sendWhileBusy("queue", content, attachments) : sendMessage(content, { attachments }))} onSteer={(content, attachments) => void sendWhileBusy("steer", content, attachments)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
       {showJumpToLive && selectedChat ? <button className="jump-to-live" aria-label="Jump to live" onClick={() => scrollToLive("smooth")}><IconDownload width={16}/><span>Live</span></button> : null}
     </main>
     {drawer && state ? <Drawer active={drawer} onChangeTab={setDrawer} onClose={() => setDrawer(null)}><DrawerContent tab={drawer} state={state} theme={theme} setTheme={setTheme} textScale={textScale} setTextScale={setTextScale} apiToken={apiToken} setApiToken={(token) => { setApiToken(token); if (token) localStorage.setItem(API_TOKEN_KEY, token); else localStorage.removeItem(API_TOKEN_KEY); }} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} activeProjectId={activeProjectId} onSelectProject={selectProject} activeWorkspaceId={activeWorkspaceId} setActiveWorkspaceId={setActiveWorkspaceId} refresh={refreshState} showToast={setToast} clearAllData={clearAllData} onStartGuidedImport={startGuidedImport} /></Drawer> : null}
@@ -687,7 +687,7 @@ function RunningActionButton(p: { label: string; tooltip: string; icon: React.Re
   return <button type="button" aria-label={p.label} className={`composer-running-button ${p.variant ?? "primary"}${showLongPressTooltip ? " show-tooltip" : ""}`} disabled={p.disabled} onClick={click} onPointerDown={startLongPress} onPointerUp={finishLongPress} onPointerCancel={finishLongPress} onPointerLeave={finishLongPress}><span className="running-button-icon">{p.icon}</span><span className="running-button-label">{p.label.replace(" response", "").replace(" message", "")}</span><span className="composer-action-tooltip" role="tooltip"><strong>{p.label}</strong><span>{p.tooltip}</span></span></button>;
 }
 type ComposerPicker = "menu" | "project" | "skills" | "workspace" | "permissions";
-const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onSubmit: (content: string, attachments: MessageAttachment[]) => void; onSteer: (content: string, attachments: MessageAttachment[]) => void; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
+const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onUploadFile: (file: File) => Promise<MessageAttachment>; onDiscardAttachment: (attachment: MessageAttachment) => Promise<void>; onSubmit: (content: string, attachments: MessageAttachment[]) => void; onSteer: (content: string, attachments: MessageAttachment[]) => void; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [value, setValue] = useState("");
@@ -717,12 +717,12 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
     setAttachmentError(null);
     const nextFiles = [...files];
     try {
-      setAttachments([...attachments, ...(await Promise.all(nextFiles.map(fileToAttachment)))]);
+      setAttachments([...attachments, ...(await Promise.all(nextFiles.map(p.onUploadFile)))]);
     } catch (e) {
       setAttachmentError(toErr(e));
     }
   }
-  function removeAttachment(id: string): void { setAttachments((current) => current.filter((attachment) => attachment.id !== id)); }
+  function removeAttachment(id: string): void { setAttachments((current) => { const attachment = current.find((item) => item.id === id); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); return current.filter((item) => item.id !== id); }); }
   function paste(e: React.ClipboardEvent<HTMLTextAreaElement>): void {
     const files = [...e.clipboardData.files];
     if (files.length === 0) return;
@@ -829,7 +829,21 @@ function writeSeenChatUpdates(value: Record<string, string>): Record<string, str
 async function registerServiceWorker(){if("serviceWorker" in navigator)try{await navigator.serviceWorker.register("/sw.js");}catch{return;}}
 function notify(title:string,body:string){if(typeof Notification==="undefined"||Notification.permission!=="granted"||document.visibilityState!=="hidden")return;if(navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:"notify",title,body});else new Notification(title,{body});}
 function fileToBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error("Failed to read file."));r.onload=()=>typeof r.result==="string"?resolve(r.result.slice(r.result.indexOf(",")+1)):reject(new Error("Failed to read file."));r.readAsDataURL(file);});}
-async function fileToAttachment(file: File): Promise<MessageAttachment> { return { id: crypto.randomUUID(), name: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: file.size, data: await fileToBase64(file) }; }
+async function uploadFile(file: File, token: string): Promise<MessageAttachment> {
+  const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
+  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+  if (token) headers.Authorization = ["Bearer", token].join(" ");
+  const response = await fetch(`/api/uploads?${query.toString()}`, { method: "POST", headers, body: file });
+  if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
+  const attachment = await response.json() as MessageAttachment;
+  if (file.type.startsWith("image/") && file.size <= 1024 * 1024) attachment.data = await fileToBase64(file);
+  return attachment;
+}
+async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {
+  if (!attachment.uploadId) return;
+  await api<void>(`/api/uploads/${encodeURIComponent(attachment.uploadId)}`, { method: "DELETE", raw: true }, token);
+}
+function attachmentForRequest(attachment: MessageAttachment): MessageAttachment { return { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, ...(attachment.uploadId ? { uploadId: attachment.uploadId } : attachment.data ? { data: attachment.data } : attachment.filePath ? { filePath: attachment.filePath } : {}) }; }
 function messageAttachments(message: ChatMessage): MessageAttachment[] { const value = message.metadata.attachments; if (!Array.isArray(value)) return []; return value.filter(isMessageAttachment); }
 function isMessageAttachment(value: unknown): value is MessageAttachment { return isObjectRecord(value) && typeof value.id === "string" && typeof value.name === "string" && typeof value.mimeType === "string" && typeof value.size === "number" && (value.data === undefined || typeof value.data === "string"); }
 function isImageAttachment(attachment: MessageAttachment): boolean { return attachment.mimeType.startsWith("image/"); }

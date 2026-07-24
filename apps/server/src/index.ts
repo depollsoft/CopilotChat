@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
@@ -8,27 +9,31 @@ import { previewImportPayload } from "@copilotchat/importers";
 import { createCopilotProvider } from "@copilotchat/provider";
 import type { ProviderChatRequest } from "@copilotchat/provider";
 import { activeResponseInputRequestSchema, apiPrefix, createArtifactRequestSchema, createChatRequestSchema, createProjectChatReferenceRequestSchema, createProjectReferenceRequestSchema, createProjectRequestSchema, editMessageRequestSchema, importPreviewRequestSchema, permissionModeSchema, registerWorkspaceRequestSchema, runWorkspaceCommandRequestSchema, sendMessageRequestSchema, skillManifestSchema, titleFromContent, updateArtifactRequestSchema, updateChatRequestSchema, updateMcpServerRequestSchema, updateProjectReferenceRequestSchema, updateProjectRequestSchema, updateSkillRequestSchema, updateWorkspaceRequestSchema } from "@copilotchat/shared";
-import type { Chat, ChatMessage, ImportPreview, MessageAttachment, Owner, ProviderStatus, SendMessageRequest } from "@copilotchat/shared";
+import type { Chat, ChatMessage, ImportPreview, Owner, ProviderStatus, SendMessageRequest } from "@copilotchat/shared";
 import Fastify from "fastify";
 import type { FastifyRequest } from "fastify";
 import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
-import { applyChatTurnScope, buildProviderChatRequest, isolatedChatWorkspace } from "./chat-context.js";
+import { chatAttachmentDirectory, isChatAttachmentDirectory, materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
+import { applyChatTurnScope, buildProviderChatRequest, chatWorkingDirectory } from "./chat-context.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { ActiveChatResponses } from "./responses.js";
+import type { InternalSendMessageRequest } from "./responses.js";
 import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
+import { UploadedFileStore } from "./uploaded-files.js";
 
 const config = loadConfig();
 if (config.authMode === "github" && !config.sessionSecret) throw new Error("COPILOTCHAT_SESSION_SECRET is required when COPILOTCHAT_AUTH_MODE=github.");
 if (config.authMode === "github" && config.githubClientSecret && !config.publicUrl) throw new Error("COPILOTCHAT_PUBLIC_URL is required for GitHub OAuth web login.");
 const db = new AppDatabase(config.dataDir);
 const isolatedWorkspaceRoot = path.join(config.dataDir, "isolated-workspaces");
-const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"));
+const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"), config.importLimitBytes);
+const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
 const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
@@ -41,6 +46,7 @@ const providerStatusCache = new Map<string, { credentialKey: string; status: Pro
 const providerStatusInFlight = new Map<string, { credentialKey: string; promise: Promise<ProviderStatus> }>();
 const configuredPublicOrigin = config.publicUrl ? new URL(config.publicUrl).origin : null;
 const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...(configuredPublicOrigin ? [configuredPublicOrigin] : []), ...config.allowedOrigins]);
+app.addContentTypeParser("application/x-copilotchat-upload", (_request, payload, done) => done(null, payload));
 await app.register(cors, {
   delegator: (request, callback) => {
     const origin = request.headers.origin;
@@ -69,20 +75,25 @@ const githubDeviceStartResponseSchema = z.object({ device_code: z.string(), user
 const githubDevicePollResponseSchema = z.union([z.object({ access_token: z.string(), token_type: z.string(), scope: z.string() }), z.object({ error: z.string(), error_description: z.string().optional() })]);
 const githubUserSchema = z.object({ id: z.number().int().positive(), login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
 type GitHubUser = z.infer<typeof githubUserSchema>;
-async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
-  const attachments = validateMessageAttachments(input);
+async function prepareChatTurn(ownerId: string, chatId: string, input: InternalSendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
   const gitHubToken = gitHubTokenForOwner(ownerId);
   if (config.authMode === "github" && !gitHubToken) throw new Error("GitHub authentication has expired. Sign in with GitHub again.");
   let chat = applyChatTurnScope(db, ownerId, chatId, input);
   if (input.model !== undefined || input.reasoningEffort !== undefined || input.contextTier !== undefined) chat = db.updateChat(ownerId, chat.id, { model: input.model ?? chat.model, reasoningEffort: input.reasoningEffort ?? chat.reasoningEffort, contextTier: input.contextTier ?? chat.contextTier });
+  const workspaceDir = chatWorkingDirectory(db, ownerId, chat, isolatedWorkspaceRoot);
+  await fs.promises.mkdir(workspaceDir, { recursive: true });
+  await relocateChatAttachments({ db, ownerId, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing; removing its file reference.") });
+  const materialized = await materializeMessageAttachments({ uploads: uploadedFiles, ownerId, chatId: chat.id, workspaceDir, maxBytes: config.uploadLimitBytes, uploadClaimId: input.uploadClaimId, attachments: input.attachments });
+  const attachments = materialized.attachments;
+  if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
   const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
-  if (!existingUserMessage && attachments.length > 0) db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
+  if ((!existingUserMessage && attachments.length > 0) || (existingUserMessage && input.attachments !== undefined)) db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
   if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
   const titleRequired = !chat.titleManuallySet && db.listMessages(chat.id).filter((message) => message.role === "user").length <= 1;
   const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
   attachImportGuidance(ownerId, input, providerRequest);
-  await fs.promises.mkdir(providerRequest.workingDirectory ?? isolatedWorkspaceRoot, { recursive: true });
   providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
+  await completeUploadClaim(ownerId, input.uploadClaimId);
   return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
 }
 app.get(`${apiPrefix}/health`, async () => ({ ok: true, name: "CopilotChat", time: new Date().toISOString() }));
@@ -128,10 +139,12 @@ app.get(`${apiPrefix}/state`, async (request) => {
 app.delete(`${apiPrefix}/data`, async (request) => {
   const owner = ownerFor(request);
   const chats = [...db.listChats(owner.id), ...db.listArchivedChats(owner.id)];
+  const chatFileTargets = chats.flatMap((chat) => chatFiles(owner.id, chat));
   for (const chat of chats) activeResponses.cancel(chat.id);
   db.clearAllData(owner.id);
-  await Promise.all(chats.map((chat) => fs.promises.rm(isolatedChatWorkspace(isolatedWorkspaceRoot, chat.id), { recursive: true, force: true })));
+  await Promise.all(chatFileTargets.map((target) => fs.promises.rm(target, { recursive: true, force: true })));
   await importDrafts.deleteOwner(owner.id);
+  await uploadedFiles.deleteOwner(owner.id);
   await fs.promises.mkdir(isolatedWorkspaceRoot, { recursive: true });
   return { ok: true };
 });
@@ -145,9 +158,9 @@ app.delete(`${apiPrefix}/project-references/:referenceId`, async (request) => { 
 app.post(`${apiPrefix}/project-chat-references`, async (request) => { const owner = ownerFor(request); return db.createProjectChatReference(owner.id, createProjectChatReferenceRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/project-chat-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); db.deleteProjectChatReference(owner.id, params.referenceId); return { ok: true }; });
 app.post(`${apiPrefix}/chats`, async (request) => db.createChat(ownerFor(request).id, createChatRequestSchema.parse(request.body)));
-app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); return { deletedChatIds: db.deleteEmptyChats(owner.id, query.except ?? null) }; });
+app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); const chats = db.listChats(owner.id); const filesByChat = new Map(chats.map((chat) => [chat.id, chatFiles(owner.id, chat)])); const deletedChatIds = db.deleteEmptyChats(owner.id, query.except ?? null); await Promise.all(deletedChatIds.flatMap((chatId) => filesByChat.get(chatId) ?? []).map((target) => fs.promises.rm(target, { recursive: true, force: true }))); return { deletedChatIds }; });
 app.patch(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); return db.updateChat(owner.id, params.chatId, updateChatRequestSchema.parse(request.body)); });
-app.delete(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.deleteChat(owner.id, params.chatId); return { ok: true }; });
+app.delete(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); const chat = db.getChat(owner.id, params.chatId); await removeChatFiles(owner.id, chat); db.deleteChat(owner.id, params.chatId); return { ok: true }; });
 app.get(`${apiPrefix}/chats/:chatId/messages`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); return db.listMessages(params.chatId); });
 app.get(`${apiPrefix}/chats/:chatId/active-response`, async (request, reply) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); activeResponses.attach(params.chatId, reply); });
 app.patch(`${apiPrefix}/chats/:chatId/active-response`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); const body = z.object({ permissionMode: permissionModeSchema }).parse(request.body); return { active: activeResponses.setPermissionMode(params.chatId, body.permissionMode) }; });
@@ -163,11 +176,46 @@ app.post(`${apiPrefix}/chats/:chatId/interactions/:interactionId`, async (reques
 app.post(`${apiPrefix}/chats/:chatId/active-response/input`, async (request) => {
   const owner = ownerFor(request);
   const params = z.object({ chatId: z.string() }).parse(request.params);
-  db.getChat(owner.id, params.chatId);
+  const chat = db.getChat(owner.id, params.chatId);
+  if (!activeResponses.has(chat.id)) throw new Error("No active response is available for this chat.");
   const input = activeResponseInputRequestSchema.parse(request.body);
-  const pending = input.mode === "queue" ? activeResponses.enqueue(params.chatId, input) : await activeResponses.steer(params.chatId, input);
-  if (!pending) throw new Error("No active response is available for this chat.");
-  return pending;
+  if (input.mode === "queue") {
+    const claimedInput = await claimRequestUploads(owner.id, input);
+    const pending = activeResponses.enqueue(params.chatId, claimedInput, uploadClaimResources(owner.id, claimedInput.uploadClaimId));
+    if (!pending) {
+      abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+      throw new Error("No active response is available for this chat.");
+    }
+    return pending;
+  }
+  const workspaceDir = chatWorkingDirectory(db, owner.id, chat, isolatedWorkspaceRoot);
+  await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing; removing its file reference.") });
+  const claimedInput = await claimRequestUploads(owner.id, input);
+  let materialized;
+  try {
+    materialized = await materializeMessageAttachments({ uploads: uploadedFiles, ownerId: owner.id, chatId: chat.id, workspaceDir, maxBytes: config.uploadLimitBytes, uploadClaimId: claimedInput.uploadClaimId, attachments: claimedInput.attachments });
+  } catch (error) {
+    abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+    throw error;
+  }
+  const attachments = materialized.attachments;
+  if (!claimedInput.content.trim() && attachments.length === 0) {
+    abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+    throw new Error("Message requires text or an attachment.");
+  }
+  const resolvedInput = { ...claimedInput, attachments };
+  const steerResult = await activeResponses.steer(params.chatId, resolvedInput, claimedInput, { temporaryFiles: materialized.createdFilePaths, cleanup: uploadClaimCleanup(owner.id, claimedInput.uploadClaimId) });
+  if (!steerResult) {
+    await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
+    abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+    throw new Error("No active response is available for this chat.");
+  }
+  if (!steerResult.delivered) {
+    await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
+    return steerResult.turn;
+  }
+  await completeUploadClaim(owner.id, claimedInput.uploadClaimId);
+  return steerResult.turn;
 });
 app.post(`${apiPrefix}/chats/:chatId/messages`, async (request, reply) => {
   const owner = ownerFor(request);
@@ -175,7 +223,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages`, async (request, reply) => {
   const input = sendMessageRequestSchema.parse(request.body);
   const existing = db.getChat(owner.id, params.chatId);
   if (activeResponses.has(existing.id)) { activeResponses.attach(existing.id, reply); return; }
-  const turn = await prepareChatTurn(owner.id, params.chatId, input);
+  const turn = await withUploadClaim(owner.id, input, (claimedInput) => prepareChatTurn(owner.id, params.chatId, claimedInput));
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -185,8 +233,12 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, 
   const input = editMessageRequestSchema.parse(request.body);
   db.getChat(owner.id, params.chatId);
   activeResponses.cancel(params.chatId);
-  const userMessage = db.editUserMessageAndTruncate(owner.id, params.chatId, params.messageId, input.content);
-  const turn = await prepareChatTurn(owner.id, params.chatId, input, userMessage);
+  const turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
+    return withUploadClaim(owner.id, input, async (claimedInput) => {
+      const userMessage = db.editUserMessageAndTruncate(owner.id, params.chatId, params.messageId, input.content);
+      return prepareChatTurn(owner.id, params.chatId, claimedInput, userMessage);
+    });
+  });
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -196,8 +248,12 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request,
   const input = sendMessageRequestSchema.omit({ content: true, projectId: true, workspaceId: true }).parse(request.body);
   db.getChat(owner.id, params.chatId);
   activeResponses.cancel(params.chatId);
-  const userMessage = db.retryAssistantMessage(owner.id, params.chatId, params.messageId);
-  const turn = await prepareChatTurn(owner.id, params.chatId, { ...input, content: userMessage.content }, userMessage);
+  const turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
+    return withUploadClaim(owner.id, { ...input, content: "" }, async (claimedInput) => {
+      const userMessage = db.retryAssistantMessage(owner.id, params.chatId, params.messageId);
+      return prepareChatTurn(owner.id, params.chatId, { ...claimedInput, content: userMessage.content }, userMessage);
+    });
+  });
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -215,7 +271,27 @@ app.post(`${apiPrefix}/workspaces`, async (request) => { const owner = ownerFor(
 app.patch(`${apiPrefix}/workspaces/:workspaceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); return db.updateWorkspace(owner.id, params.workspaceId, updateWorkspaceRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/workspaces/:workspaceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); db.deleteWorkspace(owner.id, params.workspaceId); return { ok: true }; });
 app.post(`${apiPrefix}/workspaces/:workspaceId/commands`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); const input = runWorkspaceCommandRequestSchema.parse(request.body); const workspace = db.getWorkspace(owner.id, params.workspaceId); const toolRun = db.createToolRun(owner.id, { chatId: null, workspaceId: workspace.id, toolName: "workspace.command", input }); try { const output = await runWorkspaceCommand({ workspace, command: input.command, cwd: input.cwd, timeoutMs: input.timeoutMs }); return db.finishToolRun(toolRun.id, output.exitCode === 0 ? "succeeded" : "failed", output, null); } catch (error) { return db.finishToolRun(toolRun.id, "failed", {}, (error as Error).message); } });
-app.post(`${apiPrefix}/imports/drafts`, async (request) => { const owner = ownerFor(request); return importDrafts.create(owner.id, importPreviewRequestSchema.parse(request.body)); });
+app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (request) => {
+  const owner = ownerFor(request);
+  const query = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).parse(request.query);
+  if (!(request.body instanceof Readable)) throw new Error("Upload body must be a binary stream.");
+  return uploadedFiles.create(owner.id, query, request.body);
+});
+app.delete(`${apiPrefix}/uploads/:uploadId`, async (request) => { const owner = ownerFor(request); const params = z.object({ uploadId: z.string().min(1) }).parse(request.params); await uploadedFiles.delete(owner.id, params.uploadId); return { ok: true }; });
+app.post(`${apiPrefix}/imports/drafts`, async (request) => {
+  const owner = ownerFor(request);
+  const uploaded = z.object({ source: z.enum(["chatgpt", "claude", "gemini", "auto"]).default("auto"), uploadId: z.string().min(1) }).safeParse(request.body);
+  if (!uploaded.success) return importDrafts.create(owner.id, importPreviewRequestSchema.parse(request.body));
+  const claimId = await uploadedFiles.claim(owner.id, [uploaded.data.uploadId]);
+  try {
+    const draft = await importDrafts.createFromUpload(owner.id, uploaded.data.source, uploadedFiles, uploaded.data.uploadId, claimId!);
+    await completeUploadClaim(owner.id, claimId);
+    return draft;
+  } catch (error) {
+    abandonUploadClaim(owner.id, claimId);
+    throw error;
+  }
+});
 app.post(`${apiPrefix}/imports/preview`, async (request) => { const input = importPreviewRequestSchema.parse(request.body); return slimImportPreview(await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
 app.post(`${apiPrefix}/imports/apply`, async (request) => { const owner = ownerFor(request); const input = importPreviewRequestSchema.parse(request.body); return applyImportPreview(db, owner.id, await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
 const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web/dist");
@@ -337,15 +413,69 @@ function refreshProviderStatus(ownerId: string, token: string | null, credential
 }
 function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
 function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
-function validateMessageAttachments(input: SendMessageRequest): MessageAttachment[] {
-  const attachments = input.attachments ?? [];
-  if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
-  for (const attachment of attachments) {
-    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(attachment.data)) throw new Error(`Attachment ${attachment.name} is not valid base64.`);
-    const decodedBytes = Buffer.byteLength(Buffer.from(attachment.data, "base64"));
-    if (decodedBytes !== attachment.size) throw new Error(`Attachment ${attachment.name} size does not match its content.`);
+async function removeChatFiles(ownerId: string, chat: Chat): Promise<void> {
+  await Promise.all(chatFiles(ownerId, chat).map((target) => fs.promises.rm(target, { recursive: true, force: true })));
+}
+function chatFiles(ownerId: string, chat: Chat): string[] {
+  const workspaceDir = chat.workspaceId ? db.getWorkspaceRecord(ownerId, chat.workspaceId).rootPath : path.join(isolatedWorkspaceRoot, chat.id.replace(/[^a-zA-Z0-9_.-]/g, "-"));
+  const targets = new Set([chat.workspaceId ? chatAttachmentDirectory(workspaceDir, chat.id) : workspaceDir]);
+  for (const attachment of db.listChatAttachmentFiles(ownerId, chat.id)) {
+    const directory = path.dirname(attachment.filePath!);
+    if (isChatAttachmentDirectory(directory, chat.id)) targets.add(directory);
   }
-  return attachments;
+  return [...targets];
+}
+async function claimRequestUploads<T extends SendMessageRequest>(ownerId: string, input: T): Promise<T & { uploadClaimId?: string }> {
+  const claimId = await uploadedFiles.claim(ownerId, input.attachments?.flatMap((attachment) => attachment.uploadId ? [attachment.uploadId] : []) ?? []);
+  return claimId ? { ...input, uploadClaimId: claimId } : input;
+}
+async function withUploadClaim<TInput extends SendMessageRequest, TResult>(ownerId: string, input: TInput, action: (claimedInput: TInput & { uploadClaimId?: string }) => Promise<TResult>): Promise<TResult> {
+  const claimedInput = await claimRequestUploads(ownerId, input);
+  try {
+    return await action(claimedInput);
+  } catch (error) {
+    abandonUploadClaim(ownerId, claimedInput.uploadClaimId);
+    throw error;
+  }
+}
+function uploadClaimCleanup(ownerId: string, claimId?: string): { id: string; run: () => Promise<void> } | undefined {
+  return claimId ? { id: `upload-claim:${claimId}`, run: () => uploadedFiles.completeClaim(ownerId, claimId) } : undefined;
+}
+function uploadClaimResources(ownerId: string, claimId?: string): { cleanup: { id: string; run: () => Promise<void> } } | undefined {
+  const cleanup = uploadClaimCleanup(ownerId, claimId);
+  return cleanup ? { cleanup } : undefined;
+}
+async function completeUploadClaim(ownerId: string, claimId?: string | null): Promise<void> {
+  if (!claimId) return;
+  try {
+    await uploadedFiles.completeClaim(ownerId, claimId);
+  } catch (error) {
+    app.log.warn({ err: error, claimId }, "Could not remove staged uploads after they were persisted.");
+  }
+}
+function abandonUploadClaim(ownerId: string, claimId?: string | null): void {
+  if (claimId) uploadedFiles.abandonClaim(ownerId, claimId);
+}
+async function withAttachmentCleanup<T>(ownerId: string, chatId: string, action: () => Promise<T>): Promise<T> {
+  const before = db.listChatAttachmentFiles(ownerId, chatId);
+  try {
+    return await action();
+  } finally {
+    const retained = new Set(db.listChatAttachmentFiles(ownerId, chatId).map((attachment) => attachment.filePath));
+    await Promise.all(before.filter((attachment) => !retained.has(attachment.filePath)).map(async (attachment) => {
+      const filePath = attachment.filePath!;
+      const directory = path.dirname(filePath);
+      if (!isChatAttachmentDirectory(directory, chatId)) return;
+      await fs.promises.rm(filePath, { force: true });
+      await fs.promises.rmdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+    }));
+  }
+}
+async function removeTemporaryAttachmentFiles(filePaths: string[]): Promise<void> {
+  await Promise.all(filePaths.map(async (filePath) => {
+    await fs.promises.rm(filePath, { force: true });
+    await fs.promises.rmdir(path.dirname(filePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+  }));
 }
 function attachImportGuidance(ownerId: string, input: SendMessageRequest, providerRequest: ProviderChatRequest): void {
   const hasImportDraft = providerRequest.messages.some((message) => /Import draft ID:/i.test(message.content));

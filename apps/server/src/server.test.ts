@@ -1,10 +1,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type { CopilotProvider } from "@copilotchat/provider";
 import type { ImportPreview, MessageAttachment } from "@copilotchat/shared";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import { materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
@@ -14,7 +16,8 @@ import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
-import { ActiveChatResponses } from "./responses.js";
+import { ActiveChatResponse, ActiveChatResponses } from "./responses.js";
+import { UploadedFileStore } from "./uploaded-files.js";
 import { ownerWorkspaceDirectory, ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
 const tempDbs: Array<{ db: AppDatabase; dir: string }> = [];
@@ -162,9 +165,55 @@ describe("chat provider context", () => {
     const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: message.content, skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
     db.editUserMessageAndTruncate(owner.id, chat.id, message.id, "Use this updated screenshot.");
 
-    expect(request.messages.at(-1)?.attachments).toEqual([{ type: "blob", data: attachment.data, mimeType: "image/png", displayName: "project-list.png" }]);
+    expect(request.messages.at(-1)?.attachments).toEqual([{ type: "blob", data: attachment.data, mimeType: "image/png", displayName: "project-list.png", size: 5 }]);
     expect(db.listMessages(chat.id)[0]?.metadata.attachments).toEqual([{ id: "att-1", name: "project-list.png", mimeType: "image/png", size: 5 }]);
     expect(db.listMessages(chat.id, { includeAttachmentData: true })[0]?.metadata.attachments).toEqual([attachment]);
+  });
+
+  it("streams uploads into file-backed provider attachments", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Large attachment", projectId: null, workspaceId: null });
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-"));
+    const nextWorkspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 10 * 1024 * 1024);
+      const content = Buffer.alloc(2 * 1024 * 1024, "a");
+      const uploaded = await uploads.create(owner.id, { fileName: "large-notes.txt", mimeType: "text/plain", size: content.length }, Readable.from([content]));
+      const claimId = await uploads.claim(owner.id, [uploaded.uploadId!]);
+      const workspaceDir = path.join(workspaceRoot, chat.id);
+      fs.mkdirSync(workspaceDir, { recursive: true });
+      const materialized = await materializeMessageAttachments({ uploads, ownerId: owner.id, chatId: chat.id, workspaceDir, maxBytes: 10 * 1024 * 1024, uploadClaimId: claimId, attachments: [uploaded] });
+      const [attachment] = materialized.attachments;
+      await expect(uploads.get(owner.id, uploaded.uploadId!)).resolves.toMatchObject({ id: uploaded.uploadId });
+      const message = db.addMessage({ chatId: chat.id, role: "user", content: "Inspect the uploaded file." });
+      db.replaceMessageAttachments(owner.id, chat.id, message.id, [attachment!]);
+      await uploads.completeClaim(owner.id, claimId!);
+      const nextWorkspaceDir = path.join(nextWorkspaceRoot, chat.id);
+      fs.mkdirSync(nextWorkspaceDir, { recursive: true });
+      await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir: nextWorkspaceDir });
+      const relocated = db.listChatAttachmentFiles(owner.id, chat.id)[0]!;
+
+      const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: message.content, skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: nextWorkspaceRoot } });
+
+      expect(request.messages.at(-1)?.attachments).toEqual([{ type: "file", path: relocated.filePath, displayName: "large-notes.txt", size: content.length }]);
+      expect(fs.statSync(relocated.filePath!).size).toBe(content.length);
+      expect(fs.readFileSync(relocated.filePath!, "utf8").slice(0, 16)).toBe("a".repeat(16));
+      expect(fs.existsSync(attachment!.filePath!)).toBe(false);
+      expect(db.listMessages(chat.id)[0]?.metadata.attachments).toEqual([{ id: uploaded.id, name: "large-notes.txt", mimeType: "text/plain", size: content.length }]);
+      expect(db.listMessages(chat.id, { includeAttachmentFilePaths: true })[0]?.metadata.attachments).toEqual([relocated]);
+      await expect(uploads.get(owner.id, uploaded.uploadId!)).rejects.toThrow();
+      fs.rmSync(relocated.filePath!);
+      const missing: string[] = [];
+      await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir: nextWorkspaceDir, onMissing: (item) => missing.push(item.name) });
+      expect(missing).toEqual(["large-notes.txt"]);
+      expect(db.listChatAttachmentFiles(owner.id, chat.id)).toEqual([]);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      fs.rmSync(nextWorkspaceRoot, { recursive: true, force: true });
+    }
   });
 
   it("tracks manual chat titles and disables the provider title tool", () => {
@@ -411,6 +460,145 @@ describe("chat provider context", () => {
       await expect(draftStore.get("github:bob", bob.id)).resolves.toMatchObject({ id: bob.id, ownerId: "github:bob" });
     } finally {
       fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("stores uploaded import contents outside draft metadata", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 10 * 1024 * 1024);
+      const content = JSON.stringify([{ id: "chat-1", title: "Large import", padding: "x".repeat(2 * 1024 * 1024) }]);
+      const uploaded = await uploads.create("github:alice", { fileName: "claude.json", mimeType: "application/json", size: Buffer.byteLength(content) }, Readable.from([content]));
+      const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
+      const draftStore = new ImportDraftStore(draftDir);
+
+      const draft = await draftStore.createFromUpload("github:alice", "auto", uploads, uploaded.uploadId!, claimId!);
+      const stored = await draftStore.get("github:alice", draft.id);
+      await uploads.completeClaim("github:alice", claimId!);
+
+      expect(stored.content).toBeUndefined();
+      expect(await draftStore.readContent(stored)).toBe(content);
+      expect(fs.readFileSync(path.join(draftDir, `${draft.id}.json`), "utf8")).not.toContain("x".repeat(100));
+      await expect(uploads.get("github:alice", uploaded.uploadId!)).rejects.toThrow();
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects uploads without a usable basename", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      await expect(uploads.create("github:alice", { fileName: "/", mimeType: "application/octet-stream", size: 1 }, Readable.from([Buffer.from("x")]))).rejects.toThrow("valid file name");
+      fs.writeFileSync(path.join(uploadDir, "corrupt.json"), "{");
+      fs.writeFileSync(path.join(uploadDir, "corrupt.upload"), "x");
+      await expect(uploads.deleteOwner("github:alice")).resolves.toBe(0);
+      expect(fs.readdirSync(uploadDir)).toEqual([]);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects repeated staged uploads before copying attachment data", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const uploaded = await uploads.create("github:alice", { fileName: "notes.txt", mimeType: "text/plain", size: 5 }, Readable.from(["notes"]));
+      const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
+      await expect(uploads.claim("github:alice", [uploaded.uploadId!])).rejects.toThrow("already in use");
+
+      await expect(materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, uploadClaimId: claimId, attachments: [uploaded, { ...uploaded, id: "duplicate" }] })).rejects.toThrow("only be attached once");
+      await expect(materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 4, uploadClaimId: claimId, attachments: [{ ...uploaded, size: 0 }] })).rejects.toThrow("Combined attachment size");
+      await expect(materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, uploadClaimId: claimId, attachments: [uploaded, { id: "bad", name: "bad.txt", mimeType: "text/plain", size: 2, data: "!" }] })).rejects.toThrow("valid base64");
+      expect(fs.readdirSync(path.join(workspaceDir, ".copilotchat", "uploads", "chat-1"))).toEqual([]);
+      uploads.abandonClaim("github:alice", claimId!);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses content-addressed paths for same-size attachment replacements", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const firstUpload = await uploads.create("github:alice", { fileName: "notes.txt", mimeType: "text/plain", size: 5 }, Readable.from(["first"]));
+      const firstClaim = await uploads.claim("github:alice", [firstUpload.uploadId!]);
+      const first = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, uploadClaimId: firstClaim, attachments: [{ ...firstUpload, id: "same-id" }] });
+      await uploads.completeClaim("github:alice", firstClaim!);
+      const secondUpload = await uploads.create("github:alice", { fileName: "notes.txt", mimeType: "text/plain", size: 5 }, Readable.from(["other"]));
+      const secondClaim = await uploads.claim("github:alice", [secondUpload.uploadId!]);
+      const second = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, uploadClaimId: secondClaim, attachments: [{ ...secondUpload, id: "same-id" }] });
+
+      expect(second.attachments[0]?.filePath).not.toBe(first.attachments[0]?.filePath);
+      expect(fs.readFileSync(second.attachments[0]!.filePath!, "utf8")).toBe("other");
+      await uploads.completeClaim("github:alice", secondClaim!);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+      fs.rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans temporary steering attachment files", async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-steer-files-"));
+    const filePath = path.join(directory, "steer.txt");
+    fs.writeFileSync(filePath, "temporary");
+    const response = new ActiveChatResponse("chat-1");
+    response.trackTemporaryFiles([filePath]);
+
+    await response.cleanupTemporaryFiles();
+
+    expect(fs.existsSync(filePath)).toBe(false);
+    expect(fs.existsSync(directory)).toBe(false);
+  });
+
+  it("queues original upload references when steering is unavailable", async () => {
+    const response = new ActiveChatResponse("chat-1");
+    const uploaded: MessageAttachment = { id: "upload-1", uploadId: "upload-1", name: "notes.txt", mimeType: "text/plain", size: 5 };
+    const resolved: MessageAttachment = { id: "upload-1", filePath: "/tmp/notes.txt", name: "notes.txt", mimeType: "text/plain", size: 5 };
+    let cleaned = false;
+
+    const result = await response.steer({ mode: "steer", content: "Use this", attachments: [resolved] }, { mode: "steer", content: "Use this", attachments: [uploaded] }, { cleanup: { id: "upload-claim", run: async () => { cleaned = true; } } });
+
+    expect(result?.delivered).toBe(false);
+    expect(response.nextQueued()?.request.attachments).toEqual([uploaded]);
+    await response.cleanupResources();
+    expect(cleaned).toBe(true);
+    expect(response.trackTemporaryFiles(["/tmp/late.txt"])).toBe(false);
+  });
+
+  it("keeps legacy base64 ZIP draft content as text", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const content = Buffer.from("legacy zip bytes").toString("base64");
+      const draft = await draftStore.create("github:alice", { source: "auto", fileName: "export.zip", encoding: "base64", content });
+
+      await expect(draftStore.readContent(await draftStore.get("github:alice", draft.id))).resolves.toBe(content);
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces a separate import size limit", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir, 4);
+      await expect(draftStore.create("github:alice", { source: "auto", fileName: "large.json", encoding: "text", content: "12345" })).rejects.toThrow("limit");
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const uploaded = await uploads.create("github:alice", { fileName: "large.json", mimeType: "application/json", size: 5 }, Readable.from(["12345"]));
+      const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
+      await expect(draftStore.createFromUpload("github:alice", "auto", uploads, uploaded.uploadId!, claimId!)).rejects.toThrow("limit");
+      uploads.abandonClaim("github:alice", claimId!);
+      await expect(uploads.get("github:alice", uploaded.uploadId!)).resolves.toBeDefined();
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+      fs.rmSync(uploadDir, { recursive: true, force: true });
     }
   });
 
