@@ -66,6 +66,8 @@ docker pull ghcr.io/depollsoft/copilotchat:latest
 
 GHCR packages may need to be made public once after their first publication for anonymous pulls.
 
+Dependabot checks for `@github/copilot-sdk` updates daily. Its SDK-only pull requests are squash-merged automatically after the full CI workflow succeeds for the exact commit being merged. The default branch requires the `build-test` and `docker` checks with strict up-to-date enforcement so a tested update cannot merge against a newer base.
+
 ## Environment
 
 | Variable | Default | Purpose |
