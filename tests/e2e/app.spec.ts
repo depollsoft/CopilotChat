@@ -134,6 +134,38 @@ test("mobile shell has no horizontal overflow and navigates drawers", async ({ p
   await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
 });
 
+test("mobile foreground reconnects after a transient network failure", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile lifecycle coverage only runs in mobile project.");
+  let activeResponseFailuresRemaining = 0;
+  let activeResponseRequests = 0;
+  await page.route(/\/api\/chats\/[^/]+\/active-response$/, async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.continue();
+      return;
+    }
+    activeResponseRequests += 1;
+    if (activeResponseFailuresRemaining > 0) {
+      activeResponseFailuresRemaining -= 1;
+      await route.abort("failed");
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto("/");
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Resume this chat.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").last()).toBeVisible();
+  await expect.poll(() => activeResponseRequests).toBeGreaterThan(0);
+  const requestsBeforeResume = activeResponseRequests;
+  activeResponseFailuresRemaining = 3;
+  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
+  await expect.poll(() => activeResponseRequests).toBeGreaterThan(requestsBeforeResume + 2);
+  await expect(page.locator(".error-banner")).toBeVisible();
+  await expect.poll(() => activeResponseRequests).toBeGreaterThan(requestsBeforeResume + 3);
+  await expect(page.locator(".error-banner")).toHaveCount(0);
+  await expect(page.locator(".msg.user").filter({ hasText: "Resume this chat." })).toBeVisible();
+});
+
 test("mobile shell keeps controls inside emulated safe areas", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile safe-area coverage only runs in mobile project.");
   const insets = { top: 47, right: 31, bottom: 34, left: 59 };
