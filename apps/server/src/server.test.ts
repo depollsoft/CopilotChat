@@ -15,7 +15,7 @@ import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
 import { ActiveChatResponses } from "./responses.js";
-import { ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
+import { ownerWorkspaceDirectory, ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
 const tempDbs: Array<{ db: AppDatabase; dir: string }> = [];
 function createTestDb(): AppDatabase { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-db-")); const db = new AppDatabase(dir); tempDbs.push({ db, dir }); return db; }
@@ -831,12 +831,15 @@ describe("chat provider context", () => {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-outside-"));
     try {
-      const aliceRoot = ownerWorkspaceRoot(workspaceRoot, "github:alice");
+      const aliceOwnerId = "github-id:1001";
+      const aliceRoot = ownerWorkspaceRoot(workspaceRoot, aliceOwnerId);
       const aliceRepo = path.join(aliceRoot, "repo");
       fs.mkdirSync(aliceRepo, { recursive: true });
 
-      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: "github:alice", rootPath: aliceRepo, workspaceRoot })).resolves.toBe(fs.realpathSync(aliceRepo));
-      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: "github:alice", rootPath: outside, workspaceRoot })).rejects.toThrow(/configured workspace root/);
+      expect(ownerWorkspaceDirectory(aliceOwnerId)).toBe("github-id-1001");
+      expect(ownerWorkspaceDirectory("github:legacy-login")).toBe("legacy-login");
+      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: aliceOwnerId, rootPath: aliceRepo, workspaceRoot })).resolves.toBe(fs.realpathSync(aliceRepo));
+      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: aliceOwnerId, rootPath: outside, workspaceRoot })).rejects.toThrow(/configured workspace root/);
       await expect(validateRegisteredWorkspaceRoot({ authMode: "local", ownerId: "local", rootPath: outside, workspaceRoot })).resolves.toBe(fs.realpathSync(outside));
     } finally {
       fs.rmSync(workspaceRoot, { recursive: true, force: true });

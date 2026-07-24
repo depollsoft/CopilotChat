@@ -52,7 +52,9 @@ https://chat.example.com/api/auth/github/callback
 
 The OAuth token is stored in the persistent volume and passed to the Copilot SDK for that user, so each signed-in account uses its own Copilot subscription. Set `COPILOTCHAT_ALLOWED_GITHUB_LOGINS` to a comma-separated list to restrict access to specific GitHub handles; matching is case-insensitive, a leading `@` is optional, and an empty list allows every GitHub account. The allowlist is checked on every authenticated request, so removing a handle also invalidates its existing sessions.
 
-Chats, projects, skills, MCP servers, workspaces, imports, artifacts, tokens, and provider status are isolated by GitHub login. Cowork/workspace mode requires host folders to be mounted into the container before registration; in GitHub auth mode each registered path must be under `COPILOTCHAT_WORKSPACE_ROOT/<github-login>/`.
+Chats, projects, skills, MCP servers, workspaces, imports, artifacts, tokens, and provider status are isolated by GitHub account. Cowork/workspace mode requires host folders to be mounted into the container before registration. In GitHub auth mode, mount each account below `COPILOTCHAT_CONTAINER_WORKSPACE_ROOT/<workspace-directory>/`; the authenticated `/api/auth/status` response exposes the exact stable `workspaceDirectory`. New accounts use `github-id-<numeric-github-user-id>`, while safely migrated accounts retain their legacy directory name.
+
+For a new account, calculate the directory before mounting it with `gh api users/YOUR_HANDLE --jq '"github-id-\(.id)"'`.
 
 For a single-user local deployment, leave `COPILOTCHAT_AUTH_MODE=local` and set `COPILOT_GITHUB_TOKEN` instead. If exposing the app beyond localhost, use HTTPS and set `COPILOTCHAT_ALLOWED_ORIGINS` to the exact browser origins.
 
@@ -74,7 +76,7 @@ GHCR packages may need to be made public once after their first publication for 
 | `COPILOTCHAT_IMAGE` | `ghcr.io/depollsoft/copilotchat:latest` | Image used by Docker Compose |
 | `COPILOTCHAT_CONTAINER_WORKSPACE_ROOT` | `/data/registered-workspaces` | Container workspace root used by Docker Compose |
 | `COPILOTCHAT_DATA_DIR` | `.data` | SQLite database and runtime data |
-| `COPILOTCHAT_WORKSPACE_ROOT` | `.data/registered-workspaces` | Base folder for GitHub-mode registered workspaces; each login is confined to a subfolder |
+| `COPILOTCHAT_WORKSPACE_ROOT` | `.data/registered-workspaces` | Base folder for GitHub-mode registered workspaces; each account is confined to its stable workspace directory |
 | `COPILOTCHAT_BODY_LIMIT_BYTES` | `52428800` | Maximum API request body size |
 | `COPILOTCHAT_AUTH_MODE` | `local` | `local` or `github` |
 | `COPILOTCHAT_API_TOKEN` | empty | Optional API bearer token for exposed local-auth installs |

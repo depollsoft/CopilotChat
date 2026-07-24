@@ -31,7 +31,8 @@ services:
       - copilotchat-data:/data
       # Local mode example: mount a host folder here, then register the container path in the UI.
       # - ./example-workspace:/workspaces/example
-      # GitHub mode: mount owner folders below COPILOTCHAT_CONTAINER_WORKSPACE_ROOT/<github-login>/.
+      # GitHub mode: mount owner folders below COPILOTCHAT_CONTAINER_WORKSPACE_ROOT/<workspace-directory>/.
+      # - ./owner-workspaces:/data/registered-workspaces/github-id-123456
 
 volumes:
   copilotchat-data:

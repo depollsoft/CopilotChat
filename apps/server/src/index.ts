@@ -20,7 +20,7 @@ import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { ActiveChatResponses } from "./responses.js";
-import { runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
+import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
 
 const config = loadConfig();
@@ -86,7 +86,7 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessa
   return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
 }
 app.get(`${apiPrefix}/health`, async () => ({ ok: true, name: "CopilotChat", time: new Date().toISOString() }));
-app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, apiTokenRequired: config.authMode === "local" && Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
+app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, workspaceDirectory: config.authMode === "github" && owner ? ownerWorkspaceDirectory(owner.id) : null, apiTokenRequired: config.authMode === "local" && Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
 app.get(`${apiPrefix}/auth/github/login`, async (request, reply) => {
   if (!config.githubClientId || !config.githubClientSecret) throw new Error("GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are required for GitHub login.");
   const state = randomBytes(24).toString("base64url");
