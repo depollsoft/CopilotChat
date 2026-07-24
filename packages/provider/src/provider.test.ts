@@ -75,6 +75,28 @@ describe("createCopilotProvider", () => {
     expect(abort).toHaveBeenCalledOnce();
     expect(session.disconnect).toHaveBeenCalledOnce();
   });
+  it("does not send a pre-cancelled SDK request", async () => {
+    const listeners: Array<(event: { type: string; id: string; data: Record<string, unknown> }) => void> = [];
+    const abort = vi.fn(async () => { for (const listener of listeners) listener({ type: "session.idle", id: "idle", data: {} }); });
+    const session = {
+      sessionId: "session-1",
+      workspacePath: null,
+      on: vi.fn((listener: (event: { type: string; id: string; data: Record<string, unknown> }) => void) => { listeners.push(listener); }),
+      send: vi.fn(async () => "message-1"),
+      abort,
+      disconnect: vi.fn(async () => undefined),
+      rpc: { plan: { read: vi.fn(async () => ({ content: "" })) } },
+    };
+    vi.spyOn(CopilotClient.prototype, "createSession").mockResolvedValueOnce(session as never);
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+    const controller = new AbortController();
+    controller.abort();
+
+    await collect(createCopilotProvider({ provider: "sdk", model: "gpt-test" }).streamChat({ messages: [{ role: "user", content: "Do not send" }], model: "gpt-test", abortSignal: controller.signal }));
+
+    expect(abort).toHaveBeenCalledOnce();
+    expect(session.send).not.toHaveBeenCalled();
+  });
   it("passes project context and prior messages through the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
     const events = await collect(provider.streamChat({

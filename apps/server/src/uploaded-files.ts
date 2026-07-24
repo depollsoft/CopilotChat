@@ -182,21 +182,27 @@ export class UploadedFileStore {
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
       const id = path.basename(entry, ".json");
-      if (this.claimsByUpload.has(id)) continue;
-      const uploaded = await this.safeRead(id);
-      if (!uploaded) {
-        await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
-        continue;
-      }
+      if (this.claimsByUpload.has(id) || this.deletingUploads.has(id)) continue;
+      this.deletingUploads.add(id);
       try {
-        await fs.access(this.dataPath(id));
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        await fs.rm(this.metadataPath(id), { force: true });
-        continue;
+        if (this.claimsByUpload.has(id)) continue;
+        const uploaded = await this.safeRead(id);
+        if (!uploaded) {
+          await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
+          continue;
+        }
+        try {
+          await fs.access(this.dataPath(id));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          await fs.rm(this.metadataPath(id), { force: true });
+          continue;
+        }
+        if (new Date(uploaded.createdAt).getTime() >= cutoff || this.claimsByUpload.has(id)) continue;
+        await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
+      } finally {
+        this.deletingUploads.delete(id);
       }
-      if (new Date(uploaded.createdAt).getTime() >= cutoff) continue;
-      await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
     }
     for (const entry of entries) {
       const uploadId = entry.endsWith(".upload.part") ? entry.slice(0, -".upload.part".length) : entry.endsWith(".upload") ? entry.slice(0, -".upload".length) : null;

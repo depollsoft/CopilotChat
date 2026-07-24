@@ -541,7 +541,14 @@ describe("chat provider context", () => {
       const legacyAgain = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, attachments: [legacy] });
       expect(legacyFirst.createdFilePaths).toHaveLength(1);
       expect(legacyAgain.createdFilePaths).toEqual([]);
+      const longName = `${"a".repeat(1000)}.txt`;
+      const longUpload = await uploads.create("github:alice", { fileName: longName, mimeType: "text/plain", size: 4 }, Readable.from(["long"]));
+      const longClaim = await uploads.claim("github:alice", [longUpload.uploadId!]);
+      const longAttachment = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, uploadClaimId: longClaim, attachments: [longUpload] });
+      expect(Buffer.byteLength(path.basename(longAttachment.attachments[0]!.filePath!))).toBeLessThanOrEqual(255);
+      expect(longAttachment.attachments[0]?.name).toBe(longName);
       await uploads.completeClaim("github:alice", secondClaim!);
+      await uploads.completeClaim("github:alice", longClaim!);
     } finally {
       fs.rmSync(uploadDir, { recursive: true, force: true });
       fs.rmSync(workspaceDir, { recursive: true, force: true });
@@ -561,6 +568,26 @@ describe("chat provider context", () => {
     expect(fs.existsSync(directory)).toBe(false);
   });
 
+  it("marks a response inactive before awaiting terminal cleanup", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Cleanup ordering", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Finish" });
+    const provider: CopilotProvider = { id: "test", label: "Test", status: async () => ({ id: "test", label: "Test", available: true, details: "", capabilities: [], models: [] }), async *streamChat() { yield { type: "done" }; } };
+    const responses = new ActiveChatResponses();
+    let releaseCleanup!: () => void;
+    let markCleanupStarted!: () => void;
+    const cleanupStarted = new Promise<void>((resolve) => { markCleanupStarted = resolve; });
+    const cleanupBlocked = new Promise<void>((resolve) => { releaseCleanup = resolve; });
+    const response = responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Finish" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    response.trackResources({ cleanup: { id: "slow-cleanup", run: async () => { markCleanupStarted(); await cleanupBlocked; } } });
+
+    await cleanupStarted;
+
+    expect(responses.has(chat.id)).toBe(false);
+    releaseCleanup();
+  });
+
   it("queues original upload references when steering is unavailable", async () => {
     const response = new ActiveChatResponse("chat-1");
     const uploaded: MessageAttachment = { id: "upload-1", uploadId: "upload-1", name: "notes.txt", mimeType: "text/plain", size: 5 };
@@ -577,6 +604,24 @@ describe("chat provider context", () => {
     await response.cleanupResources();
     expect(cleaned).toBe(true);
     expect(response.trackTemporaryFiles(["/tmp/late.txt"])).toBe(false);
+  });
+
+  it("removes staged bytes when an accepted queued upload is abandoned", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const uploaded = await uploads.create("github:alice", { fileName: "queued.txt", mimeType: "text/plain", size: 6 }, Readable.from(["queued"]));
+      const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
+      const response = new ActiveChatResponse("chat-1");
+      response.trackResources({ cleanup: { id: "upload-claim", run: () => uploads.completeClaim("github:alice", claimId!) } });
+      response.enqueue({ mode: "queue", content: "Use this", attachments: [uploaded], uploadClaimId: claimId! });
+
+      await response.cleanupResources();
+
+      await expect(uploads.get("github:alice", uploaded.uploadId!)).rejects.toThrow();
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
   });
 
   it("enforces staged upload quotas and cleans orphaned files", async () => {

@@ -113,9 +113,6 @@ class SdkCopilotProvider implements CopilotProvider {
     catch (error) { await client.stop().catch(() => []); throw error; }
     const { session, resumed } = sessionData;
     yield { type: "session", sessionId: session.sessionId, workspacePath: session.workspacePath ?? null, resumed, infinite: true };
-    const abortSession = () => { void session.abort().catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error)))); };
-    if (request.abortSignal?.aborted) abortSession();
-    else request.abortSignal?.addEventListener("abort", abortSession, { once: true });
     const unregisterSteer = request.controls?.onSteer((message) => session.send({ prompt: message.content, mode: "immediate", attachments: sdkAttachments(message) }).then(() => undefined));
     const rootText: ProviderTextState = { length: 0, tail: "" };
     let rootTextClosed = false;
@@ -187,7 +184,12 @@ class SdkCopilotProvider implements CopilotProvider {
       if (eventType === "session.idle") { queue.push({ type: "done", usage: { provider: this.id } }); queue.close(); return; }
       if (eventType === "session.error") queue.fail(new Error(readNestedString(event.data, ["message"]) ?? "Copilot SDK session failed."));
     });
-    void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
+    const abortSession = () => { void session.abort().then(() => queue.close()).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error)))); };
+    if (request.abortSignal?.aborted) abortSession();
+    else {
+      request.abortSignal?.addEventListener("abort", abortSession, { once: true });
+      void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
+    }
     try { yield* queue; } finally { request.abortSignal?.removeEventListener("abort", abortSession); unregisterSteer?.(); await session.disconnect(); await client.stop().catch(() => []); }
   }
 }

@@ -315,9 +315,12 @@ function App(): React.ReactElement {
     } });
   }
   async function startGuidedImport(file: File): Promise<void> {
+    let uploaded: MessageAttachment | null = null;
+    let draftCreated = false;
     try {
-      const uploaded = await uploadFile(file, apiToken);
+      uploaded = await uploadFile(file, apiToken);
       const draft = await api<ImportDraft>("/api/imports/drafts", { method: "POST", body: { source: "auto", uploadId: uploaded.uploadId } }, apiToken);
+      draftCreated = true;
       const importSkillId = state?.skills.find((skill) => skill.manifest.id === IMPORT_ASSISTANT_SKILL_ID || skill.id === IMPORT_ASSISTANT_SKILL_ID)?.id ?? "";
       const skillIds = importSkillId ? [importSkillId] : [];
       if (importSkillId) setSelectedSkillIds((current) => current.includes(importSkillId) ? current : [...current, importSkillId]);
@@ -325,7 +328,11 @@ function App(): React.ReactElement {
       const chat = await createChat(null, null, { cleanup: false, refresh: false });
       await sendMessage(guidedImportPrompt(draft), { chat, skillIds });
     } catch (e) {
-      setError(toErr(e));
+      let message = toErr(e);
+      if (uploaded && !draftCreated) {
+        try { await discardUploadedFile(uploaded, apiToken); } catch (cleanupError) { message = `${message} Cleanup also failed: ${toErr(cleanupError)}`; }
+      }
+      setError(message);
     }
   }
   function addRunningChat(chatId: string): void { setLocalRunningChatIds((current) => current.includes(chatId) ? current : [...current, chatId]); }

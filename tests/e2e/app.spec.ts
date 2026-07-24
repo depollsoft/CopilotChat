@@ -365,6 +365,20 @@ test("preferences import starts a guided import chat", async ({ page }, testInfo
   await expect(response).toContainText("screenshots or pasted title lists");
 });
 
+test("failed guided imports discard their staged upload", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers guided import cleanup.");
+  let deleteCount = 0;
+  await page.route("**/api/imports/drafts", async (route) => route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Import exceeds limit" }) }));
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator(".sidebar-preferences-row").click();
+  await page.getByRole("dialog", { name: "Preferences" }).locator('input[type="file"]').setInputFiles({ name: "too-large.json", mimeType: "application/json", buffer: Buffer.from("{}") });
+
+  await expect(page.getByRole("alert")).toBeVisible();
+  await expect.poll(() => deleteCount).toBe(1);
+});
+
 test("composer sends attached files and pasted images", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer attachments.");
   await page.goto("/");

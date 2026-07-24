@@ -129,9 +129,16 @@ async function validateExistingAttachment(directory: string, attachment: Message
 }
 
 function attachmentFileName(attachment: MessageAttachment, contentDigest: string): string {
-  const name = safePathSegment(path.basename(attachment.name));
+  const name = boundedStorageName(attachment.name, 112);
   const idDigest = createHash("sha256").update(`${attachment.id}\0${contentDigest}`).digest("hex").slice(0, 24);
   return `${idDigest}-${contentDigest}-${name}`;
+}
+
+function boundedStorageName(fileName: string, maxLength: number): string {
+  const safeName = safePathSegment(path.basename(fileName));
+  if (safeName.length <= maxLength) return safeName;
+  const extension = path.extname(safeName).slice(0, 32);
+  return `${safeName.slice(0, Math.max(1, maxLength - extension.length))}${extension}`;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {

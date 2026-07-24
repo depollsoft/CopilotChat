@@ -134,6 +134,7 @@ export class ActiveChatResponses {
 
   private async run(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): Promise<void> {
     let turn: ActiveTurn = { chat: input.chat, userMessage: input.userMessage, providerRequest: input.providerRequest };
+    let terminal: { event: "done" | "error"; data: Record<string, unknown> };
     try {
       while (!response.cancelled) {
         turn = await this.runTurn(response, input, turn);
@@ -142,19 +143,18 @@ export class ActiveChatResponses {
         response.markPendingRunning(next.id);
         turn = await input.prepareTurn(next.request);
       }
-      response.emit("done", response.cancelled ? { ok: false, cancelled: true } : { ok: true });
+      terminal = { event: "done", data: response.cancelled ? { ok: false, cancelled: true } : { ok: true } };
     } catch (error) {
-      if (response.cancelled) response.emit("done", { ok: false, cancelled: true });
-      else response.emit("error", { message: (error as Error).message });
-    } finally {
-      try {
-        await response.cleanupResources();
-      } catch (error) {
-        response.emit("error", { message: `Could not clean temporary attachments: ${(error as Error).message}` });
-      }
-      response.close();
-      if (this.active.get(input.chat.id) === response) this.active.delete(input.chat.id);
+      terminal = response.cancelled ? { event: "done", data: { ok: false, cancelled: true } } : { event: "error", data: { message: (error as Error).message } };
     }
+    if (this.active.get(input.chat.id) === response) this.active.delete(input.chat.id);
+    try {
+      await response.cleanupResources();
+    } catch (error) {
+      terminal = { event: "error", data: { message: `Could not clean temporary attachments: ${(error as Error).message}` } };
+    }
+    response.emit(terminal.event, terminal.data);
+    response.close();
   }
 
   private async runTurn(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string }, turn: ActiveTurn): Promise<ActiveTurn> {

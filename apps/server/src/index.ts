@@ -447,7 +447,7 @@ async function withUploadClaim<TInput extends SendMessageRequest, TResult>(owner
   }
 }
 function uploadClaimCleanup(ownerId: string, claimId?: string): { id: string; run: () => Promise<void> } | undefined {
-  return claimId ? { id: `upload-claim:${claimId}`, run: async () => { uploadedFiles.abandonClaim(ownerId, claimId); } } : undefined;
+  return claimId ? { id: `upload-claim:${claimId}`, run: () => uploadedFiles.completeClaim(ownerId, claimId) } : undefined;
 }
 function uploadClaimResources(ownerId: string, claimId?: string): { cleanup: { id: string; run: () => Promise<void> } } | undefined {
   const cleanup = uploadClaimCleanup(ownerId, claimId);
