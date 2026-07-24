@@ -24,6 +24,9 @@ describe("createCopilotProvider", () => {
     expect(message).not.toContain("minified-source");
     expect(message.length).toBeLessThan(200);
   });
+  it("preserves actionable messages containing the word at", () => {
+    expect(summarizeSdkFailureMessage(new Error("Open the device page at https://github.com/login/device"))).toBe("Open the device page at https://github.com/login/device");
+  });
   it("stops the SDK client when startup fails", async () => {
     vi.spyOn(CopilotClient.prototype, "start").mockRejectedValueOnce(new Error("startup failed"));
     const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
