@@ -130,11 +130,12 @@ class SdkCopilotProvider implements CopilotProvider {
       return { truncated: next.truncated };
     };
     session.on((event: SessionEvent) => {
-      const eventType = String(event.type);
-      const agentId = eventAgentId(event);
+      const e = event as unknown as SdkSessionEvent;
+      const eventType = e.type;
+      const agentId = eventAgentId(e);
       if (eventType === "assistant.message_delta") {
         if (!agentId || subagentTextClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(e.data, ["deltaContent"]);
         if (text) {
           sawSubagentDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -144,7 +145,7 @@ class SdkCopilotProvider implements CopilotProvider {
       }
       if (eventType === "assistant.reasoning_delta") {
         if (!agentId || subagentReasoningClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(e.data, ["deltaContent"]);
         if (text) {
           sawSubagentReasoningDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -153,7 +154,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.message") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(e.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -164,7 +165,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.reasoning") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(e.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentReasoningDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -173,14 +174,14 @@ class SdkCopilotProvider implements CopilotProvider {
         }
         return;
       }
-      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), input: limitProviderValue(eventToolInput(event.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
-      if (eventType === "tool.execution_complete") { const error = eventToolError(event.data); const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), output: limitProviderValue(eventToolOutput(event.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
-      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(event.data, ["agentDescription"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, toolCallId: readNestedString(event.data, ["toolCallId"]) }); return; }
-      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
-      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(event.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(e.data), toolName: eventToolName(e.data), input: limitProviderValue(eventToolInput(e.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
+      if (eventType === "tool.execution_complete") { const error = eventToolError(e.data); const tool = { toolCallId: eventId(e.data), toolName: eventToolName(e.data), output: limitProviderValue(eventToolOutput(e.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
+      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(e), name: readNestedString(e.data, ["agentName"]) ?? "subagent", displayName: readNestedString(e.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(e.data, ["agentDescription"]) ?? undefined, model: readNestedString(e.data, ["model"]) ?? undefined, toolCallId: readNestedString(e.data, ["toolCallId"]) }); return; }
+      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(e), name: readNestedString(e.data, ["agentName"]) ?? "subagent", displayName: readNestedString(e.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(e.data, ["durationMs"]) ?? undefined, model: readNestedString(e.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(e.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(e.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(e), name: readNestedString(e.data, ["agentName"]) ?? "subagent", displayName: readNestedString(e.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(e.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(e.data, ["durationMs"]) ?? undefined, model: readNestedString(e.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(e.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(e.data, ["totalToolCalls"]) ?? undefined }); return; }
       if (eventType === "session.plan_changed") { void session.rpc.plan.read().then((plan) => { const items = parseTaskListItems(plan.content ?? ""); if (items.length > 0) queue.push({ type: "task-list", id: "session-plan", title: "Session plan", source: "plan.md", content: plan.content, items }); }).catch(() => undefined); return; }
       if (eventType === "session.idle") { queue.push({ type: "done", usage: { provider: this.id } }); queue.close(); return; }
-      if (eventType === "session.error") queue.fail(new Error(readNestedString(event.data, ["message"]) ?? "Copilot SDK session failed."));
+      if (eventType === "session.error") queue.fail(new Error(readNestedString(e.data, ["message"]) ?? "Copilot SDK session failed."));
     });
     void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
     try { yield* queue; } finally { unregisterSteer?.(); await session.disconnect(); await client.stop().catch(() => []); }
@@ -660,8 +661,9 @@ function eventToolError(value: unknown): string | null {
   if (isRecord(error) && typeof error.message === "string") return error.message;
   return readFirstString(value, [["errorMessage"], ["error_message"]]);
 }
-function eventAgentId(event: SessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
-function subagentEventId(event: SessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
+type SdkSessionEvent = { type: string; data: unknown; agentId?: string; id: string };
+function eventAgentId(event: SdkSessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
+function subagentEventId(event: SdkSessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function formatToolOutput(value: unknown): string { try { return JSON.stringify(value); } catch { return String(value); } }
 function summarizeInline(value?: string | null): string { const normalized = value?.replace(/\s+/g, " ").trim() ?? ""; return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized; }
