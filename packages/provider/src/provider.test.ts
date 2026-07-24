@@ -2,7 +2,7 @@ import type { ProviderEvent } from "./index.js";
 import type { ModelInfo } from "@github/copilot-sdk";
 import http from "node:http";
 import { describe, expect, it } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo } from "./index.js";
+import { createCopilotProvider, mapSdkModelInfo, summarizeSdkFailureMessage } from "./index.js";
 
 describe("createCopilotProvider", () => {
   it("uses SDK provider by default", async () => {
@@ -12,6 +12,14 @@ describe("createCopilotProvider", () => {
   it("can use echo provider explicitly", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
     expect((await provider.status()).id).toBe("echo");
+  });
+  it("extracts actionable CLI failures without returning bundled source", () => {
+    const source = "minified-source ".repeat(5000);
+    const message = summarizeSdkFailureMessage(new Error(`CLI server exited with code 1 stderr: ${source} ^ Error: Persistence error: I/O error: Permission denied (os error 13) at Object.writeKey (file:///app/app.js:83:684) at async start (file:///app/app.js:100:1) Node.js v22.23.1`));
+
+    expect(message).toBe("Error: Persistence error: I/O error: Permission denied (os error 13)");
+    expect(message).not.toContain("minified-source");
+    expect(message.length).toBeLessThan(200);
   });
   it("passes project context and prior messages through the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
