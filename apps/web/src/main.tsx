@@ -286,6 +286,7 @@ function App(): React.ReactElement {
         const done = await handleStreamEvent(chatId, event);
         if (done) { completed = true; break; }
       }
+      if (rethrowNetworkErrors && !completed && !controller.signal.aborted) throw new Error("Network error: the response stream ended before completion.");
       setStreamingText("");
       setStreamingActivities([]);
       setPendingInteractions([]);

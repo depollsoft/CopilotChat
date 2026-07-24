@@ -134,9 +134,9 @@ test("mobile shell has no horizontal overflow and navigates drawers", async ({ p
   await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
 });
 
-test("mobile foreground reconnects after a transient network failure", async ({ page }, testInfo) => {
+test("mobile foreground reconnects to an in-progress response", async ({ page, context }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile lifecycle coverage only runs in mobile project.");
-  let activeResponseFailuresRemaining = 0;
+  let returnCleanEof = false;
   let activeResponseRequests = 0;
   await page.route(/\/api\/chats\/[^/]+\/active-response$/, async (route) => {
     if (route.request().method() !== "GET") {
@@ -144,26 +144,36 @@ test("mobile foreground reconnects after a transient network failure", async ({ 
       return;
     }
     activeResponseRequests += 1;
-    if (activeResponseFailuresRemaining > 0) {
-      activeResponseFailuresRemaining -= 1;
-      await route.abort("failed");
+    if (returnCleanEof) {
+      returnCleanEof = false;
+      await route.fulfill({ status: 200, contentType: "text/event-stream", body: ": connected\n\n" });
       return;
     }
     await route.continue();
   });
   await page.goto("/");
-  await page.getByPlaceholder(/Ask CopilotChat/).fill("Resume this chat.");
+  const prompt = `Start a long response for mobile resume. ${"Keep streaming this response. ".repeat(750)}`;
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".msg.assistant").last()).toBeVisible();
-  await expect.poll(() => activeResponseRequests).toBeGreaterThan(0);
-  const requestsBeforeResume = activeResponseRequests;
-  activeResponseFailuresRemaining = 3;
-  await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
-  await expect.poll(() => activeResponseRequests).toBeGreaterThan(requestsBeforeResume + 2);
+  const streamingResponse = page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last();
+  await expect(streamingResponse).toContainText("I am running with the local development provider");
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await context.setOffline(true);
   await expect(page.locator(".error-banner")).toBeVisible();
-  await expect.poll(() => activeResponseRequests).toBeGreaterThan(requestsBeforeResume + 3);
+  await page.evaluate(() => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  const requestsBeforeResume = activeResponseRequests;
+  returnCleanEof = true;
+  await context.setOffline(false);
+  await expect.poll(() => activeResponseRequests).toBeGreaterThan(requestsBeforeResume + 1);
+  await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 20000 });
   await expect(page.locator(".error-banner")).toHaveCount(0);
-  await expect(page.locator(".msg.user").filter({ hasText: "Resume this chat." })).toBeVisible();
+  await expect(page.locator(".msg.user").filter({ hasText: "Start a long response for mobile resume." })).toBeVisible();
 });
 
 test("mobile shell keeps controls inside emulated safe areas", async ({ page }, testInfo) => {
