@@ -6,6 +6,7 @@ on:
     types: [completed]
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -25,6 +26,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          TESTED_BASE_SHA: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
           TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           set -euo pipefail
@@ -37,10 +39,29 @@ jobs:
           head_repo="$(jq -r '.head.repo.full_name' <<<"${pr}")"
           head_sha="$(jq -r '.head.sha' <<<"${pr}")"
           default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          branch_rules="$(gh api "repos/${GITHUB_REPOSITORY}/rules/branches/${default_branch}")"
+          current_base_sha="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${base_ref}" --jq '.sha'
+          )"
+
+          for required_check in build-test docker; do
+            if ! jq -e --arg check "${required_check}" '
+              any(.[];
+                .type == "required_status_checks" and
+                .parameters.strict_required_status_checks_policy == true and
+                any(.parameters.required_status_checks[]?; .context == $check)
+              )
+            ' <<<"${branch_rules}" >/dev/null; then
+              echo "Strict ${required_check} branch protection is not active; skipping."
+              exit 0
+            fi
+          done
 
           if [[ "${actor}" != "dependabot[bot]" ||
                 "${state}" != "open" ||
                 "${base_ref}" != "${default_branch}" ||
+                "${base_sha}" != "${TESTED_BASE_SHA}" ||
+                "${current_base_sha}" != "${TESTED_BASE_SHA}" ||
                 "${head_repo}" != "${GITHUB_REPOSITORY}" ||
                 "${head_sha}" != "${TESTED_SHA}" ]]; then
             echo "PR no longer matches the tested Dependabot commit; skipping."
@@ -101,3 +122,8 @@ jobs:
               -f sha="${TESTED_SHA}"
           )"
           jq -e '.merged == true' <<<"${result}"
+
+          gh workflow run ci.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${default_branch}" \
+            -f publish=true

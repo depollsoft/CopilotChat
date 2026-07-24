@@ -7,6 +7,12 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the image after validating the selected ref
+        type: boolean
+        default: false
 
 jobs:
   build-test:
@@ -21,6 +27,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @copilotchat/provider auth:doctor:check
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
@@ -39,7 +46,10 @@ jobs:
       - run: pnpm test:e2e
 
   docker:
-    if: github.event_name != 'push'
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'workflow_dispatch' && !inputs.publish)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -53,7 +63,9 @@ jobs:
           cache-from: type=gha
 
   docker-publish:
-    if: github.event_name == 'push'
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
     runs-on: ubuntu-latest
     needs: build-test
     permissions:
@@ -68,7 +80,7 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=branch
+            type=raw,value=main,enable={{is_default_branch}}
             type=ref,event=tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
