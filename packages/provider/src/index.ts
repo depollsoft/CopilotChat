@@ -683,8 +683,9 @@ function sdkFailureDetails(error: unknown, options: ProviderFactoryOptions): str
 
 export function summarizeSdkFailureMessage(error: unknown): string {
   let message = error instanceof Error ? error.message : String(error);
-  const marker = message.lastIndexOf("^ Error: ");
-  if (marker >= 0) message = message.slice(marker + 2);
+  const markers = Array.from(message.matchAll(/\^\s*Error:\s*/g));
+  const marker = markers.at(-1);
+  if (marker?.index !== undefined) message = message.slice(marker.index + marker[0].lastIndexOf("Error:"));
   const nodeVersion = message.search(/\s+Node\.js v\d/);
   if (nodeVersion >= 0) message = message.slice(0, nodeVersion);
   const stack = message.search(/\s+at\s+(?:async\s+)?\S+/);
