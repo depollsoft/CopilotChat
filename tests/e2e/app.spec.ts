@@ -388,6 +388,30 @@ test("composer sends attached files and pasted images", async ({ page }, testInf
   await expect(response).toContainText("pasted.png");
 });
 
+test("composer retains successful files and discards each upload once", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers composer upload errors.");
+  await page.route("**/api/uploads?*", async (route) => {
+    const fileName = new URL(route.request().url()).searchParams.get("fileName");
+    if (fileName === "bad.txt") { await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Upload rejected" }) }); return; }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles([
+    { name: "good.txt", mimeType: "text/plain", buffer: Buffer.from("keep me") },
+    { name: "bad.txt", mimeType: "text/plain", buffer: Buffer.from("reject me") },
+  ]);
+
+  await expect(page.locator(".attachment-tray").filter({ hasText: "good.txt" })).toBeVisible();
+  await expect(page.locator(".attachment-error")).toContainText("too large");
+  await expect(page.locator(".attachment-tray").filter({ hasText: "bad.txt" })).toHaveCount(0);
+  let deleteCount = 0;
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  await page.getByRole("button", { name: "Remove good.txt" }).click();
+  await expect.poll(() => deleteCount).toBe(1);
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
+});
+
 test("composer shows slash command autocomplete with descriptions", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers slash command suggestions.");
   await page.goto("/");

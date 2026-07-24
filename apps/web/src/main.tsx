@@ -716,13 +716,13 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   async function addFiles(files: FileList | File[]): Promise<void> {
     setAttachmentError(null);
     const nextFiles = [...files];
-    try {
-      setAttachments([...attachments, ...(await Promise.all(nextFiles.map(p.onUploadFile)))]);
-    } catch (e) {
-      setAttachmentError(toErr(e));
-    }
+    const results = await Promise.allSettled(nextFiles.map(p.onUploadFile));
+    const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const failed = results.flatMap((result) => result.status === "rejected" ? [toErr(result.reason)] : []);
+    if (uploaded.length > 0) setAttachments((current) => [...current, ...uploaded]);
+    if (failed.length > 0) setAttachmentError(failed.length === 1 ? failed[0]! : `${failed.length} files failed to upload. ${failed[0]}`);
   }
-  function removeAttachment(id: string): void { setAttachments((current) => { const attachment = current.find((item) => item.id === id); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); return current.filter((item) => item.id !== id); }); }
+  function removeAttachment(id: string): void { const attachment = attachments.find((item) => item.id === id); setAttachments((current) => current.filter((item) => item.id !== id)); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); }
   function paste(e: React.ClipboardEvent<HTMLTextAreaElement>): void {
     const files = [...e.clipboardData.files];
     if (files.length === 0) return;
@@ -836,7 +836,9 @@ async function uploadFile(file: File, token: string): Promise<MessageAttachment>
   const response = await fetch(`/api/uploads?${query.toString()}`, { method: "POST", headers, body: file });
   if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
   const attachment = await response.json() as MessageAttachment;
-  if (file.type.startsWith("image/") && file.size <= 1024 * 1024) attachment.data = await fileToBase64(file);
+  if (file.type.startsWith("image/") && file.size <= 1024 * 1024) {
+    try { attachment.data = await fileToBase64(file); } catch { /* The uploaded image remains usable without an inline preview. */ }
+  }
   return attachment;
 }
 async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {

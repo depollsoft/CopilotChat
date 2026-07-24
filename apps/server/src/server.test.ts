@@ -204,7 +204,7 @@ describe("chat provider context", () => {
       expect(db.listMessages(chat.id)[0]?.metadata.attachments).toEqual([{ id: uploaded.id, name: "large-notes.txt", mimeType: "text/plain", size: content.length }]);
       expect(db.listMessages(chat.id, { includeAttachmentFilePaths: true })[0]?.metadata.attachments).toEqual([relocated]);
       await expect(uploads.get(owner.id, uploaded.uploadId!)).rejects.toThrow();
-      fs.rmSync(relocated.filePath!);
+      fs.writeFileSync(relocated.filePath!, Buffer.alloc(content.length, "b"));
       const missing: string[] = [];
       await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir: nextWorkspaceDir, onMissing: (item) => missing.push(item.name) });
       expect(missing).toEqual(["large-notes.txt"]);
@@ -536,6 +536,11 @@ describe("chat provider context", () => {
 
       expect(second.attachments[0]?.filePath).not.toBe(first.attachments[0]?.filePath);
       expect(fs.readFileSync(second.attachments[0]!.filePath!, "utf8")).toBe("other");
+      const legacy: MessageAttachment = { id: "legacy-id", name: "legacy.txt", mimeType: "text/plain", size: 5, data: Buffer.from("first").toString("base64") };
+      const legacyFirst = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, attachments: [legacy] });
+      const legacyAgain = await materializeMessageAttachments({ uploads, ownerId: "github:alice", chatId: "chat-1", workspaceDir, maxBytes: 1024, attachments: [legacy] });
+      expect(legacyFirst.createdFilePaths).toHaveLength(1);
+      expect(legacyAgain.createdFilePaths).toEqual([]);
       await uploads.completeClaim("github:alice", secondClaim!);
     } finally {
       fs.rmSync(uploadDir, { recursive: true, force: true });
@@ -562,13 +567,39 @@ describe("chat provider context", () => {
     const resolved: MessageAttachment = { id: "upload-1", filePath: "/tmp/notes.txt", name: "notes.txt", mimeType: "text/plain", size: 5 };
     let cleaned = false;
 
-    const result = await response.steer({ mode: "steer", content: "Use this", attachments: [resolved] }, { mode: "steer", content: "Use this", attachments: [uploaded] }, { cleanup: { id: "upload-claim", run: async () => { cleaned = true; } } });
+    const result = await response.steer({ mode: "steer", content: "Use this", attachments: [resolved] }, { cleanup: { id: "steer-resources", run: async () => { throw new Error("Live-only resources should not be tracked."); } } });
 
     expect(result?.delivered).toBe(false);
+    expect(result?.turn).toBeNull();
+    response.trackResources({ cleanup: { id: "upload-claim", run: async () => { cleaned = true; } } });
+    response.enqueue({ mode: "queue", content: "Use this", attachments: [uploaded] });
     expect(response.nextQueued()?.request.attachments).toEqual([uploaded]);
     await response.cleanupResources();
     expect(cleaned).toBe(true);
     expect(response.trackTemporaryFiles(["/tmp/late.txt"])).toBe(false);
+  });
+
+  it("enforces staged upload quotas and cleans orphaned files", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024, 6, 2);
+      await uploads.create("github:alice", { fileName: "first.bin", mimeType: "application/octet-stream", size: 4 }, Readable.from(["1234"]));
+      await expect(uploads.create("github:alice", { fileName: "second.bin", mimeType: "application/octet-stream", size: 3 }, Readable.from(["123"]))).rejects.toThrow("per-owner limit");
+      const staleTime = new Date(Date.now() - 25 * 60 * 60 * 1000);
+      const orphanPath = path.join(uploadDir, "orphan.upload");
+      const partialPath = path.join(uploadDir, "partial.upload.part");
+      fs.writeFileSync(orphanPath, "orphan");
+      fs.writeFileSync(partialPath, "partial");
+      fs.utimesSync(orphanPath, staleTime, staleTime);
+      fs.utimesSync(partialPath, staleTime, staleTime);
+
+      await uploads.cleanupExpired();
+
+      expect(fs.existsSync(orphanPath)).toBe(false);
+      expect(fs.existsSync(partialPath)).toBe(false);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
   });
 
   it("keeps legacy base64 ZIP draft content as text", async () => {

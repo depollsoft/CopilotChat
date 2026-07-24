@@ -50,6 +50,31 @@ describe("createCopilotProvider", () => {
     expect(status.available).toBe(false);
     expect(stop).toHaveBeenCalledOnce();
   });
+  it("aborts an active SDK session when the request is cancelled", async () => {
+    const listeners: Array<(event: { type: string; id: string; data: Record<string, unknown> }) => void> = [];
+    const abort = vi.fn(async () => { for (const listener of listeners) listener({ type: "session.idle", id: "idle", data: {} }); });
+    const session = {
+      sessionId: "session-1",
+      workspacePath: null,
+      on: vi.fn((listener: (event: { type: string; id: string; data: Record<string, unknown> }) => void) => { listeners.push(listener); }),
+      send: vi.fn(async () => "message-1"),
+      abort,
+      disconnect: vi.fn(async () => undefined),
+      rpc: { plan: { read: vi.fn(async () => ({ content: "" })) } },
+    };
+    vi.spyOn(CopilotClient.prototype, "createSession").mockResolvedValueOnce(session as never);
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+    const controller = new AbortController();
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test" });
+    const collecting = collect(provider.streamChat({ messages: [{ role: "user", content: "Wait" }], model: "gpt-test", abortSignal: controller.signal }));
+    await vi.waitFor(() => expect(session.send).toHaveBeenCalledOnce());
+
+    controller.abort();
+    await collecting;
+
+    expect(abort).toHaveBeenCalledOnce();
+    expect(session.disconnect).toHaveBeenCalledOnce();
+  });
   it("passes project context and prior messages through the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
     const events = await collect(provider.streamChat({

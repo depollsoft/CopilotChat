@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { MessageAttachment } from "@copilotchat/shared";
@@ -41,8 +41,7 @@ export async function materializeMessageAttachments(input: { uploads: UploadedFi
         const existed = await pathExists(targetPath);
         await input.uploads.copyTo(input.ownerId, attachment.uploadId, targetPath, input.uploadClaimId!);
         materialized.push({ id: attachment.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size, filePath: targetPath });
-        createdFilePaths.push(targetPath);
-        if (!existed) createdThisAttempt.push(targetPath);
+        if (!existed) { createdFilePaths.push(targetPath); createdThisAttempt.push(targetPath); }
         continue;
       }
       if (!attachment.data || !/^[A-Za-z0-9+/]*={0,2}$/.test(attachment.data)) throw new Error(`Attachment ${attachment.name} is not valid base64.`);
@@ -53,8 +52,7 @@ export async function materializeMessageAttachments(input: { uploads: UploadedFi
       const existed = await pathExists(targetPath);
       await writeFileAtomically(targetPath, content);
       materialized.push({ id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, filePath: targetPath });
-      createdFilePaths.push(targetPath);
-      if (!existed) createdThisAttempt.push(targetPath);
+      if (!existed) { createdFilePaths.push(targetPath); createdThisAttempt.push(targetPath); }
     }
     return { attachments: materialized, uploadIds, createdFilePaths };
   } catch (error) {
@@ -84,16 +82,18 @@ export async function relocateChatAttachments(input: { db: AppDatabase; ownerId:
       continue;
     }
     if (!isChatAttachmentDirectory(path.dirname(sourcePath), input.chatId)) throw new Error(`Attachment ${attachment.name} is outside a managed chat upload directory.`);
+    try {
+      await validateManagedAttachmentFile(sourcePath, attachment);
+    } catch {
+      input.db.updateMessageAttachmentFilePath(input.ownerId, input.chatId, attachment.id, null);
+      input.onMissing?.(attachment);
+      continue;
+    }
     if (isPathInside(directoryRealPath, sourcePath)) continue;
     const targetPath = path.join(directoryRealPath, path.basename(sourcePath));
     await assertNoSymlink(targetPath, "Attachment path must not be a symlink.");
-    try {
-      await fs.copyFile(sourcePath, targetPath, constants.COPYFILE_EXCL);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const targetStat = await fs.stat(targetPath);
-      if (targetStat.size !== attachment.size) throw new Error(`Attachment ${attachment.name} conflicts with an existing file.`, { cause: error });
-    }
+    await copyFileAtomically(sourcePath, targetPath);
+    await validateManagedAttachmentFile(targetPath, attachment);
     input.db.updateMessageAttachmentFilePath(input.ownerId, input.chatId, attachment.id, targetPath);
     await fs.rm(sourcePath, { force: true });
     await fs.rmdir(path.dirname(sourcePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
@@ -124,16 +124,14 @@ async function validateExistingAttachment(directory: string, attachment: Message
   const directoryRealPath = await fs.realpath(directory);
   const targetRealPath = await fs.realpath(target);
   if (!isPathInside(directoryRealPath, targetRealPath)) throw new Error(`Attachment ${attachment.name} is outside the active chat upload directory.`);
-  const stat = await fs.stat(targetRealPath);
-  if (!stat.isFile()) throw new Error(`Attachment ${attachment.name} is not a file.`);
-  if (stat.size !== attachment.size) throw new Error(`Attachment ${attachment.name} size does not match its file.`);
+  await validateManagedAttachmentFile(targetRealPath, attachment);
   return { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, filePath: targetRealPath };
 }
 
 function attachmentFileName(attachment: MessageAttachment, contentDigest: string): string {
   const name = safePathSegment(path.basename(attachment.name));
   const idDigest = createHash("sha256").update(`${attachment.id}\0${contentDigest}`).digest("hex").slice(0, 24);
-  return `${idDigest}-${name}`;
+  return `${idDigest}-${contentDigest}-${name}`;
 }
 
 async function pathExists(filePath: string): Promise<boolean> {
@@ -154,6 +152,34 @@ async function writeFileAtomically(targetPath: string, content: Buffer): Promise
   } finally {
     await fs.rm(temporaryPath, { force: true });
   }
+}
+
+async function copyFileAtomically(sourcePath: string, targetPath: string): Promise<void> {
+  const temporaryPath = `${targetPath}.${randomUUID()}.part`;
+  try {
+    await fs.copyFile(sourcePath, temporaryPath);
+    await replaceFile(temporaryPath, targetPath);
+  } finally {
+    await fs.rm(temporaryPath, { force: true });
+  }
+}
+
+async function validateManagedAttachmentFile(filePath: string, attachment: MessageAttachment): Promise<void> {
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) throw new Error(`Attachment ${attachment.name} is not a file.`);
+  if (stat.size !== attachment.size) throw new Error(`Attachment ${attachment.name} size does not match its file.`);
+  const expectedDigest = attachmentDigestFromPath(filePath);
+  if (expectedDigest && await hashFile(filePath) !== expectedDigest) throw new Error(`Attachment ${attachment.name} content does not match its file reference.`);
+}
+
+function attachmentDigestFromPath(filePath: string): string | null {
+  return /^[a-f0-9]{24}-([a-f0-9]{64})-/.exec(path.basename(filePath))?.[1] ?? null;
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer);
+  return hash.digest("hex");
 }
 
 async function replaceFile(sourcePath: string, targetPath: string): Promise<void> {

@@ -121,9 +121,9 @@ export class ActiveChatResponses {
     return true;
   }
 
-  async steer(chatId: string, request: InternalActiveResponseInputRequest, fallbackRequest: InternalActiveResponseInputRequest = request, resources?: ResponseResources): Promise<{ turn: PendingTurn; delivered: boolean } | null> {
+  async steer(chatId: string, request: InternalActiveResponseInputRequest, resources?: ResponseResources): Promise<{ turn: PendingTurn | null; delivered: boolean } | null> {
     const response = this.active.get(chatId);
-    return response ? await response.steer(request, fallbackRequest, resources) : null;
+    return response ? await response.steer(request, resources) : null;
   }
 
   trackTemporaryFiles(chatId: string, filePaths: string[]): boolean {
@@ -275,15 +275,15 @@ export class ActiveChatResponse {
     return turn;
   }
 
-  async steer(request: InternalActiveResponseInputRequest, fallbackRequest: InternalActiveResponseInputRequest = request, resources?: ResponseResources): Promise<{ turn: PendingTurn; delivered: boolean } | null> {
+  async steer(request: InternalActiveResponseInputRequest, resources?: ResponseResources): Promise<{ turn: PendingTurn | null; delivered: boolean } | null> {
     const steerHandler = this.steerHandler;
-    if (!this.trackResources({ cleanup: resources?.cleanup, temporaryFiles: steerHandler ? resources?.temporaryFiles : undefined })) return null;
-    const turn = this.createPendingTurn("steer", request.content, steerHandler ? "sent" : "queued");
+    if (!steerHandler) return { turn: null, delivered: false };
+    if (!this.trackResources(resources)) return null;
+    const turn = this.createPendingTurn("steer", request.content, "sent");
     this.pendingTurns = [...this.pendingTurns, turn];
-    if (steerHandler) await steerHandler(providerMessageForActiveInput(request));
-    else this.queuedTurns.push({ ...turn, mode: "queue", status: "queued", request: queueRequest(fallbackRequest) });
+    await steerHandler(providerMessageForActiveInput(request));
     this.emitPendingTurns();
-    return { turn, delivered: Boolean(steerHandler) };
+    return { turn, delivered: true };
   }
 
   nextQueued(): QueuedTurn | null {

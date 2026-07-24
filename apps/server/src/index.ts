@@ -33,11 +33,14 @@ if (config.authMode === "github" && config.githubClientSecret && !config.publicU
 const db = new AppDatabase(config.dataDir);
 const isolatedWorkspaceRoot = path.join(config.dataDir, "isolated-workspaces");
 const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"), config.importLimitBytes);
-const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes);
+const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes, config.stagedUploadLimitBytes, config.stagedUploadLimitFiles);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
 const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
 const app = Fastify({ logger: true, bodyLimit: config.bodyLimitBytes });
+await uploadedFiles.cleanupExpired();
+const uploadCleanupTimer = setInterval(() => { void uploadedFiles.cleanupExpired().catch((error) => app.log.error({ err: error }, "Could not clean expired uploads.")); }, 60 * 60 * 1000);
+uploadCleanupTimer.unref();
 const requestOwners = new WeakMap<FastifyRequest, Owner>();
 const sessionCookieName = "copilotchat_session";
 const oauthStateCookieName = "copilotchat_oauth_state";
@@ -189,7 +192,7 @@ app.post(`${apiPrefix}/chats/:chatId/active-response/input`, async (request) => 
     return pending;
   }
   const workspaceDir = chatWorkingDirectory(db, owner.id, chat, isolatedWorkspaceRoot);
-  await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing; removing its file reference.") });
+  await relocateChatAttachments({ db, ownerId: owner.id, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing or invalid; removing its file reference.") });
   const claimedInput = await claimRequestUploads(owner.id, input);
   let materialized;
   try {
@@ -204,7 +207,7 @@ app.post(`${apiPrefix}/chats/:chatId/active-response/input`, async (request) => 
     throw new Error("Message requires text or an attachment.");
   }
   const resolvedInput = { ...claimedInput, attachments };
-  const steerResult = await activeResponses.steer(params.chatId, resolvedInput, claimedInput, { temporaryFiles: materialized.createdFilePaths, cleanup: uploadClaimCleanup(owner.id, claimedInput.uploadClaimId) });
+  const steerResult = await activeResponses.steer(params.chatId, resolvedInput, { temporaryFiles: materialized.createdFilePaths, cleanup: uploadClaimCleanup(owner.id, claimedInput.uploadClaimId) });
   if (!steerResult) {
     await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
     abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
@@ -212,10 +215,15 @@ app.post(`${apiPrefix}/chats/:chatId/active-response/input`, async (request) => 
   }
   if (!steerResult.delivered) {
     await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
-    return steerResult.turn;
+    const pending = activeResponses.enqueue(params.chatId, claimedInput, uploadClaimResources(owner.id, claimedInput.uploadClaimId));
+    if (!pending) {
+      abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+      throw new Error("No active response is available for this chat.");
+    }
+    return pending;
   }
   await completeUploadClaim(owner.id, claimedInput.uploadClaimId);
-  return steerResult.turn;
+  return steerResult.turn!;
 });
 app.post(`${apiPrefix}/chats/:chatId/messages`, async (request, reply) => {
   const owner = ownerFor(request);
@@ -439,7 +447,7 @@ async function withUploadClaim<TInput extends SendMessageRequest, TResult>(owner
   }
 }
 function uploadClaimCleanup(ownerId: string, claimId?: string): { id: string; run: () => Promise<void> } | undefined {
-  return claimId ? { id: `upload-claim:${claimId}`, run: () => uploadedFiles.completeClaim(ownerId, claimId) } : undefined;
+  return claimId ? { id: `upload-claim:${claimId}`, run: async () => { uploadedFiles.abandonClaim(ownerId, claimId); } } : undefined;
 }
 function uploadClaimResources(ownerId: string, claimId?: string): { cleanup: { id: string; run: () => Promise<void> } } | undefined {
   const cleanup = uploadClaimCleanup(ownerId, claimId);

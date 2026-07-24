@@ -24,7 +24,9 @@ export function previewImport(requestedSource: ImportSource, fileName: string, c
 export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string | Uint8Array, encoding: "text" | "base64" = "text"): Promise<ImportPreview> {
   if (!fileName.toLowerCase().endsWith(".zip")) return previewImport(requestedSource, fileName, typeof content === "string" ? content : new TextDecoder().decode(content));
   if (encoding !== "base64") throw new Error("ZIP imports must be uploaded as base64 payloads.");
-  const zip = await JSZip.loadAsync(typeof content === "string" ? base64ToBytes(content) : content);
+  const archiveBytes = typeof content === "string" ? base64ToBytes(content) : content;
+  validateZipEntryCount(archiveBytes);
+  const zip = await JSZip.loadAsync(archiveBytes);
   validateImportArchive(zip);
   const archiveReadState: ArchiveReadState = { totalBytes: 0 };
   if (requestedSource === "auto" || requestedSource === "claude") {
@@ -259,6 +261,17 @@ function extractReusableHelpers(item: UnknownRecord, source: "chatgpt" | "claude
 function normalizeRole(role: string): "user" | "assistant" | "system" | "tool" { const lower = role.toLowerCase(); if (lower.includes("assistant") || lower.includes("bot") || lower.includes("claude")) return "assistant"; if (lower.includes("system")) return "system"; if (lower.includes("tool")) return "tool"; return "user"; }
 function normalizeContent(value: unknown): string { if (typeof value === "string") return value; if (Array.isArray(value)) return value.map(normalizeContent).filter(Boolean).join("\n\n"); if (!isRecord(value)) return ""; if (value.type === "image" && typeof value.url === "string") return `![Imported image](${value.url})`; if (typeof value.language === "string" && typeof value.text === "string") return `\`\`\`${value.language}\n${value.text}\n\`\`\``; if (typeof value.text === "string") return value.text; if (typeof value.result === "string") return value.result; if (Array.isArray(value.parts)) return value.parts.map(normalizeContent).filter(Boolean).join("\n\n"); return ""; }
 function isSupportedArchiveEntry(name: string): boolean { const n = name.replaceAll("\\", "/").toLowerCase(); return n.endsWith("conversations.json") || n.endsWith("myactivity.json") || (n.includes("/design_chats/") && n.endsWith(".json")); }
+function validateZipEntryCount(bytes: Uint8Array): void {
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const minimumOffset = Math.max(0, buffer.length - 65_557);
+  for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) !== 0x06054b50) continue;
+    const entries = buffer.readUInt16LE(offset + 10);
+    if (entries === 0xffff || entries > archiveEntryLimit) throw new Error(`Import archive contains too many files (${entries === 0xffff ? "ZIP64" : entries}).`);
+    return;
+  }
+  throw new Error("Import archive is missing a valid end-of-central-directory record.");
+}
 function validateImportArchive(zip: JSZip): void {
   const allEntries = Object.values(zip.files);
   if (allEntries.length > archiveEntryLimit) throw new Error(`Import archive contains too many files (${allEntries.length}).`);

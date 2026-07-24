@@ -23,16 +23,21 @@ export type UploadedFile = z.infer<typeof uploadedFileSchema>;
 export class UploadedFileStore {
   private readonly claimsByUpload = new Map<string, { claimId: string; ownerId: string }>();
   private readonly uploadsByClaim = new Map<string, { ownerId: string; uploadIds: string[] }>();
+  private readonly deletingUploads = new Set<string>();
+  private readonly activeUploadIds = new Set<string>();
+  private readonly reservationsByOwner = new Map<string, { bytes: number; count: number }>();
+  private quotaQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly rootDir: string, private readonly maxBytes: number) {}
+  constructor(private readonly rootDir: string, private readonly maxBytes: number, private readonly maxStagedBytes = maxBytes, private readonly maxStagedFiles = 100) {}
 
   async create(ownerId: string, input: { fileName: string; mimeType: string; size: number }, source: Readable): Promise<MessageAttachment> {
     if (input.size > this.maxBytes) throw new Error(`Upload exceeds the ${formatBytes(this.maxBytes)} limit.`);
     await fs.mkdir(this.rootDir, { recursive: true });
-    await this.deleteExpired();
     const fileName = path.basename(input.fileName).trim();
     if (!fileName || fileName === "." || fileName === "..") throw new Error("Upload requires a valid file name.");
     const id = randomUUID();
+    const releaseReservation = await this.reserve(ownerId, input.size);
+    this.activeUploadIds.add(id);
     const temporaryPath = `${this.dataPath(id)}.part`;
     let received = 0;
     const hash = createHash("sha256");
@@ -54,6 +59,9 @@ export class UploadedFileStore {
     } catch (error) {
       await Promise.all([fs.rm(temporaryPath, { force: true }), fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
       throw error;
+    } finally {
+      this.activeUploadIds.delete(id);
+      releaseReservation();
     }
   }
 
@@ -68,7 +76,7 @@ export class UploadedFileStore {
     if (uniqueIds.length === 0) return null;
     if (uniqueIds.length !== uploadIds.length) throw new Error("Each staged upload can only be claimed once.");
     await Promise.all(uniqueIds.map((id) => this.get(ownerId, id)));
-    for (const id of uniqueIds) if (this.claimsByUpload.has(id)) throw new Error("Uploaded file is already in use.");
+    for (const id of uniqueIds) if (this.claimsByUpload.has(id) || this.deletingUploads.has(id)) throw new Error("Uploaded file is already in use.");
     const claimId = randomUUID();
     for (const id of uniqueIds) this.claimsByUpload.set(id, { claimId, ownerId });
     this.uploadsByClaim.set(claimId, { ownerId, uploadIds: uniqueIds });
@@ -94,8 +102,15 @@ export class UploadedFileStore {
 
   async delete(ownerId: string, id: string): Promise<void> {
     if (this.claimsByUpload.has(id)) throw new Error("Uploaded file is currently in use.");
-    await this.get(ownerId, id);
-    await this.deleteFiles(id);
+    if (this.deletingUploads.has(id)) throw new Error("Uploaded file is already being deleted.");
+    this.deletingUploads.add(id);
+    try {
+      await this.get(ownerId, id);
+      if (this.claimsByUpload.has(id)) throw new Error("Uploaded file is currently in use.");
+      await this.deleteFiles(id);
+    } finally {
+      this.deletingUploads.delete(id);
+    }
   }
 
   async completeClaim(ownerId: string, claimId: string): Promise<void> {
@@ -150,7 +165,11 @@ export class UploadedFileStore {
     return deleted;
   }
 
-  private async deleteExpired(): Promise<void> {
+  async cleanupExpired(): Promise<void> {
+    await this.withQuotaLock(async () => this.cleanupExpiredUnlocked());
+  }
+
+  private async cleanupExpiredUnlocked(): Promise<void> {
     let entries: string[];
     try {
       entries = await fs.readdir(this.rootDir);
@@ -159,6 +178,7 @@ export class UploadedFileStore {
       throw error;
     }
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const metadataIds = new Set(entries.filter((entry) => entry.endsWith(".json")).map((entry) => path.basename(entry, ".json")));
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
       const id = path.basename(entry, ".json");
@@ -168,8 +188,21 @@ export class UploadedFileStore {
         await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
         continue;
       }
+      try {
+        await fs.access(this.dataPath(id));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        await fs.rm(this.metadataPath(id), { force: true });
+        continue;
+      }
       if (new Date(uploaded.createdAt).getTime() >= cutoff) continue;
       await Promise.all([fs.rm(this.dataPath(id), { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
+    }
+    for (const entry of entries) {
+      const uploadId = entry.endsWith(".upload.part") ? entry.slice(0, -".upload.part".length) : entry.endsWith(".upload") ? entry.slice(0, -".upload".length) : null;
+      if (!uploadId || this.activeUploadIds.has(uploadId) || (entry.endsWith(".upload") && metadataIds.has(uploadId))) continue;
+      const stat = await fs.stat(path.join(this.rootDir, entry)).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
+      if (stat && stat.mtimeMs < cutoff) await fs.rm(path.join(this.rootDir, entry), { force: true });
     }
   }
 
@@ -178,8 +211,61 @@ export class UploadedFileStore {
       const parsed = uploadedFileSchema.safeParse(JSON.parse(await fs.readFile(this.metadataPath(id), "utf8")) as unknown);
       return parsed.success ? parsed.data : null;
     } catch (error) {
-      if (error instanceof SyntaxError) return null;
+      if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw error;
+    }
+  }
+
+  private async reserve(ownerId: string, size: number): Promise<() => void> {
+    await this.withQuotaLock(async () => {
+      await this.cleanupExpiredUnlocked();
+      const usage = await this.ownerUsage(ownerId);
+      const reserved = this.reservationsByOwner.get(ownerId) ?? { bytes: 0, count: 0 };
+      if (usage.bytes + reserved.bytes + size > this.maxStagedBytes) throw new Error(`Staged uploads exceed the ${formatBytes(this.maxStagedBytes)} per-owner limit.`);
+      if (usage.count + reserved.count + 1 > this.maxStagedFiles) throw new Error(`Staged uploads exceed the ${this.maxStagedFiles}-file per-owner limit.`);
+      this.reservationsByOwner.set(ownerId, { bytes: reserved.bytes + size, count: reserved.count + 1 });
+    });
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const reserved = this.reservationsByOwner.get(ownerId);
+      if (!reserved) return;
+      const next = { bytes: Math.max(0, reserved.bytes - size), count: Math.max(0, reserved.count - 1) };
+      if (next.bytes === 0 && next.count === 0) this.reservationsByOwner.delete(ownerId);
+      else this.reservationsByOwner.set(ownerId, next);
+    };
+  }
+
+  private async ownerUsage(ownerId: string): Promise<{ bytes: number; count: number }> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.rootDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { bytes: 0, count: 0 };
+      throw error;
+    }
+    let bytes = 0;
+    let count = 0;
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const uploaded = await this.safeRead(path.basename(entry, ".json"));
+      if (!uploaded || uploaded.ownerId !== ownerId) continue;
+      bytes += uploaded.size;
+      count += 1;
+    }
+    return { bytes, count };
+  }
+
+  private async withQuotaLock<T>(action: () => Promise<T>): Promise<T> {
+    const previous = this.quotaQueue;
+    let release!: () => void;
+    this.quotaQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
     }
   }
 
