@@ -67,7 +67,8 @@ app.addHook("preHandler", async (request, reply) => {
 });
 const githubDeviceStartResponseSchema = z.object({ device_code: z.string(), user_code: z.string(), verification_uri: z.string(), expires_in: z.number(), interval: z.number() });
 const githubDevicePollResponseSchema = z.union([z.object({ access_token: z.string(), token_type: z.string(), scope: z.string() }), z.object({ error: z.string(), error_description: z.string().optional() })]);
-const githubUserSchema = z.object({ login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
+const githubUserSchema = z.object({ id: z.number().int().positive(), login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
+type GitHubUser = z.infer<typeof githubUserSchema>;
 async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
   const attachments = validateMessageAttachments(input);
   const gitHubToken = gitHubTokenForOwner(ownerId);
@@ -101,15 +102,15 @@ app.get(`${apiPrefix}/auth/github/callback`, async (request, reply) => {
   const tokenResponse = await fetch("https://github.com/login/oauth/access_token", { method: "POST", headers: { Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ client_id: config.githubClientId, client_secret: config.githubClientSecret, code: query.code, redirect_uri: `${publicOrigin(request)}/api/auth/github/callback` }) });
   if (!tokenResponse.ok) throw new Error(`GitHub token exchange failed: ${tokenResponse.status} ${await tokenResponse.text()}`);
   const token = z.object({ access_token: z.string(), token_type: z.string(), scope: z.string().optional() }).parse(await tokenResponse.json());
-  const userResponse = await fetch("https://api.github.com/user", { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token.access_token}`, "X-GitHub-Api-Version": "2022-11-28" } });
-  if (!userResponse.ok) throw new Error(`GitHub user lookup failed: ${userResponse.status} ${await userResponse.text()}`);
-  const githubUser = githubUserSchema.parse(await userResponse.json());
+  const githubUser = await fetchGitHubUser(token.access_token);
   if (!isGitHubLoginAllowed(config.allowedGitHubLogins, githubUser.login)) {
     reply.header("Set-Cookie", clearCookie(oauthStateCookieName));
     reply.code(403).send({ error: "This GitHub account is not allowed to access this CopilotChat instance." });
     return;
   }
-  const owner = db.getOrCreateGitHubOwner({ login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
+  const providerUserId = String(githubUser.id);
+  const legacyOwnerId = db.getGitHubOwnerByProviderId(providerUserId) ? null : await verifiedLegacyGitHubOwnerId(request, githubUser);
+  const owner = db.getOrCreateGitHubOwner({ providerUserId, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url, legacyOwnerId });
   db.setGitHubAuth(owner.id, { accessToken: token.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
   providerStatusCache.delete(owner.id);
   reply.header("Set-Cookie", [cookie(sessionCookieName, signSession(owner), 60 * 60 * 24 * 30), clearCookie(oauthStateCookieName)]);
@@ -232,16 +233,39 @@ function ownerForOptional(request: FastifyRequest): Owner | null {
   return readSessionOwner(request);
 }
 function readSessionOwner(request: FastifyRequest): Owner | null {
+  const owner = readSignedSessionOwner(request);
+  return owner && isGitHubLoginAllowed(config.allowedGitHubLogins, owner.login) ? owner : null;
+}
+function readSignedSessionOwner(request: FastifyRequest): Owner | null {
   const signed = readCookie(request, sessionCookieName);
   if (!signed) return null;
   const payload = verifySignedJson<{ ownerId: string; exp: number }>(signed);
   if (!payload || payload.exp < Date.now()) return null;
-  try {
-    const owner = db.getOwnerById(payload.ownerId);
-    return isGitHubLoginAllowed(config.allowedGitHubLogins, owner.login) ? owner : null;
-  } catch {
-    return null;
+  try { return db.getOwnerById(payload.ownerId); } catch { return null; }
+}
+async function fetchGitHubUser(accessToken: string): Promise<GitHubUser> {
+  const response = await fetch("https://api.github.com/user", { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${accessToken}`, "X-GitHub-Api-Version": "2022-11-28" } });
+  if (!response.ok) throw new Error(`GitHub user lookup failed: ${response.status} ${await response.text()}`);
+  return githubUserSchema.parse(await response.json());
+}
+async function verifiedLegacyGitHubOwnerId(request: FastifyRequest, githubUser: GitHubUser): Promise<string | null> {
+  const signedOwner = readSignedSessionOwner(request);
+  const sessionLegacy = signedOwner ? db.getLegacyGitHubOwnerById(signedOwner.id) : null;
+  const loginLegacy = db.getLegacyGitHubOwnerByLogin(githubUser.login);
+  const candidates = Array.from(new Map([sessionLegacy, loginLegacy].filter((owner): owner is Owner => Boolean(owner)).map((owner) => [owner.id, owner])).values());
+  for (const legacyOwner of candidates) {
+    if (sessionLegacy?.id === legacyOwner.id && legacyOwner.login.toLowerCase() === githubUser.login.toLowerCase()) return legacyOwner.id;
+    const legacyToken = db.getGitHubToken(legacyOwner.id);
+    if (!legacyToken) continue;
+    try {
+      const legacyUser = await fetchGitHubUser(legacyToken);
+      if (legacyUser.id === githubUser.id) return legacyOwner.id;
+      app.log.warn({ legacyOwnerId: legacyOwner.id }, "Refused to migrate a legacy GitHub owner because its stored token belongs to another account.");
+    } catch (error) {
+      app.log.warn({ err: error, legacyOwnerId: legacyOwner.id }, "Could not verify a legacy GitHub owner; creating an isolated owner instead.");
+    }
   }
+  return null;
 }
 function signSession(owner: Owner): string { return signJson({ ownerId: owner.id, login: owner.login, exp: Date.now() + 30 * 24 * 60 * 60 * 1000 }); }
 function signState(state: string): string { return signJson({ state, exp: Date.now() + 10 * 60 * 1000 }); }
