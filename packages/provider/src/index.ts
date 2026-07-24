@@ -60,11 +60,10 @@ class SdkCopilotProvider implements CopilotProvider {
   constructor(private readonly options: ProviderFactoryOptions) {}
   async status(): Promise<ProviderStatus> {
     const capabilities = ["streaming", "markdown", "copilot-tools", "web-search", "mcp", "skills", "workspace-sessions", "infinite-sessions", "permission-guardrails"];
+    const client = new CopilotClient(copilotClientOptions(this.options.gitHubToken, this.options.sdkCliPath));
     try {
-      const client = new CopilotClient(copilotClientOptions(this.options.gitHubToken, this.options.sdkCliPath));
       await withTimeout(client.start(), 10000);
       const models = await withTimeout(client.listModels(), 5000);
-      await client.stop().catch(() => []);
       const mapped = models.map(mapSdkModelInfo);
       return {
         id: this.id,
@@ -85,6 +84,8 @@ class SdkCopilotProvider implements CopilotProvider {
         models: fallbackModels(this.options.model),
         defaultModel: this.options.model,
       };
+    } finally {
+      await client.stop().catch(() => []);
     }
   }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
@@ -670,14 +671,27 @@ function chunkText(text: string, size: number): string[] { const chunks: string[
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function sdkFailureDetails(error: unknown, options: ProviderFactoryOptions): string {
-  const message = error instanceof Error ? error.message : String(error);
-  const detectedCli = options.sdkCliPath ? ` Detected Copilot CLI: ${options.sdkCliPath}.` : " No copilot executable was found on PATH.";
+  const message = summarizeSdkFailureMessage(error);
+  const detectedCli = options.sdkCliPath ? ` Detected Copilot CLI: ${options.sdkCliPath}.` : " Using the Copilot CLI bundled with @github/copilot-sdk.";
   const authHint = /auth/i.test(message)
     ? options.gitHubToken
       ? " The supplied GitHub token was rejected or does not have Copilot access. Verify the token and confirm that the GitHub account has an active Copilot subscription."
       : " No usable Copilot auth was found. Run `copilot login` or `gh auth login` in the same terminal that starts the app, or set `COPILOT_GITHUB_TOKEN`, then restart `pnpm dev`."
     : "";
   return `Copilot SDK model discovery failed: ${message}.${detectedCli}${authHint}`;
+}
+
+export function summarizeSdkFailureMessage(error: unknown): string {
+  let message = error instanceof Error ? error.message : String(error);
+  const marker = message.lastIndexOf("^ Error: ");
+  if (marker >= 0) message = message.slice(marker + 2);
+  const nodeVersion = message.search(/\s+Node\.js v\d/);
+  if (nodeVersion >= 0) message = message.slice(0, nodeVersion);
+  const stack = message.search(/\s+at\s+(?:async\s+)?\S+/);
+  if (stack >= 0) message = message.slice(0, stack);
+  message = message.replace(/\s+/g, " ").trim();
+  const limit = 800;
+  return message.length > limit ? `[truncated] ${message.slice(-limit)}` : message;
 }
 
 export function mapSdkModelInfo(model: ModelInfo): ProviderStatus["models"][number] {
