@@ -12,6 +12,7 @@ import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
+import { isAllowedCorsOrigin } from "./cors-origin.js";
 import { ActiveChatResponses } from "./responses.js";
 import { ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
@@ -37,6 +38,31 @@ describe("loadConfig", () => {
       if (previous === undefined) delete process.env.COPILOTCHAT_REQUIRE_CSRF;
       else process.env.COPILOTCHAT_REQUIRE_CSRF = previous;
     }
+  });
+
+  describe("CORS origins", () => {
+    const configuredOrigins = new Set(["https://configured.example"]);
+
+    it("allows same-origin requests through forwarded hosts", () => {
+      expect(isAllowedCorsOrigin("http://ovh-copilotc.localhost:35151", "ovh-copilotc.localhost:35151", configuredOrigins)).toBe(true);
+    });
+
+    it("allows explicitly configured cross-origin clients", () => {
+      expect(isAllowedCorsOrigin("https://configured.example", "127.0.0.1:4328", configuredOrigins)).toBe(true);
+    });
+
+    it("blocks matching non-localhost origins to prevent DNS rebinding", () => {
+      expect(isAllowedCorsOrigin("http://attacker.example:4328", "attacker.example:4328", configuredOrigins)).toBe(false);
+    });
+
+    it("blocks localhost tunnel origins when the forwarded host or scheme differs", () => {
+      expect(isAllowedCorsOrigin("http://preview.localhost:35151", "other.localhost:35151", configuredOrigins)).toBe(false);
+      expect(isAllowedCorsOrigin("ftp://preview.localhost:35151", "preview.localhost:35151", configuredOrigins)).toBe(false);
+    });
+
+    it("blocks unrelated browser origins", () => {
+      expect(isAllowedCorsOrigin("https://malicious.example", "127.0.0.1:4328", configuredOrigins)).toBe(false);
+    });
   });
 });
 

@@ -131,7 +131,56 @@ test("project model defaults apply to the first turn", async ({ page }, testInfo
 
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile shell coverage only runs in mobile project.");
-  await page.goto("/"); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
+  await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
+});
+
+test("mobile shell keeps controls inside emulated safe areas", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile safe-area coverage only runs in mobile project.");
+  const insets = { top: 47, right: 31, bottom: 34, left: 59 };
+  const session = await page.context().newCDPSession(page);
+  await session.send("Emulation.setSafeAreaInsetsOverride", { insets });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+
+  async function safeAreaBounds(selector: string): Promise<{ top: number; right: number; bottom: number; left: number; width: number; height: number }> {
+    const bounds = await page.locator(selector).evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      return { top: rect.top, right: rect.right, bottom: rect.bottom, left: rect.left, width: window.innerWidth, height: window.innerHeight };
+    });
+    expect(bounds.right).toBeLessThanOrEqual(bounds.width - insets.right);
+    expect(bounds.left).toBeGreaterThanOrEqual(insets.left);
+    return bounds;
+  }
+
+  async function expectInsideSafeArea(selector: string): Promise<void> {
+    const bounds = await safeAreaBounds(selector);
+    expect(bounds.top).toBeGreaterThanOrEqual(insets.top);
+    expect(bounds.bottom).toBeLessThanOrEqual(bounds.height - insets.bottom);
+  }
+
+  await expectInsideSafeArea(".header-left");
+  await expectInsideSafeArea(".header-actions");
+  await safeAreaBounds(".welcome-inner");
+  await expectInsideSafeArea(".composer");
+
+  await page.keyboard.press("?");
+  await expect(page.getByRole("dialog", { name: "Keyboard shortcuts" })).toBeVisible();
+  await expectInsideSafeArea(".app-dialog");
+  await page.keyboard.press("Escape");
+
+  await page.getByRole("button", { name: "Toggle sidebar" }).click();
+  await page.getByText("Preferences").click();
+  await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible();
+  await expectInsideSafeArea(".drawer-head .icon-button");
+  await safeAreaBounds(".drawer-head > div");
+  await safeAreaBounds(".drawer-body > *");
+  const drawerPadding = await page.locator(".drawer-body").evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { right: Number.parseFloat(style.paddingRight), bottom: Number.parseFloat(style.paddingBottom), left: Number.parseFloat(style.paddingLeft) };
+  });
+  expect(drawerPadding.right).toBeGreaterThanOrEqual(insets.right);
+  expect(drawerPadding.bottom).toBeGreaterThanOrEqual(insets.bottom);
+  expect(drawerPadding.left).toBeGreaterThanOrEqual(insets.left);
 });
 
 test("composer pickers stay within the mobile viewport", async ({ page }, testInfo) => {
