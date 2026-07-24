@@ -14,7 +14,7 @@ import type { FastifyRequest } from "fastify";
 import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest, isolatedChatWorkspace } from "./chat-context.js";
-import { loadConfig } from "./config.js";
+import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
@@ -103,6 +103,11 @@ app.get(`${apiPrefix}/auth/github/callback`, async (request, reply) => {
   const userResponse = await fetch("https://api.github.com/user", { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token.access_token}`, "X-GitHub-Api-Version": "2022-11-28" } });
   if (!userResponse.ok) throw new Error(`GitHub user lookup failed: ${userResponse.status} ${await userResponse.text()}`);
   const githubUser = githubUserSchema.parse(await userResponse.json());
+  if (!isGitHubLoginAllowed(config.allowedGitHubLogins, githubUser.login)) {
+    reply.header("Set-Cookie", clearCookie(oauthStateCookieName));
+    reply.code(403).send({ error: "This GitHub account is not allowed to access this CopilotChat instance." });
+    return;
+  }
   const owner = db.getOrCreateGitHubOwner({ login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
   db.setGitHubAuth(owner.id, { accessToken: token.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
   providerStatusCache.delete(owner.id);
@@ -230,7 +235,12 @@ function readSessionOwner(request: FastifyRequest): Owner | null {
   if (!signed) return null;
   const payload = verifySignedJson<{ ownerId: string; exp: number }>(signed);
   if (!payload || payload.exp < Date.now()) return null;
-  try { return db.getOwnerById(payload.ownerId); } catch { return null; }
+  try {
+    const owner = db.getOwnerById(payload.ownerId);
+    return isGitHubLoginAllowed(config.allowedGitHubLogins, owner.login) ? owner : null;
+  } catch {
+    return null;
+  }
 }
 function signSession(owner: Owner): string { return signJson({ ownerId: owner.id, login: owner.login, exp: Date.now() + 30 * 24 * 60 * 60 * 1000 }); }
 function signState(state: string): string { return signJson({ state, exp: Date.now() + 10 * 60 * 1000 }); }

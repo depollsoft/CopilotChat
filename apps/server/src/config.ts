@@ -33,6 +33,7 @@ const configSchema = z.object({
   copilotSdkCliPath: z.string().optional(),
   copilotGitHubToken: z.string().optional(),
   copilotGitHubTokenSource: z.string().optional(),
+  allowedGitHubLogins: z.array(z.string()).default([]),
   allowedOrigins: z.array(z.string()).default([]),
   requireCsrf: envBooleanSchema,
 });
@@ -66,14 +67,29 @@ export function loadConfig(): AppConfig {
     copilotSdkCliPath: resolveCopilotCliPath(),
     copilotGitHubToken: configuredToken?.[1],
     copilotGitHubTokenSource: configuredToken?.[0],
+    allowedGitHubLogins: parseAllowedGitHubLogins(process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS),
     allowedOrigins: (process.env.COPILOTCHAT_ALLOWED_ORIGINS ?? "").split(",").map((o) => o.trim()).filter(Boolean),
     requireCsrf: process.env.COPILOTCHAT_REQUIRE_CSRF,
   });
 }
 
+export function isGitHubLoginAllowed(allowedLogins: readonly string[], login: string): boolean {
+  if (allowedLogins.length === 0) return true;
+  const normalized = normalizeGitHubLogin(login);
+  return allowedLogins.some((allowed) => normalizeGitHubLogin(allowed) === normalized);
+}
+
 function optionalEnv(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed || undefined;
+}
+
+function parseAllowedGitHubLogins(value: string | undefined): string[] {
+  return Array.from(new Set((value ?? "").split(",").map(normalizeGitHubLogin).filter(Boolean)));
+}
+
+function normalizeGitHubLogin(value: string): string {
+  return value.trim().replace(/^@/, "").toLowerCase();
 }
 
 function resolveCopilotCliPath(): string | undefined {

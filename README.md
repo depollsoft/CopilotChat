@@ -41,6 +41,7 @@ COPILOTCHAT_PUBLIC_URL=https://chat.example.com
 COPILOTCHAT_SESSION_SECRET=replace-with-a-long-random-value
 GITHUB_CLIENT_ID=your-oauth-client-id
 GITHUB_CLIENT_SECRET=your-oauth-client-secret
+COPILOTCHAT_ALLOWED_GITHUB_LOGINS=your-handle,teammate
 ```
 
 Generate the session secret with `openssl rand -hex 32`. Configure the OAuth App homepage as the public URL and its callback URL as:
@@ -49,7 +50,9 @@ Generate the session secret with `openssl rand -hex 32`. Configure the OAuth App
 https://chat.example.com/api/auth/github/callback
 ```
 
-The OAuth token is stored in the persistent volume and passed to the Copilot SDK for that user, so each signed-in account uses its own Copilot subscription. Chats, projects, skills, MCP servers, workspaces, imports, artifacts, tokens, and provider status are isolated by GitHub login. Cowork/workspace mode requires host folders to be mounted into the container before registration; in GitHub auth mode each registered path must be under `COPILOTCHAT_WORKSPACE_ROOT/<github-login>/`.
+The OAuth token is stored in the persistent volume and passed to the Copilot SDK for that user, so each signed-in account uses its own Copilot subscription. Set `COPILOTCHAT_ALLOWED_GITHUB_LOGINS` to a comma-separated list to restrict access to specific GitHub handles; matching is case-insensitive, a leading `@` is optional, and an empty list allows every GitHub account. The allowlist is checked on every authenticated request, so removing a handle also invalidates its existing sessions.
+
+Chats, projects, skills, MCP servers, workspaces, imports, artifacts, tokens, and provider status are isolated by GitHub login. Cowork/workspace mode requires host folders to be mounted into the container before registration; in GitHub auth mode each registered path must be under `COPILOTCHAT_WORKSPACE_ROOT/<github-login>/`.
 
 For a single-user local deployment, leave `COPILOTCHAT_AUTH_MODE=local` and set `COPILOT_GITHUB_TOKEN` instead. If exposing the app beyond localhost, use HTTPS and set `COPILOTCHAT_ALLOWED_ORIGINS` to the exact browser origins.
 
@@ -85,6 +88,7 @@ GHCR packages may need to be made public once after their first publication for 
 | `COPILOTCHAT_REQUIRE_CSRF` | `true` | Require `X-CopilotChat-CSRF: 1` for mutating API requests |
 | `GITHUB_CLIENT_ID` | empty | GitHub OAuth app/device-flow client ID |
 | `GITHUB_CLIENT_SECRET` | empty | GitHub OAuth app client secret for web login |
+| `COPILOTCHAT_ALLOWED_GITHUB_LOGINS` | empty | Comma-separated GitHub handles allowed to sign in; empty allows all |
 | `COPILOT_PROVIDER` | `auto` | `auto`, `sdk`, `http`, `cli`, or `echo` |
 | `COPILOT_API_BASE_URL` | empty | OpenAI-compatible provider base URL |
 | `COPILOT_API_TOKEN` | empty | Provider token for HTTP adapter |
@@ -104,7 +108,7 @@ GHCR packages may need to be made public once after their first publication for 
 
 ## Security model
 
-The app is single-user and local-first by default. In GitHub auth mode, browser access requires a GitHub OAuth session and data is isolated by GitHub login. The API restricts browser origins, caps request body size, and requires a CSRF header for mutating requests. Optional `COPILOTCHAT_API_TOKEN` can be used for bearer-token API access. Workspace commands are parsed without a shell, reject shell metacharacters, require commands to run inside registered folders, block destructive commands, and redact common token patterns. GitHub-mode workspace registration is confined to the signed-in owner's configured workspace-root subfolder. Copilot SDK shell/write/MCP/custom-tool permission requests are denied until explicit in-app approvals exist; URL/read requests are allowed once so web search and local context can work.
+The app is single-user and local-first by default. In GitHub auth mode, browser access requires a GitHub OAuth session, can be restricted with an optional login allowlist, and data is isolated by GitHub login. The API restricts browser origins, caps request body size, and requires a CSRF header for mutating requests. Optional `COPILOTCHAT_API_TOKEN` can be used for bearer-token API access. Workspace commands are parsed without a shell, reject shell metacharacters, require commands to run inside registered folders, block destructive commands, and redact common token patterns. GitHub-mode workspace registration is confined to the signed-in owner's configured workspace-root subfolder. Copilot SDK shell/write/MCP/custom-tool permission requests are denied until explicit in-app approvals exist; URL/read requests are allowed once so web search and local context can work.
 
 ## Auth troubleshooting
 

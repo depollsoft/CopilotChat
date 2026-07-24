@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
-import { loadConfig } from "./config.js";
+import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
@@ -56,6 +56,22 @@ describe("loadConfig", () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+    }
+  });
+  it("normalizes and enforces allowed GitHub logins", () => {
+    const previous = process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS;
+    try {
+      process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS = "@Alice, bob, ALICE";
+      const allowed = loadConfig().allowedGitHubLogins;
+      expect(allowed).toEqual(["alice", "bob"]);
+      expect(isGitHubLoginAllowed(allowed, "ALICE")).toBe(true);
+      expect(isGitHubLoginAllowed(allowed, "@bob")).toBe(true);
+      expect(isGitHubLoginAllowed(["@Alice"], "alice")).toBe(true);
+      expect(isGitHubLoginAllowed(allowed, "mallory")).toBe(false);
+      expect(isGitHubLoginAllowed([], "any-user")).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS;
+      else process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS = previous;
     }
   });
 
