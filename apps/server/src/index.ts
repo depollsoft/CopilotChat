@@ -21,6 +21,7 @@ import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { ActiveChatResponses } from "./responses.js";
 import { runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
+import { isAllowedCorsOrigin } from "./cors-origin.js";
 
 const config = loadConfig();
 if (config.authMode === "github" && !config.sessionSecret) throw new Error("COPILOTCHAT_SESSION_SECRET is required when COPILOTCHAT_AUTH_MODE=github.");
@@ -39,7 +40,16 @@ const providerStatusTtlMs = 5 * 60_000;
 let providerStatusCache: { status: ProviderStatus; expiresAt: number } | null = null;
 let providerStatusInFlight: Promise<ProviderStatus> | null = null;
 const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...config.allowedOrigins]);
-await app.register(cors, { origin: (origin, cb) => { if (!origin || allowedOrigins.has(origin)) { cb(null, true); return; } cb(new Error(`Origin not allowed: ${origin}`), false); }, credentials: false });
+await app.register(cors, {
+  delegator: (request, callback) => {
+    const origin = request.headers.origin;
+    if (isAllowedCorsOrigin(origin, request.headers.host, allowedOrigins)) {
+      callback(null, { origin: Boolean(origin), credentials: false });
+      return;
+    }
+    callback(new Error(`Origin not allowed: ${origin}`));
+  },
+});
 app.addHook("preHandler", async (request, reply) => {
   if (!request.raw.url?.startsWith(apiPrefix)) return;
   const bearerOk = Boolean(config.apiToken && request.headers.authorization === `Bearer ${config.apiToken}`);
