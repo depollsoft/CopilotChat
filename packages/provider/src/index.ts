@@ -20,7 +20,7 @@ export type ProviderInteractionHandlers = {
   requestElicitation?: (request: ProviderElicitationRequest) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, ProviderElicitationValue> }>;
 };
 export type ProviderChatControls = { onSteer: (handler: (message: ProviderMessage) => void | Promise<void>) => () => void };
-export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; permissionMode?: PermissionMode; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
+export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; contextTier?: "default" | "long_context"; permissionMode?: PermissionMode; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
 export type ProviderEvent =
   | { type: "delta"; text: string }
   | { type: "reasoning-delta"; text: string }
@@ -65,7 +65,7 @@ class SdkCopilotProvider implements CopilotProvider {
       await withTimeout(client.start(), 10000);
       const models = await withTimeout(client.listModels(), 5000);
       await client.stop().catch(() => []);
-      const mapped = models.map(mapModelInfo);
+      const mapped = models.map(mapSdkModelInfo);
       return {
         id: this.id,
         label: this.label,
@@ -100,7 +100,7 @@ class SdkCopilotProvider implements CopilotProvider {
     const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory));
     const queue = new AsyncEventQueue<ProviderEvent>();
     const lastUserMessage = [...request.messages].reverse().find((message) => message.role === "user");
-    const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
+    const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), contextTier: sdkContextTier(request.contextTier), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
     if (request.workingDirectory) sessionOptions.workingDirectory = request.workingDirectory;
     if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
     const mcpServers = mapMcpServers(request.mcpServers ?? []);
@@ -189,7 +189,7 @@ class SdkCopilotProvider implements CopilotProvider {
 class EchoProvider implements CopilotProvider {
   id = "echo"; label = "Local development provider";
   constructor(private readonly model: string) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: fallbackModels(this.model), defaultModel: this.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), defaultModel: this.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (request.sessionId) yield { type: "session", sessionId: request.sessionId, workspacePath: null, resumed: Boolean(request.resumeSession), infinite: false };
     const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
@@ -289,6 +289,7 @@ class EchoProvider implements CopilotProvider {
       "- Enabled skills: " + enabledSkills + ".",
       attachmentSummary ? "- Attachments: " + attachmentSummary + "." : "",
       "- Reasoning effort: " + (request.reasoningEffort ?? "default") + ".",
+      "- Context size: " + (request.contextTier ?? "default") + ".",
       request.workingDirectory ? "- Workspace: " + request.workingDirectory : "",
       importPreviewText,
       "",
@@ -318,7 +319,7 @@ class HttpCopilotProvider implements CopilotProvider {
         const response = await withTimeout(fetch(`${this.options.apiBaseUrl!.replace(/\/$/, "")}/models`, { headers: { Authorization: `Bearer ${this.options.apiToken}` } }), 3000);
         if (response.ok) {
           const body = await response.json() as { data?: Array<{ id?: string; name?: string }> };
-          const listed = body.data?.map((model) => ({ id: model.id ?? model.name ?? "", name: model.name ?? model.id ?? "", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium" })).filter((model) => model.id);
+          const listed = body.data?.map((model) => ({ id: model.id ?? model.name ?? "", name: model.name ?? model.id ?? "", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false })).filter((model) => model.id);
           if (listed && listed.length > 0) models = listed;
         }
       } catch { /* keep configured model */ }
@@ -371,7 +372,7 @@ async function createOrResumeSdkSession(client: CopilotClient, config: SessionCo
   }
   try { return { session: await client.createSession(config), resumed: false }; }
   catch (error) {
-    if (sessionId && isExistingSessionError(error)) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
+    if (preferResume && sessionId && isExistingSessionError(error)) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
     throw error;
   }
 }
@@ -677,15 +678,19 @@ function sdkFailureDetails(error: unknown, options: ProviderFactoryOptions): str
   return `Copilot SDK model discovery failed: ${message}.${detectedCli}${authHint}`;
 }
 
-function mapModelInfo(model: ModelInfo): ProviderStatus["models"][number] {
+export function mapSdkModelInfo(model: ModelInfo): ProviderStatus["models"][number] {
+  const tokenPrices = model.billing?.tokenPrices;
+  const longContext = tokenPrices?.longContext;
   return {
     id: model.id,
     name: model.name || model.id,
     supportsReasoningEffort: Boolean(model.capabilities?.supports?.reasoningEffort),
     supportedReasoningEfforts: model.supportedReasoningEfforts ?? [],
     defaultReasoningEffort: model.defaultReasoningEffort,
+    supportsLongContext: Boolean(longContext),
     contextWindowTokens: positiveTokenLimit(model.capabilities?.limits?.max_context_window_tokens),
-    maxPromptTokens: positiveTokenLimit(model.capabilities?.limits?.max_prompt_tokens),
+    maxPromptTokens: positiveTokenLimit(tokenPrices?.maxPromptTokens ?? tokenPrices?.contextMax ?? model.capabilities?.limits?.max_prompt_tokens),
+    longContextMaxPromptTokens: positiveTokenLimit(longContext?.maxPromptTokens ?? longContext?.contextMax),
   };
 }
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -697,12 +702,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 function fallbackModels(defaultModel: string): ProviderStatus["models"] {
   const catalog: ProviderStatus["models"] = [
-    { id: defaultModel, name: defaultModel, supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", contextWindowTokens: 128000, maxPromptTokens: 128000 },
-    { id: "gpt-5-mini", name: "GPT-5 mini", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", contextWindowTokens: 128000, maxPromptTokens: 128000 },
-    { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", contextWindowTokens: 200000, maxPromptTokens: 168000 },
-    { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", contextWindowTokens: 200000, maxPromptTokens: 168000 },
+    { id: defaultModel, name: defaultModel, supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 128000, maxPromptTokens: 128000 },
+    { id: "gpt-5-mini", name: "GPT-5 mini", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 128000, maxPromptTokens: 128000 },
+    { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 200000, maxPromptTokens: 168000 },
+    { id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 200000, maxPromptTokens: 168000 },
   ];
   return Array.from(new Map(catalog.map((model) => [model.id, model])).values());
+}
+
+function developmentModels(defaultModel: string): ProviderStatus["models"] {
+  return fallbackModels(defaultModel).map((model) => model.id === defaultModel ? { ...model, supportsLongContext: true, longContextMaxPromptTokens: 1_000_000 } : model);
 }
 
 function positiveTokenLimit(value: number | undefined): number | undefined {
@@ -713,4 +722,8 @@ function sdkReasoningEffort(effort: ProviderChatRequest["reasoningEffort"]): "lo
   if (effort === "low" || effort === "medium" || effort === "high" || effort === "xhigh") return effort;
   if (effort === "max") return "xhigh";
   return undefined;
+}
+
+function sdkContextTier(tier: ProviderChatRequest["contextTier"]): "long_context" | undefined {
+  return tier === "long_context" ? tier : undefined;
 }

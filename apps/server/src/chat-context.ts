@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { ProviderChatRequest, ProviderMessage, ProviderTitleTool } from "@copilotchat/provider";
 import type { Chat, SendMessageRequest } from "@copilotchat/shared";
 import { messageAttachmentSchema } from "@copilotchat/shared";
@@ -20,10 +21,11 @@ export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: stri
   const workingDirectory = workspace?.rootPath ?? isolatedChatWorkspace(input.context.isolatedWorkspaceRoot, input.chat.id);
   return {
     messages,
-    sessionId: input.chat.providerSessionId ?? stableProviderSessionId(input.ownerId, input.chat.id),
+    sessionId: input.chat.providerSessionId ?? newProviderSessionId(input.ownerId, input.chat.id),
     resumeSession: Boolean(input.chat.providerSessionId),
     model: input.message.model ?? input.chat.model ?? project?.defaultModel ?? input.defaultModel,
     reasoningEffort: input.message.reasoningEffort ?? input.chat.reasoningEffort ?? undefined,
+    contextTier: input.message.contextTier ?? input.chat.contextTier ?? undefined,
     permissionMode: input.message.permissionMode ?? "ask",
     projectContext: project ? buildProjectContext(input.db, input.ownerId, project.id) : null,
     skills: input.db.enabledSkillManifests(input.ownerId, input.message.skillIds, input.chat.projectId, input.message.content),
@@ -41,8 +43,8 @@ function readProviderAttachments(metadata: Record<string, unknown>): ProviderMes
   return parsed.data.flatMap((attachment) => attachment.data ? [{ type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name }] : []);
 }
 
-function stableProviderSessionId(ownerId: string, chatId: string): string {
-  return `copilotchat-${ownerId}-${chatId}`.replace(/[^a-zA-Z0-9_.-]/g, "-");
+function newProviderSessionId(ownerId: string, chatId: string): string {
+  return `copilotchat-${ownerId}-${chatId}-${randomUUID()}`.replace(/[^a-zA-Z0-9_.-]/g, "-");
 }
 
 export function isolatedChatWorkspace(root: string, chatId: string): string {

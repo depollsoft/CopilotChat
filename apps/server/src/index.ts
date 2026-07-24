@@ -69,7 +69,7 @@ const githubUserSchema = z.object({ login: z.string(), name: z.string().nullable
 async function prepareChatTurn(ownerId: string, chatId: string, input: SendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
   const attachments = validateMessageAttachments(input);
   let chat = applyChatTurnScope(db, ownerId, chatId, input);
-  if (input.model !== undefined || input.reasoningEffort !== undefined) chat = db.updateChat(ownerId, chat.id, { model: input.model ?? chat.model, reasoningEffort: input.reasoningEffort ?? chat.reasoningEffort });
+  if (input.model !== undefined || input.reasoningEffort !== undefined || input.contextTier !== undefined) chat = db.updateChat(ownerId, chat.id, { model: input.model ?? chat.model, reasoningEffort: input.reasoningEffort ?? chat.reasoningEffort, contextTier: input.contextTier ?? chat.contextTier });
   const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
   if (!existingUserMessage && attachments.length > 0) db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
   if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
