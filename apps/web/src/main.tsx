@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, McpServer, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, Workspace } from "@copilotchat/shared";
 import { formatAic } from "@copilotchat/shared";
 import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload } from "./icons.js";
+import { externalLinkProps } from "./links.js";
 import "./styles.css";
 
 type Theme = "system" | "light" | "dark";
@@ -640,7 +641,8 @@ function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<Messa
     prev.canRetry === next.canRetry;
 }
 function PendingTurns(p: { turns: PendingTurn[] }) { const visible = p.turns.filter((turn) => turn.status !== "done"); if (visible.length === 0) return null; return <div className="pending-turns">{visible.map((turn) => <article key={turn.id} className={`pending-turn ${turn.mode} ${turn.status}`}><span className="pending-label">{turn.mode === "steer" ? "Steer" : "Queued"}</span><span className="pending-content">{turn.content}</span><span className="pending-status">{turn.status === "running" ? "Running next" : turn.status === "sent" ? "Sent live" : turn.status}</span></article>)}</div>; }
-const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock> };
+const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock>, a: (props) => <MarkdownLink {...props} /> };
+function MarkdownLink(props: React.ComponentPropsWithoutRef<"a"> & { node?: unknown }) { const anchor: React.ComponentPropsWithoutRef<"a"> & { node?: unknown } = { ...props }; delete anchor.node; return <a {...anchor} {...externalLinkProps(props.href)} />; }
 function CodeBlock(p: { children?: React.ReactNode }) { const code = textFromNode(p.children).replace(/\n$/, ""); return <div className="code-block"><button type="button" className="code-copy" aria-label="Copy code block" title="Copy code" onClick={() => void copyText(code)}><IconCopy width={15}/></button><pre>{p.children}</pre></div>; }
 type MarkdownTaskPart = { kind: "markdown"; content: string } | { kind: "tasks"; items: TaskListItem[] };
 function splitMarkdownTaskLists(markdown: string): MarkdownTaskPart[] {
