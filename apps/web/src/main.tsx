@@ -968,10 +968,10 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
     <section className="settings-section">
       <div className="settings-section-title"><div><strong>Location</strong><span>Share no location, an approximate area, or browser-reported fine coordinates.</span></div></div>
       <div className="settings-card location-card">
-        <div className="segmented-control vertical location-level-control">
-          <button type="button" className={locationLevel === "off" ? "on" : ""} onClick={() => setLocationLevel("off")}><strong>Off</strong><span>No location is stored or included.</span></button>
-          <button type="button" className={locationLevel === "coarse" ? "on" : ""} onClick={() => setLocationLevel("coarse")}><strong>Coarse</strong><span>Rounded to roughly a city or region, about 10 km.</span></button>
-          <button type="button" className={locationLevel === "fine" ? "on" : ""} onClick={() => setLocationLevel("fine")}><strong>Fine</strong><span>Uses browser-reported coordinates and accuracy.</span></button>
+        <div className="segmented-control vertical location-level-control" role="radiogroup" aria-label="Location precision">
+          <button type="button" role="radio" aria-checked={locationLevel === "off"} className={locationLevel === "off" ? "on" : ""} onClick={() => setLocationLevel("off")}><strong>Off</strong><span>No location is stored or included.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "coarse"} className={locationLevel === "coarse" ? "on" : ""} onClick={() => setLocationLevel("coarse")}><strong>Coarse</strong><span>Rounded to roughly a city or region, about 10 km.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "fine"} className={locationLevel === "fine" ? "on" : ""} onClick={() => setLocationLevel("fine")}><strong>Fine</strong><span>Uses browser-reported coordinates and accuracy.</span></button>
         </div>
         <div className="location-summary">
           <div><strong>Saved location</strong><span>{currentLocation ? locationSummary(currentLocation) : "No location saved."}</span></div>

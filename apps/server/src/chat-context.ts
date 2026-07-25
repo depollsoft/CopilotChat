@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderChatRequest, ProviderMessage, ProviderTitleTool } from "@copilotchat/provider";
-import type { Chat, SendMessageRequest } from "@copilotchat/shared";
+import type { Chat, Memory, SendMessageRequest } from "@copilotchat/shared";
 import { messageAttachmentSchema } from "@copilotchat/shared";
 import { buildConversationTools } from "./conversation-tools.js";
 import type { AppDatabase } from "./db.js";
 
 export interface ChatContextOptions { isolatedWorkspaceRoot: string; allowStdioMcp?: boolean }
+const memoryContextCharacterBudget = 16_000;
+const memoryContextNoticeReserve = 220;
+const memoryTruncationNotice = "\n[Memory truncated to fit the context budget.]";
 export function applyChatTurnScope(db: AppDatabase, ownerId: string, chatId: string, input: Pick<SendMessageRequest, "projectId" | "workspaceId">): Chat {
   const chat = db.getChat(ownerId, chatId);
   const projectId = input.projectId === undefined ? chat.projectId : input.projectId;
@@ -60,7 +63,7 @@ function buildProjectContext(db: AppDatabase, ownerId: string, projectId: string
   return [
     project.instructions ? `Project instructions:\n${project.instructions}` : "",
     project.memory ? `Shared project memory:\n${project.memory}` : "",
-    memories.length > 0 ? ["Project memories:", ...memories.map((memory) => `## ${memory.title}\n${memory.content}`)].join("\n\n") : "",
+    buildMemoryContext("Project memories:", memories),
     references.length > 0 ? ["Project reference materials:", ...references.map((reference) => `## ${reference.title}\n${reference.content}`)].join("\n\n") : "",
     chatReferences.length > 0 ? ["Referenced prior chat content:", ...chatReferences.map((reference) => `- ${reference.title}: ${reference.excerpt}`)].join("\n") : "",
   ].filter(Boolean).join("\n\n") || null;
@@ -71,7 +74,44 @@ function buildUserContext(db: AppDatabase, ownerId: string): string | null {
   const memories = db.listMemories(ownerId, null).filter((memory) => memory.enabled);
   return [
     context.profile ? `Profile supplied by the user:\n${context.profile}` : "",
-    memories.length > 0 ? ["User memories:", ...memories.map((memory) => `## ${memory.title}\n${memory.content}`)].join("\n\n") : "",
+    buildMemoryContext("User memories:", memories),
     context.location ? `Location shared by the user (${context.location.precision}): ${context.location.latitude}, ${context.location.longitude}; accuracy about ${Math.round(context.location.accuracy)} meters; captured ${context.location.capturedAt}.` : "",
   ].filter(Boolean).join("\n\n") || null;
+}
+
+function buildMemoryContext(heading: string, memories: Memory[]): string {
+  if (memories.length === 0) return "";
+  const ordered = [...memories].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+  const blocks: string[] = [];
+  const contentLimit = memoryContextCharacterBudget - memoryContextNoticeReserve;
+  let used = heading.length;
+  let omitted = 0;
+  let truncated = 0;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const memory = ordered[index]!;
+    const prefix = `## ${memory.title}\n`;
+    const separatorLength = 2;
+    const available = contentLimit - used - separatorLength;
+    const block = `${prefix}${memory.content}`;
+    if (block.length <= available) {
+      blocks.push(block);
+      used += separatorLength + block.length;
+      continue;
+    }
+    const contentLength = available - prefix.length - memoryTruncationNotice.length;
+    if (contentLength > 0) {
+      blocks.push(`${prefix}${memory.content.slice(0, contentLength)}${memoryTruncationNotice}`);
+      truncated = 1;
+      omitted = ordered.length - index - 1;
+    } else {
+      omitted = ordered.length - index;
+    }
+    break;
+  }
+  const limitations = [
+    truncated ? "1 memory truncated" : "",
+    omitted ? `${omitted} ${omitted === 1 ? "memory" : "memories"} omitted` : "",
+  ].filter(Boolean);
+  const notice = limitations.length > 0 ? `[Memory context limited to ${memoryContextCharacterBudget} characters; ${limitations.join("; ")}.]` : "";
+  return [heading, ...blocks, notice].filter(Boolean).join("\n\n");
 }

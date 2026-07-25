@@ -149,6 +149,20 @@ describe("chat provider context", () => {
     expect(db.getUserContext(owner.id).location).toMatchObject({ latitude: 47.6, longitude: -122.3, accuracy: 10_000, precision: "coarse" });
   });
 
+  it("bounds enabled memory context and reports omitted content", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    for (let index = 0; index < 4; index += 1) db.createMemory(owner.id, { projectId: null, title: `Large memory ${index}`, content: `${index}`.repeat(8_000), enabled: true });
+    const chat = db.createChat(owner.id, { title: "Bounded context", projectId: null, workspaceId: null });
+    db.addMessage({ chatId: chat.id, role: "user", content: "Use bounded context" });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Use bounded context", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.userContext?.length).toBeLessThanOrEqual(16_000);
+    expect(request.userContext).toContain("Memory context limited to 16000 characters");
+    expect(request.userContext).toMatch(/memory truncated|memories omitted/);
+  });
+
   it("invalidates provider sessions when user or scoped memory context changes", () => {
     const db = createTestDb();
     const owner = db.getOwner();
@@ -157,18 +171,37 @@ describe("chat provider context", () => {
     const projectChat = db.createChat(owner.id, { title: "Project", projectId: project.id, workspaceId: null });
     db.setChatProviderSession(owner.id, generalChat.id, { providerSessionId: "general-session" });
     db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session" });
+    const generalBeforeProjectMemory = db.getChat(owner.id, generalChat.id).updatedAt;
+    const projectBeforeProjectMemory = db.getChat(owner.id, projectChat.id).updatedAt;
 
     db.createMemory(owner.id, { projectId: project.id, title: "Project fact", content: "Use durable storage.", enabled: true });
 
-    expect(db.getChat(owner.id, generalChat.id).providerSessionId).toBe("general-session");
-    expect(db.getChat(owner.id, projectChat.id).providerSessionId).toBeNull();
+    expect(db.getChat(owner.id, generalChat.id)).toMatchObject({ providerSessionId: "general-session", updatedAt: generalBeforeProjectMemory });
+    expect(db.getChat(owner.id, projectChat.id)).toMatchObject({ providerSessionId: null, updatedAt: projectBeforeProjectMemory });
 
     db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session-2" });
+    const generalBeforeProfile = db.getChat(owner.id, generalChat.id).updatedAt;
+    const projectBeforeProfile = db.getChat(owner.id, projectChat.id).updatedAt;
     db.updateUserContext(owner.id, { profile: "Prefer concise answers." });
 
-    expect(db.getChat(owner.id, generalChat.id).providerSessionId).toBeNull();
-    expect(db.getChat(owner.id, projectChat.id).providerSessionId).toBeNull();
+    expect(db.getChat(owner.id, generalChat.id)).toMatchObject({ providerSessionId: null, updatedAt: generalBeforeProfile });
+    expect(db.getChat(owner.id, projectChat.id)).toMatchObject({ providerSessionId: null, updatedAt: projectBeforeProfile });
     expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }).memories).toHaveLength(1);
+  });
+
+  it("invalidates surviving chat sessions before deleting their project memories", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Deleted context", description: null, instructions: "" });
+    db.createMemory(owner.id, { projectId: project.id, title: "Temporary decision", content: "Only valid in this project.", enabled: true });
+    const chat = db.createChat(owner.id, { title: "Surviving chat", projectId: project.id, workspaceId: null });
+    db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "project-session", providerSessionWorkspacePath: "/tmp/project-session" });
+    const updatedAt = db.getChat(owner.id, chat.id).updatedAt;
+
+    db.deleteProject(owner.id, project.id);
+
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ projectId: null, providerSessionId: null, providerSessionWorkspacePath: null, updatedAt });
+    expect(db.listMemories(owner.id)).toHaveLength(0);
   });
 
   it("uses saved chat model choices when a request does not override them", () => {

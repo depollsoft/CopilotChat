@@ -29,7 +29,7 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.getByRole("button", { name: "Save changes" }).click();
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
-  await page.getByRole("button", { name: "Manage" }).click();
+  await page.getByRole("button", { name: "Manage", exact: true }).click();
   await page.getByRole("button", { name: "New skill" }).click();
   await page.getByLabel("Skill name").fill(`Skill ${testInfo.project.name}`);
   await page.getByLabel("Short description").fill("E2E skill");
@@ -339,19 +339,53 @@ test("personal context and coarse location are included in chats", async ({ page
   const drawer = page.getByRole("dialog", { name: "Personal context" });
   await drawer.getByLabel("About you").fill("I am a staff engineer who prefers concise TypeScript examples.");
   await drawer.getByRole("button", { name: "Save profile" }).click();
-  await drawer.locator(".location-level-control button").filter({ hasText: /^Coarse/ }).click();
+  const coarseLocation = drawer.getByRole("radio", { name: /^Coarse/ });
+  await coarseLocation.click();
+  await expect(coarseLocation).toHaveAttribute("aria-checked", "true");
   await drawer.getByRole("button", { name: "Save current location" }).click();
   await expect(drawer.locator(".location-summary")).toContainText("47.6, -122.3");
   await drawer.getByLabel("Title").fill("Response style");
   await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
   await drawer.getByRole("button", { name: "Add memory" }).click();
-  await expect(drawer.getByText("Response style")).toBeVisible();
+  let memoryCard = drawer.locator(".memory-card").filter({ hasText: "Response style" });
+  await memoryCard.getByRole("button", { name: "Edit" }).click();
+  const memoryEditor = drawer.locator(".memory-card.memory-editor");
+  await memoryEditor.getByLabel("Title").fill("Updated response style");
+  await memoryEditor.getByLabel("Memory").fill("Lead with the edited recommendation.");
+  await memoryEditor.getByRole("button", { name: "Save changes" }).click();
+  memoryCard = drawer.locator(".memory-card").filter({ hasText: "Updated response style" });
+  await expect(memoryCard).toContainText("Lead with the edited recommendation.");
+  await memoryCard.getByRole("button", { name: "Pause" }).click();
+  await expect(memoryCard.getByText("Paused", { exact: true })).toBeVisible();
   await drawer.getByRole("button", { name: "Close" }).click();
-  await page.getByPlaceholder(/Ask CopilotChat/).fill("Use my personal context.");
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check paused personal context.");
   await page.getByRole("button", { name: "Send" }).click();
-  const response = page.locator(".msg.assistant .msg-body").last();
+  let response = page.locator(".msg.assistant .msg-body").last();
   await expect(response).toContainText("Personal context: Profile supplied by the user: I am a staff engineer", { timeout: 15000 });
-  await expect(response).toContainText("Response style");
+  await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Include" }).click();
+  await expect(memoryCard.getByText("Included", { exact: true })).toBeVisible();
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check included personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("Updated response style", { timeout: 15000 });
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Delete", exact: true }).click();
+  await memoryCard.getByRole("button", { name: "Confirm delete" }).click();
+  await expect(page.getByRole("dialog", { name: "Personal context" }).getByText("Updated response style")).toHaveCount(0);
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check deleted personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).not.toContainText("Updated response style");
 });
 
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
