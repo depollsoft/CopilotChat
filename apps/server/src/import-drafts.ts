@@ -13,13 +13,21 @@ const assignmentSchema = z.object({ conversationSourceId: z.string().nullable().
 const storedImportDraftSchema = importPreviewRequestSchema.omit({ content: true }).extend(importDraftSchema.shape).extend({ ownerId: z.string(), assignments: z.array(assignmentSchema).default([]), content: z.string().optional(), contentFile: z.string().optional(), contentStorage: z.enum(["text", "binary"]).optional() }).refine((draft) => draft.content || draft.contentFile, { message: "Import draft content is missing." });
 
 export class ImportDraftStore {
+  private readonly activeContentFiles = new Set<string>();
+  private operationQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly rootDir: string, private readonly maxImportBytes = 128 * 1024 * 1024) {}
 
   async create(ownerId: string, input: ImportPreviewRequest): Promise<ImportDraft> {
+    return this.withOperationLock(() => this.createUnlocked(ownerId, input));
+  }
+
+  private async createUnlocked(ownerId: string, input: ImportPreviewRequest): Promise<ImportDraft> {
     if (Buffer.byteLength(input.content) > this.maxImportBytes) throw new Error(`Import exceeds the ${formatBytes(this.maxImportBytes)} limit.`);
     await fs.mkdir(this.rootDir, { recursive: true });
     const id = randomUUID();
     const draft: StoredImportDraft = { source: input.source, fileName: input.fileName, encoding: input.encoding, id, ownerId, createdAt: new Date().toISOString(), assignments: [], contentFile: `${id}.data`, contentStorage: "text" };
+    this.activeContentFiles.add(draft.contentFile!);
     try {
       await fs.writeFile(this.contentPathFor(draft), input.content, { encoding: "utf8", flag: "wx" });
       await fs.writeFile(this.pathFor(draft.id), JSON.stringify(draft), { encoding: "utf8", flag: "wx" });
@@ -27,23 +35,32 @@ export class ImportDraftStore {
     } catch (error) {
       await Promise.all([fs.rm(this.contentPathFor(draft), { force: true }), fs.rm(this.pathFor(draft.id), { force: true })]);
       throw error;
+    } finally {
+      this.activeContentFiles.delete(draft.contentFile!);
     }
   }
 
   async createFromUpload(ownerId: string, source: ImportPreviewRequest["source"], uploads: UploadedFileStore, uploadId: string, uploadClaimId: string): Promise<ImportDraft> {
+    return this.withOperationLock(() => this.createFromUploadUnlocked(ownerId, source, uploads, uploadId, uploadClaimId));
+  }
+
+  private async createFromUploadUnlocked(ownerId: string, source: ImportPreviewRequest["source"], uploads: UploadedFileStore, uploadId: string, uploadClaimId: string): Promise<ImportDraft> {
     await fs.mkdir(this.rootDir, { recursive: true });
     const uploaded = await uploads.get(ownerId, uploadId);
     if (uploaded.size > this.maxImportBytes) throw new Error(`Import exceeds the ${formatBytes(this.maxImportBytes)} limit.`);
     const id = randomUUID();
     const isZip = uploaded.fileName.toLowerCase().endsWith(".zip");
     const draft: StoredImportDraft = { source, fileName: uploaded.fileName, encoding: isZip ? "base64" : "text", id, ownerId, createdAt: new Date().toISOString(), assignments: [], contentFile: `${id}.data`, contentStorage: isZip ? "binary" : "text" };
-    await uploads.copyTo(ownerId, uploadId, this.contentPathFor(draft), uploadClaimId);
+    this.activeContentFiles.add(draft.contentFile!);
     try {
+      await uploads.copyTo(ownerId, uploadId, this.contentPathFor(draft), uploadClaimId);
       await fs.writeFile(this.pathFor(draft.id), JSON.stringify(draft), { encoding: "utf8", flag: "wx" });
       return publicDraft(draft);
     } catch (error) {
       await fs.rm(this.contentPathFor(draft), { force: true });
       throw error;
+    } finally {
+      this.activeContentFiles.delete(draft.contentFile!);
     }
   }
 
@@ -67,6 +84,10 @@ export class ImportDraftStore {
   }
 
   async deleteOwner(ownerId: string): Promise<number> {
+    return this.withOperationLock(() => this.deleteOwnerUnlocked(ownerId));
+  }
+
+  private async deleteOwnerUnlocked(ownerId: string): Promise<number> {
     let entries: string[];
     try {
       entries = await fs.readdir(this.rootDir);
@@ -80,10 +101,55 @@ export class ImportDraftStore {
       const id = path.basename(entry, ".json");
       const draft = await this.read(id);
       if (draft.ownerId !== ownerId) continue;
-      await Promise.all([fs.unlink(this.pathFor(id)), draft.contentFile ? fs.rm(this.contentPathFor(draft), { force: true }) : Promise.resolve()]);
+      if (draft.contentFile) await fs.rm(this.contentPathFor(draft), { force: true });
+      await fs.unlink(this.pathFor(id));
+      deleted += 1;
+    }
+    await this.cleanupOrphansUnlocked();
+    return deleted;
+  }
+
+  async cleanupOrphans(): Promise<number> {
+    return this.withOperationLock(() => this.cleanupOrphansUnlocked());
+  }
+
+  private async cleanupOrphansUnlocked(): Promise<number> {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(this.rootDir);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+      throw error;
+    }
+    const referenced = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      try {
+        const value = JSON.parse(await fs.readFile(path.join(this.rootDir, entry), "utf8")) as { contentFile?: unknown };
+        if (typeof value.contentFile === "string" && path.basename(value.contentFile) === value.contentFile) referenced.add(value.contentFile);
+      } catch {
+        referenced.add(`${path.basename(entry, ".json")}.data`);
+      }
+    }
+    let deleted = 0;
+    for (const entry of entries) {
+      if (!entry.endsWith(".data") || referenced.has(entry) || this.activeContentFiles.has(entry)) continue;
+      await fs.rm(path.join(this.rootDir, entry), { force: true });
       deleted += 1;
     }
     return deleted;
+  }
+
+  private async withOperationLock<T>(action: () => Promise<T>): Promise<T> {
+    const previous = this.operationQueue;
+    let release!: () => void;
+    this.operationQueue = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
   }
 
   private async read(id: string): Promise<StoredImportDraft> {

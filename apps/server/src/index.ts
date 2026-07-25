@@ -14,7 +14,7 @@ import Fastify from "fastify";
 import type { FastifyRequest } from "fastify";
 import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
-import { chatAttachmentDirectory, isChatAttachmentDirectory, materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
+import { chatAttachmentDirectory, forgetValidatedAttachmentFiles, forgetValidatedAttachmentTree, isChatAttachmentDirectory, materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
 import { applyChatTurnScope, buildProviderChatRequest, chatWorkingDirectory } from "./chat-context.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
@@ -35,6 +35,7 @@ const isolatedWorkspaceRoot = path.join(config.dataDir, "isolated-workspaces");
 const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"), config.importLimitBytes);
 const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes, config.stagedUploadLimitBytes, config.stagedUploadLimitFiles);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
+await importDrafts.cleanupOrphans();
 const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
 const app = Fastify({ logger: true, bodyLimit: config.bodyLimitBytes });
@@ -145,7 +146,7 @@ app.delete(`${apiPrefix}/data`, async (request) => {
   const chatFileTargets = chats.flatMap((chat) => chatFiles(owner.id, chat));
   for (const chat of chats) activeResponses.cancel(chat.id);
   db.clearAllData(owner.id);
-  await Promise.all(chatFileTargets.map((target) => fs.promises.rm(target, { recursive: true, force: true })));
+  await Promise.all(chatFileTargets.map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); }));
   await importDrafts.deleteOwner(owner.id);
   await uploadedFiles.deleteOwner(owner.id);
   await fs.promises.mkdir(isolatedWorkspaceRoot, { recursive: true });
@@ -161,7 +162,7 @@ app.delete(`${apiPrefix}/project-references/:referenceId`, async (request) => { 
 app.post(`${apiPrefix}/project-chat-references`, async (request) => { const owner = ownerFor(request); return db.createProjectChatReference(owner.id, createProjectChatReferenceRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/project-chat-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); db.deleteProjectChatReference(owner.id, params.referenceId); return { ok: true }; });
 app.post(`${apiPrefix}/chats`, async (request) => db.createChat(ownerFor(request).id, createChatRequestSchema.parse(request.body)));
-app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); const chats = db.listChats(owner.id); const filesByChat = new Map(chats.map((chat) => [chat.id, chatFiles(owner.id, chat)])); const deletedChatIds = db.deleteEmptyChats(owner.id, query.except ?? null); await Promise.all(deletedChatIds.flatMap((chatId) => filesByChat.get(chatId) ?? []).map((target) => fs.promises.rm(target, { recursive: true, force: true }))); return { deletedChatIds }; });
+app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); const chats = db.listChats(owner.id); const filesByChat = new Map(chats.map((chat) => [chat.id, chatFiles(owner.id, chat)])); const deletedChatIds = db.deleteEmptyChats(owner.id, query.except ?? null); await Promise.all(deletedChatIds.flatMap((chatId) => filesByChat.get(chatId) ?? []).map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); })); return { deletedChatIds }; });
 app.patch(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); return db.updateChat(owner.id, params.chatId, updateChatRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); const chat = db.getChat(owner.id, params.chatId); await removeChatFiles(owner.id, chat); db.deleteChat(owner.id, params.chatId); return { ok: true }; });
 app.get(`${apiPrefix}/chats/:chatId/messages`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); return db.listMessages(params.chatId); });
@@ -422,7 +423,7 @@ function refreshProviderStatus(ownerId: string, token: string | null, credential
 function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
 function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
 async function removeChatFiles(ownerId: string, chat: Chat): Promise<void> {
-  await Promise.all(chatFiles(ownerId, chat).map((target) => fs.promises.rm(target, { recursive: true, force: true })));
+  await Promise.all(chatFiles(ownerId, chat).map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); }));
 }
 function chatFiles(ownerId: string, chat: Chat): string[] {
   const workspaceDir = chat.workspaceId ? db.getWorkspaceRecord(ownerId, chat.workspaceId).rootPath : path.join(isolatedWorkspaceRoot, chat.id.replace(/[^a-zA-Z0-9_.-]/g, "-"));
@@ -474,12 +475,14 @@ async function withAttachmentCleanup<T>(ownerId: string, chatId: string, action:
       const filePath = attachment.filePath!;
       const directory = path.dirname(filePath);
       if (!isChatAttachmentDirectory(directory, chatId)) return;
+      forgetValidatedAttachmentFiles([filePath]);
       await fs.promises.rm(filePath, { force: true });
       await fs.promises.rmdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
     }));
   }
 }
 async function removeTemporaryAttachmentFiles(filePaths: string[]): Promise<void> {
+  forgetValidatedAttachmentFiles(filePaths);
   await Promise.all(filePaths.map(async (filePath) => {
     await fs.promises.rm(filePath, { force: true });
     await fs.promises.rmdir(path.dirname(filePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });

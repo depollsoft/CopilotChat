@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
+import type { Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { MessageAttachment } from "@copilotchat/shared";
@@ -9,6 +10,9 @@ import type { UploadedFileStore } from "./uploaded-files.js";
 
 const attachmentDirectoryName = ".copilotchat/uploads";
 const attachmentCountLimit = 20;
+type ValidatedFileIdentity = { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number; digest: string };
+const validatedFiles = new Map<string, ValidatedFileIdentity>();
+const validatedFileCacheLimit = 2048;
 
 export type MaterializedMessageAttachments = { attachments: MessageAttachment[]; uploadIds: string[]; createdFilePaths: string[] };
 
@@ -40,18 +44,23 @@ export async function materializeMessageAttachments(input: { uploads: UploadedFi
         await assertNoSymlink(targetPath, "Attachment path must not be a symlink.");
         const existed = await pathExists(targetPath);
         await input.uploads.copyTo(input.ownerId, attachment.uploadId, targetPath, input.uploadClaimId!);
-        materialized.push({ id: attachment.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size, filePath: targetPath });
+        const materializedAttachment = { id: attachment.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size, filePath: targetPath };
+        await validateManagedAttachmentFile(targetPath, materializedAttachment);
+        materialized.push(materializedAttachment);
         if (!existed) { createdFilePaths.push(targetPath); createdThisAttempt.push(targetPath); }
         continue;
       }
       if (!attachment.data || !/^[A-Za-z0-9+/]*={0,2}$/.test(attachment.data)) throw new Error(`Attachment ${attachment.name} is not valid base64.`);
       const content = Buffer.from(attachment.data, "base64");
       if (content.byteLength !== attachment.size) throw new Error(`Attachment ${attachment.name} size does not match its content.`);
-      const targetPath = path.join(directory, attachmentFileName(attachment, createHash("sha256").update(content).digest("hex")));
+      const contentDigest = createHash("sha256").update(content).digest("hex");
+      const targetPath = path.join(directory, attachmentFileName(attachment, contentDigest));
       await assertNoSymlink(targetPath, "Attachment path must not be a symlink.");
       const existed = await pathExists(targetPath);
       await writeFileAtomically(targetPath, content);
-      materialized.push({ id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, filePath: targetPath });
+      const materializedAttachment = { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, filePath: targetPath };
+      await validateManagedAttachmentFile(targetPath, materializedAttachment);
+      materialized.push(materializedAttachment);
       if (!existed) { createdFilePaths.push(targetPath); createdThisAttempt.push(targetPath); }
     }
     return { attachments: materialized, uploadIds, createdFilePaths };
@@ -85,6 +94,7 @@ export async function relocateChatAttachments(input: { db: AppDatabase; ownerId:
     try {
       await validateManagedAttachmentFile(sourcePath, attachment);
     } catch {
+      validatedFiles.delete(sourcePath);
       input.db.updateMessageAttachmentFilePath(input.ownerId, input.chatId, attachment.id, null);
       input.onMissing?.(attachment);
       continue;
@@ -96,6 +106,7 @@ export async function relocateChatAttachments(input: { db: AppDatabase; ownerId:
     await validateManagedAttachmentFile(targetPath, attachment);
     input.db.updateMessageAttachmentFilePath(input.ownerId, input.chatId, attachment.id, targetPath);
     await fs.rm(sourcePath, { force: true });
+    validatedFiles.delete(sourcePath);
     await fs.rmdir(path.dirname(sourcePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
   }
 }
@@ -105,6 +116,14 @@ export function isChatAttachmentDirectory(directory: string, chatId: string): bo
   return path.basename(resolved) === safePathSegment(chatId)
     && path.basename(path.dirname(resolved)) === "uploads"
     && path.basename(path.dirname(path.dirname(resolved))) === ".copilotchat";
+}
+
+export function forgetValidatedAttachmentFiles(paths: string[]): void {
+  for (const filePath of paths) validatedFiles.delete(filePath);
+}
+
+export function forgetValidatedAttachmentTree(rootPath: string): void {
+  for (const filePath of validatedFiles.keys()) if (isPathInside(rootPath, filePath)) validatedFiles.delete(filePath);
 }
 
 async function prepareAttachmentDirectory(workspaceDir: string, directory: string): Promise<void> {
@@ -176,7 +195,11 @@ async function validateManagedAttachmentFile(filePath: string, attachment: Messa
   if (!stat.isFile()) throw new Error(`Attachment ${attachment.name} is not a file.`);
   if (stat.size !== attachment.size) throw new Error(`Attachment ${attachment.name} size does not match its file.`);
   const expectedDigest = attachmentDigestFromPath(filePath);
-  if (expectedDigest && await hashFile(filePath) !== expectedDigest) throw new Error(`Attachment ${attachment.name} content does not match its file reference.`);
+  if (!expectedDigest) return;
+  const cached = validatedFiles.get(filePath);
+  if (cached && cached.digest === expectedDigest && sameFileIdentity(cached, stat)) { cacheValidatedIdentity(filePath, cached); return; }
+  if (await hashFile(filePath) !== expectedDigest) { validatedFiles.delete(filePath); throw new Error(`Attachment ${attachment.name} content does not match its file reference.`); }
+  cacheValidatedIdentity(filePath, fileIdentity(stat, expectedDigest));
 }
 
 function attachmentDigestFromPath(filePath: string): string | null {
@@ -187,6 +210,24 @@ async function hashFile(filePath: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer);
   return hash.digest("hex");
+}
+
+function fileIdentity(stat: Stats, digest: string): ValidatedFileIdentity {
+  return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, digest };
+}
+
+function cacheValidatedIdentity(filePath: string, identity: ValidatedFileIdentity): void {
+  validatedFiles.delete(filePath);
+  validatedFiles.set(filePath, identity);
+  while (validatedFiles.size > validatedFileCacheLimit) {
+    const oldest = validatedFiles.keys().next().value;
+    if (typeof oldest !== "string") break;
+    validatedFiles.delete(oldest);
+  }
+}
+
+function sameFileIdentity(identity: ValidatedFileIdentity, stat: Stats): boolean {
+  return identity.dev === stat.dev && identity.ino === stat.ino && identity.size === stat.size && identity.mtimeMs === stat.mtimeMs && identity.ctimeMs === stat.ctimeMs;
 }
 
 async function replaceFile(sourcePath: string, targetPath: string): Promise<void> {

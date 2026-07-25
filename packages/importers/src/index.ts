@@ -4,7 +4,8 @@ import JSZip from "jszip";
 type UnknownRecord = Record<string, unknown>;
 type AssistantActivity = { id: string; type: "reasoning" | "tool" | "subagent" | "task-list"; title: string; status: "running" | "succeeded" | "failed"; content?: string; input?: unknown; output?: unknown; error?: string | null; details?: Record<string, unknown>; steps?: AssistantActivity[] };
 type ClaudeProjectHint = { sourceId: string; name: string; normalizedName: string; isStarterProject: boolean; topicPhrases: string[]; negativePhrases: string[] };
-type ArchiveReadState = { totalBytes: number };
+type ArchiveReadState = { totalBytes: number; maxBytes: number };
+export type ImportPayloadLimits = { archiveEntryLimit?: number; archiveUncompressedLimit?: number };
 const importedContentLimit = 20_000;
 const importedValueDepthLimit = 5;
 const importedValueArrayLimit = 80;
@@ -21,14 +22,16 @@ export function previewImport(requestedSource: ImportSource, fileName: string, c
   throw new Error(`Unsupported import source: ${String(source)}`);
 }
 
-export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string | Uint8Array, encoding: "text" | "base64" = "text"): Promise<ImportPreview> {
+export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string | Uint8Array, encoding: "text" | "base64" = "text", limits: ImportPayloadLimits = {}): Promise<ImportPreview> {
   if (!fileName.toLowerCase().endsWith(".zip")) return previewImport(requestedSource, fileName, typeof content === "string" ? content : new TextDecoder().decode(content));
   if (encoding !== "base64") throw new Error("ZIP imports must be uploaded as base64 payloads.");
+  const entryLimit = limits.archiveEntryLimit ?? archiveEntryLimit;
+  const uncompressedLimit = limits.archiveUncompressedLimit ?? archiveUncompressedLimit;
   const archiveBytes = typeof content === "string" ? base64ToBytes(content) : content;
-  validateZipEntryCount(archiveBytes);
+  validateZipEntryCount(archiveBytes, entryLimit);
   const zip = await JSZip.loadAsync(archiveBytes);
-  validateImportArchive(zip);
-  const archiveReadState: ArchiveReadState = { totalBytes: 0 };
+  validateImportArchive(zip, entryLimit, uncompressedLimit);
+  const archiveReadState: ArchiveReadState = { totalBytes: 0, maxBytes: uncompressedLimit };
   if (requestedSource === "auto" || requestedSource === "claude") {
     const claudeArchive = await parseClaudeArchive(zip, archiveReadState);
     if (claudeArchive) return claudeArchive;
@@ -261,27 +264,27 @@ function extractReusableHelpers(item: UnknownRecord, source: "chatgpt" | "claude
 function normalizeRole(role: string): "user" | "assistant" | "system" | "tool" { const lower = role.toLowerCase(); if (lower.includes("assistant") || lower.includes("bot") || lower.includes("claude")) return "assistant"; if (lower.includes("system")) return "system"; if (lower.includes("tool")) return "tool"; return "user"; }
 function normalizeContent(value: unknown): string { if (typeof value === "string") return value; if (Array.isArray(value)) return value.map(normalizeContent).filter(Boolean).join("\n\n"); if (!isRecord(value)) return ""; if (value.type === "image" && typeof value.url === "string") return `![Imported image](${value.url})`; if (typeof value.language === "string" && typeof value.text === "string") return `\`\`\`${value.language}\n${value.text}\n\`\`\``; if (typeof value.text === "string") return value.text; if (typeof value.result === "string") return value.result; if (Array.isArray(value.parts)) return value.parts.map(normalizeContent).filter(Boolean).join("\n\n"); return ""; }
 function isSupportedArchiveEntry(name: string): boolean { const n = name.replaceAll("\\", "/").toLowerCase(); return n.endsWith("conversations.json") || n.endsWith("myactivity.json") || (n.includes("/design_chats/") && n.endsWith(".json")); }
-function validateZipEntryCount(bytes: Uint8Array): void {
+function validateZipEntryCount(bytes: Uint8Array, entryLimit: number): void {
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const minimumOffset = Math.max(0, buffer.length - 65_557);
   for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
     if (buffer.readUInt32LE(offset) !== 0x06054b50) continue;
     const entries = buffer.readUInt16LE(offset + 10);
-    if (entries === 0xffff || entries > archiveEntryLimit) throw new Error(`Import archive contains too many files (${entries === 0xffff ? "ZIP64" : entries}).`);
+    if (entries === 0xffff || entries > entryLimit) throw new Error(`Import archive contains too many files (${entries === 0xffff ? "ZIP64" : entries}).`);
     return;
   }
   throw new Error("Import archive is missing a valid end-of-central-directory record.");
 }
-function validateImportArchive(zip: JSZip): void {
+function validateImportArchive(zip: JSZip, entryLimit: number, uncompressedLimit: number): void {
   const allEntries = Object.values(zip.files);
-  if (allEntries.length > archiveEntryLimit) throw new Error(`Import archive contains too many files (${allEntries.length}).`);
+  if (allEntries.length > entryLimit) throw new Error(`Import archive contains too many files (${allEntries.length}).`);
   const entries = allEntries.filter((entry) => !entry.dir && isImportArchiveEntry(entry.name));
   let total = 0;
   for (const entry of entries) {
     const size = (entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
     if (typeof size !== "number") continue;
     total += size;
-    if (total > archiveUncompressedLimit) throw new Error("Import archive expands beyond the 256 MB safety limit.");
+    if (total > uncompressedLimit) throw new Error(`Import archive expands beyond the ${formatArchiveLimit(uncompressedLimit)} safety limit.`);
   }
 }
 function isImportArchiveEntry(name: string): boolean {
@@ -304,8 +307,8 @@ async function readArchiveEntryText(entry: JSZip.JSZipObject, state: ArchiveRead
       if (settled) return;
       entryBytes += chunk.byteLength;
       state.totalBytes += chunk.byteLength;
-      if (entryBytes > archiveUncompressedLimit) { fail(new Error(`Import archive entry ${entry.name} expands beyond the 256 MB safety limit.`)); return; }
-      if (state.totalBytes > archiveUncompressedLimit) { fail(new Error("Import archive expands beyond the 256 MB safety limit.")); return; }
+      if (entryBytes > state.maxBytes) { fail(new Error(`Import archive entry ${entry.name} expands beyond the ${formatArchiveLimit(state.maxBytes)} safety limit.`)); return; }
+      if (state.totalBytes > state.maxBytes) { fail(new Error(`Import archive expands beyond the ${formatArchiveLimit(state.maxBytes)} safety limit.`)); return; }
       chunks.push(chunk);
     });
     stream.on("error", (error: Error) => fail(error));
@@ -316,6 +319,7 @@ async function readArchiveEntryText(entry: JSZip.JSZipObject, state: ArchiveRead
     });
   });
 }
+function formatArchiveLimit(value: number): string { return value >= 1024 * 1024 ? `${Math.round(value / 1024 / 1024)} MB` : `${value} byte`; }
 function base64ToBytes(value: string): Uint8Array { return Uint8Array.from(Buffer.from(value, "base64")); }
 function asArray(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
 function asRecord(value: unknown): UnknownRecord { return isRecord(value) ? value : {}; }

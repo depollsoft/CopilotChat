@@ -426,6 +426,25 @@ test("composer retains successful files and discards each upload once", async ({
   await expect(page.locator(".attachment-tray")).toHaveCount(0);
 });
 
+test("composer retains staged uploads when message acceptance fails", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers composer submission failures.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "retry.txt", mimeType: "text/plain", buffer: Buffer.from("retry me") });
+  await composer.fill("Please retry this.");
+  await page.route("**/api/chats/*/messages", async (route) => {
+    if (route.request().method() === "POST") { await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Message rejected" }) }); return; }
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: "Send" }).click();
+
+  await expect(page.locator(".attachment-tray").filter({ hasText: "retry.txt" })).toBeVisible();
+  await expect(composer).toHaveValue("Please retry this.");
+  await expect(page.getByRole("alert")).toBeVisible();
+});
+
 test("composer shows slash command autocomplete with descriptions", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers slash command suggestions.");
   await page.goto("/");

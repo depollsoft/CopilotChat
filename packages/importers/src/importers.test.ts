@@ -58,4 +58,35 @@ describe("previewImport", () => {
     expect(preview.conversations[0]?.projectSourceId).toBe("project-1");
     expect(preview.conversations[0]?.metadata.inferredProject).toMatchObject({ name: "Payments" });
   });
+  it("rejects ZIP archives above the entry-count limit", async () => {
+    const zip = new JSZip();
+    zip.file("conversations.json", "[]");
+    zip.file("memories.json", "[]");
+    const bytes = await zip.generateAsync({ type: "uint8array" });
+
+    await expect(previewImportPayload("auto", "claude-export.zip", bytes, "base64", { archiveEntryLimit: 1 })).rejects.toThrow("too many files");
+  });
+  it("rejects ZIP archives above the aggregate expansion limit", async () => {
+    const zip = new JSZip();
+    zip.file("conversations.json", JSON.stringify([{ padding: "x".repeat(80) }]));
+    zip.file("memories.json", JSON.stringify([{ padding: "y".repeat(80) }]));
+    const bytes = await zip.generateAsync({ type: "uint8array" });
+
+    await expect(previewImportPayload("auto", "claude-export.zip", bytes, "base64", { archiveUncompressedLimit: 100 })).rejects.toThrow("expands beyond");
+  });
+  it("enforces the runtime expansion limit when ZIP metadata understates the size", async () => {
+    const zip = new JSZip();
+    zip.file("conversations.json", "x".repeat(1024));
+    const bytes = forgeCentralUncompressedSize(await zip.generateAsync({ type: "uint8array" }), 1);
+
+    await expect(previewImportPayload("auto", "claude-export.zip", bytes, "base64", { archiveUncompressedLimit: 64 })).rejects.toThrow("expands beyond");
+  });
 });
+
+function forgeCentralUncompressedSize(bytes: Uint8Array, size: number): Uint8Array {
+  const buffer = Buffer.from(bytes);
+  for (let offset = 0; offset <= buffer.length - 46; offset += 1) {
+    if (buffer.readUInt32LE(offset) === 0x02014b50) buffer.writeUInt32LE(size, offset + 24);
+  }
+  return Uint8Array.from(buffer);
+}

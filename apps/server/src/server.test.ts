@@ -463,6 +463,77 @@ describe("chat provider context", () => {
     }
   });
 
+  it("keeps import draft metadata when content deletion fails", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const draft = await draftStore.create("github:alice", { source: "auto", fileName: "alice.json", encoding: "text", content: "{}" });
+      const contentPath = path.join(draftDir, `${draft.id}.data`);
+      fs.rmSync(contentPath);
+      fs.mkdirSync(contentPath);
+      fs.writeFileSync(path.join(contentPath, "blocker"), "x");
+
+      await expect(draftStore.deleteOwner("github:alice")).rejects.toThrow();
+
+      expect(fs.existsSync(path.join(draftDir, `${draft.id}.json`))).toBe(true);
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("cleans orphaned import draft content files", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const draft = await draftStore.create("github:alice", { source: "auto", fileName: "alice.json", encoding: "text", content: "{}" });
+      fs.writeFileSync(path.join(draftDir, "orphan.data"), "orphan");
+      fs.writeFileSync(path.join(draftDir, "corrupt.json"), "{");
+      fs.writeFileSync(path.join(draftDir, "corrupt.data"), "recoverable");
+
+      await expect(draftStore.cleanupOrphans()).resolves.toBe(1);
+
+      expect(fs.existsSync(path.join(draftDir, `${draft.id}.data`))).toBe(true);
+      expect(fs.existsSync(path.join(draftDir, "orphan.data"))).toBe(false);
+      expect(fs.existsSync(path.join(draftDir, "corrupt.data"))).toBe(true);
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes import draft creation with orphan cleanup", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    let releaseCopy!: () => void;
+    let markCopyStarted!: () => void;
+    const copyBlocked = new Promise<void>((resolve) => { releaseCopy = resolve; });
+    const copyStarted = new Promise<void>((resolve) => { markCopyStarted = resolve; });
+    class BlockingUploadStore extends UploadedFileStore {
+      override async copyTo(ownerId: string, id: string, targetPath: string, claimId: string) {
+        markCopyStarted();
+        await copyBlocked;
+        return super.copyTo(ownerId, id, targetPath, claimId);
+      }
+    }
+    try {
+      const uploads = new BlockingUploadStore(uploadDir, 1024);
+      const uploaded = await uploads.create("github:alice", { fileName: "draft.json", mimeType: "application/json", size: 2 }, Readable.from(["{}"]));
+      const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
+      const draftStore = new ImportDraftStore(draftDir);
+      const creating = draftStore.createFromUpload("github:alice", "auto", uploads, uploaded.uploadId!, claimId!);
+      await copyStarted;
+      const cleaning = draftStore.cleanupOrphans();
+      releaseCopy();
+      const draft = await creating;
+
+      await expect(cleaning).resolves.toBe(0);
+      expect(fs.existsSync(path.join(draftDir, `${draft.id}.data`))).toBe(true);
+      await uploads.completeClaim("github:alice", claimId!);
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
   it("stores uploaded import contents outside draft metadata", async () => {
     const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
     const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));

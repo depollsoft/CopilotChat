@@ -5,6 +5,7 @@ import { titleFromContent } from "@copilotchat/shared";
 import type { ActiveResponseInputRequest, Chat, ChatMessage, PermissionMode, SendMessageRequest } from "@copilotchat/shared";
 import type { FastifyReply } from "fastify";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
+import { forgetValidatedAttachmentFiles } from "./attachment-files.js";
 import type { AppDatabase } from "./db.js";
 
 type StreamListener = {
@@ -484,6 +485,7 @@ export class ActiveChatResponse {
   async cleanupTemporaryFiles(): Promise<void> {
     const filePaths = [...this.temporaryFiles];
     this.temporaryFiles.clear();
+    forgetValidatedAttachmentFiles(filePaths);
     const errors: unknown[] = [];
     for (const filePath of filePaths) {
       try {
