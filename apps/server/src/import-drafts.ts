@@ -23,7 +23,7 @@ export class ImportDraftStore {
   }
 
   private async createUnlocked(ownerId: string, input: ImportPreviewRequest): Promise<ImportDraft> {
-    if (Buffer.byteLength(input.content) > this.maxImportBytes) throw new Error(`Import exceeds the ${formatBytes(this.maxImportBytes)} limit.`);
+    assertImportPayloadSize(input, this.maxImportBytes);
     await fs.mkdir(this.rootDir, { recursive: true });
     const id = randomUUID();
     const draft: StoredImportDraft = { source: input.source, fileName: input.fileName, encoding: input.encoding, id, ownerId, createdAt: new Date().toISOString(), assignments: [], contentFile: `${id}.data`, contentStorage: "text" };
@@ -57,7 +57,7 @@ export class ImportDraftStore {
       await fs.writeFile(this.pathFor(draft.id), JSON.stringify(draft), { encoding: "utf8", flag: "wx" });
       return publicDraft(draft);
     } catch (error) {
-      await fs.rm(this.contentPathFor(draft), { force: true });
+      await Promise.all([fs.rm(this.contentPathFor(draft), { force: true }), fs.rm(this.pathFor(draft.id), { force: true })]);
       throw error;
     } finally {
       this.activeContentFiles.delete(draft.contentFile!);
@@ -165,6 +165,12 @@ export class ImportDraftStore {
     if (!draft.contentFile || path.basename(draft.contentFile) !== draft.contentFile) throw new Error("Invalid import draft content path.");
     return path.join(this.rootDir, draft.contentFile);
   }
+}
+
+export function assertImportPayloadSize(input: Pick<ImportPreviewRequest, "content" | "encoding" | "fileName">, maxImportBytes: number): void {
+  if (input.encoding === "base64" && !input.fileName.toLowerCase().endsWith(".zip")) throw new Error("Non-ZIP imports must use text encoding.");
+  const size = input.encoding === "base64" ? Buffer.from(input.content, "base64").byteLength : Buffer.byteLength(input.content);
+  if (size > maxImportBytes) throw new Error(`Import exceeds the ${formatBytes(maxImportBytes)} limit.`);
 }
 
 function publicDraft(draft: StoredImportDraft): ImportDraft {

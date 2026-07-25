@@ -14,12 +14,12 @@ import Fastify from "fastify";
 import type { FastifyRequest } from "fastify";
 import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
-import { chatAttachmentDirectory, forgetValidatedAttachmentFiles, forgetValidatedAttachmentTree, isChatAttachmentDirectory, materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
+import { chatAttachmentDirectory, forgetValidatedAttachmentFiles, forgetValidatedAttachmentTree, isChatAttachmentDirectory, materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { applyChatTurnScope, buildProviderChatRequest, chatWorkingDirectory } from "./chat-context.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
-import { ImportDraftStore } from "./import-drafts.js";
+import { assertImportPayloadSize, ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { ProviderStatusCache } from "./provider-status-cache.js";
 import { ActiveChatResponses } from "./responses.js";
@@ -37,6 +37,7 @@ const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-draf
 const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes, config.stagedUploadLimitBytes, config.stagedUploadLimitFiles);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
 await importDrafts.cleanupOrphans();
+await reconcileAttachmentFiles({ db, isolatedWorkspaceRoot });
 const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
 const app = Fastify({ logger: true, bodyLimit: config.bodyLimitBytes });
@@ -89,16 +90,25 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: InternalS
   await relocateChatAttachments({ db, ownerId, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing; removing its file reference.") });
   const materialized = await materializeMessageAttachments({ uploads: uploadedFiles, ownerId, chatId: chat.id, workspaceDir, maxBytes: config.uploadLimitBytes, uploadClaimId: input.uploadClaimId, attachments: input.attachments });
   const attachments = materialized.attachments;
-  if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
-  const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
-  if ((!existingUserMessage && attachments.length > 0) || (existingUserMessage && input.attachments !== undefined)) db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
-  if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
-  const titleRequired = !chat.titleManuallySet && db.listMessages(chat.id).filter((message) => message.role === "user").length <= 1;
-  const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
-  attachImportGuidance(ownerId, input, providerRequest);
-  providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
-  await completeUploadClaim(ownerId, input.uploadClaimId);
-  return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
+  let filesPersisted = materialized.createdFilePaths.length === 0;
+  try {
+    if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
+    const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
+    if ((!existingUserMessage && attachments.length > 0) || (existingUserMessage && input.attachments !== undefined)) {
+      db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
+      filesPersisted = true;
+    }
+    if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
+    const titleRequired = !chat.titleManuallySet && db.listMessages(chat.id).filter((message) => message.role === "user").length <= 1;
+    const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
+    attachImportGuidance(ownerId, input, providerRequest);
+    providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
+    await completeUploadClaim(ownerId, input.uploadClaimId);
+    return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
+  } catch (error) {
+    if (!filesPersisted) await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
+    throw error;
+  }
 }
 app.get(`${apiPrefix}/health`, async () => ({ ok: true, name: "CopilotChat", time: new Date().toISOString() }));
 app.get(`${apiPrefix}/auth/status`, async (request) => { const owner = ownerForOptional(request); const storedOAuth = Boolean(owner && db.hasGitHubAuth(owner.id)); const configuredToken = config.authMode === "local" && Boolean(config.copilotGitHubToken); return { mode: config.authMode, owner, authenticated: Boolean(owner), githubOAuthConfigured: Boolean(config.githubClientId && config.githubClientSecret), githubAuthenticated: storedOAuth || configuredToken, workspaceDirectory: config.authMode === "github" && owner ? ownerWorkspaceDirectory(owner.id) : null, apiTokenRequired: config.authMode === "local" && Boolean(config.apiToken), copilotTokenSource: storedOAuth ? "github-oauth" : configuredToken ? config.copilotGitHubTokenSource ?? null : null, copilotCliPath: config.copilotSdkCliPath ?? null }; });
@@ -213,7 +223,14 @@ app.post(`${apiPrefix}/chats/:chatId/active-response/input`, async (request) => 
     throw new Error("Message requires text or an attachment.");
   }
   const resolvedInput = { ...claimedInput, attachments };
-  const steerResult = await activeResponses.steer(params.chatId, resolvedInput, { temporaryFiles: materialized.createdFilePaths, cleanup: uploadClaimCleanup(owner.id, claimedInput.uploadClaimId) });
+  let steerResult: Awaited<ReturnType<typeof activeResponses.steer>>;
+  try {
+    steerResult = await activeResponses.steer(params.chatId, resolvedInput, { temporaryFiles: materialized.createdFilePaths, cleanup: uploadClaimCleanup(owner.id, claimedInput.uploadClaimId) });
+  } catch (error) {
+    await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
+    abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
+    throw error;
+  }
   if (!steerResult) {
     await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
     abandonUploadClaim(owner.id, claimedInput.uploadClaimId);
@@ -306,8 +323,8 @@ app.post(`${apiPrefix}/imports/drafts`, async (request) => {
     throw error;
   }
 });
-app.post(`${apiPrefix}/imports/preview`, async (request) => { const input = importPreviewRequestSchema.parse(request.body); return slimImportPreview(await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
-app.post(`${apiPrefix}/imports/apply`, async (request) => { const owner = ownerFor(request); const input = importPreviewRequestSchema.parse(request.body); return applyImportPreview(db, owner.id, await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
+app.post(`${apiPrefix}/imports/preview`, async (request) => { const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return slimImportPreview(await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
+app.post(`${apiPrefix}/imports/apply`, async (request) => { const owner = ownerFor(request); const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return applyImportPreview(db, owner.id, await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
 const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web/dist");
 if (fs.existsSync(webDist)) { await app.register(fastifyStatic, { root: webDist, prefix: "/", wildcard: false }); app.setNotFoundHandler((request, reply) => { if (request.raw.url?.startsWith(apiPrefix)) { reply.code(404).send({ error: "Not found" }); return; } reply.sendFile("index.html"); }); }
 await app.listen({ host: config.host, port: config.port });

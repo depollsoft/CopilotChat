@@ -23,7 +23,10 @@ export function previewImport(requestedSource: ImportSource, fileName: string, c
 }
 
 export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string | Uint8Array, encoding: "text" | "base64" = "text", limits: ImportPayloadLimits = {}): Promise<ImportPreview> {
-  if (!fileName.toLowerCase().endsWith(".zip")) return previewImport(requestedSource, fileName, typeof content === "string" ? content : new TextDecoder().decode(content));
+  if (!fileName.toLowerCase().endsWith(".zip")) {
+    if (encoding !== "text") throw new Error("Non-ZIP imports must use text encoding.");
+    return previewImport(requestedSource, fileName, typeof content === "string" ? content : new TextDecoder().decode(content));
+  }
   if (encoding !== "base64") throw new Error("ZIP imports must be uploaded as base64 payloads.");
   const entryLimit = limits.archiveEntryLimit ?? archiveEntryLimit;
   const uncompressedLimit = limits.archiveUncompressedLimit ?? archiveUncompressedLimit;
@@ -269,7 +272,15 @@ function validateZipEntryCount(bytes: Uint8Array, entryLimit: number): void {
   const minimumOffset = Math.max(0, buffer.length - 65_557);
   for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
     if (buffer.readUInt32LE(offset) !== 0x06054b50) continue;
+    const commentLength = buffer.readUInt16LE(offset + 20);
+    if (offset + 22 + commentLength !== buffer.length) continue;
+    const diskNumber = buffer.readUInt16LE(offset + 4);
+    const centralDirectoryDisk = buffer.readUInt16LE(offset + 6);
+    const entriesOnDisk = buffer.readUInt16LE(offset + 8);
     const entries = buffer.readUInt16LE(offset + 10);
+    const centralDirectorySize = buffer.readUInt32LE(offset + 12);
+    const centralDirectoryOffset = buffer.readUInt32LE(offset + 16);
+    if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== entries || centralDirectoryOffset + centralDirectorySize !== offset) continue;
     if (entries === 0xffff || entries > entryLimit) throw new Error(`Import archive contains too many files (${entries === 0xffff ? "ZIP64" : entries}).`);
     return;
   }

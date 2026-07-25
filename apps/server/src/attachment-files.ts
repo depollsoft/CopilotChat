@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
-import type { Stats } from "node:fs";
+import type { Dirent, Stats } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { MessageAttachment } from "@copilotchat/shared";
@@ -126,6 +126,24 @@ export function forgetValidatedAttachmentTree(rootPath: string): void {
   for (const filePath of validatedFiles.keys()) if (isPathInside(rootPath, filePath)) validatedFiles.delete(filePath);
 }
 
+export async function reconcileAttachmentFiles(input: { db: AppDatabase; isolatedWorkspaceRoot: string }): Promise<number> {
+  const referenced = new Set(input.db.listAllAttachmentFilePaths().map((filePath) => path.resolve(filePath)));
+  let deleted = 0;
+  for (const workspaceRoot of input.db.listAllWorkspaceRoots()) deleted += await cleanManagedUploadRoot(path.join(workspaceRoot, attachmentDirectoryName), referenced);
+  let isolatedWorkspaces: Dirent[];
+  try {
+    isolatedWorkspaces = await fs.readdir(input.isolatedWorkspaceRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return deleted;
+    throw error;
+  }
+  for (const workspace of isolatedWorkspaces) {
+    if (!workspace.isDirectory() || workspace.isSymbolicLink()) continue;
+    deleted += await cleanManagedUploadRoot(path.join(input.isolatedWorkspaceRoot, workspace.name, attachmentDirectoryName), referenced);
+  }
+  return deleted;
+}
+
 async function prepareAttachmentDirectory(workspaceDir: string, directory: string): Promise<void> {
   const root = path.resolve(workspaceDir);
   const copilotChatDir = path.join(root, ".copilotchat");
@@ -136,6 +154,33 @@ async function prepareAttachmentDirectory(workspaceDir: string, directory: strin
   await fs.mkdir(directory, { recursive: true });
   const [rootRealPath, directoryRealPath] = await Promise.all([fs.realpath(root), fs.realpath(directory)]);
   if (!isPathInside(rootRealPath, directoryRealPath)) throw new Error("Attachment directory must stay inside the active workspace.");
+}
+
+async function cleanManagedUploadRoot(uploadRoot: string, referenced: Set<string>): Promise<number> {
+  let rootStat;
+  try {
+    rootStat = await fs.lstat(uploadRoot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return 0;
+  let deleted = 0;
+  for (const chatDirectory of await fs.readdir(uploadRoot, { withFileTypes: true })) {
+    if (!chatDirectory.isDirectory() || chatDirectory.isSymbolicLink()) continue;
+    const directory = path.join(uploadRoot, chatDirectory.name);
+    for (const file of await fs.readdir(directory, { withFileTypes: true })) {
+      if (!file.isFile() || file.isSymbolicLink()) continue;
+      const filePath = path.join(directory, file.name);
+      if (referenced.has(path.resolve(filePath))) continue;
+      forgetValidatedAttachmentFiles([filePath]);
+      await fs.rm(filePath, { force: true });
+      deleted += 1;
+    }
+    await fs.rmdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+  }
+  await fs.rmdir(uploadRoot).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+  return deleted;
 }
 
 async function validateExistingAttachment(directory: string, attachment: MessageAttachment): Promise<MessageAttachment> {

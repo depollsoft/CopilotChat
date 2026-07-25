@@ -840,6 +840,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   function openNestedPicker(next: ComposerPicker): void { setOpenPicker(next); }
   function updateValue(next: string): void { setValue(next); }
   function clearValue(): void { setValue(""); setAttachments([]); setAttachmentError(null); p.onDraftPreviewChange(""); }
+  async function discardValue(): Promise<void> { const discarded = attachments; clearValue(); const results = await Promise.allSettled(discarded.map(p.onDiscardAttachment)); const failed = results.filter((result) => result.status === "rejected"); if (failed.length > 0) setAttachmentError(`${failed.length} attachment${failed.length === 1 ? "" : "s"} could not be discarded.`); }
   async function addFiles(files: FileList | File[]): Promise<void> {
     setAttachmentError(null);
     const nextFiles = [...files];
@@ -863,7 +864,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
       if (e.key === "ArrowDown") { e.preventDefault(); setSlashIndex((index) => (index + 1) % slashMatches.length); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setSlashIndex((index) => (index - 1 + slashMatches.length) % slashMatches.length); return; }
       if (e.key === "Tab" || submitOnEnter) { e.preventDefault(); const command = slashMatches[slashIndex]; if (command) chooseSlash(command); return; }
-      if (e.key === "Escape") { e.preventDefault(); clearValue(); return; }
+      if (e.key === "Escape") { e.preventDefault(); void discardValue(); return; }
     }
     if (submitOnEnter) { e.preventDefault(); void submitMessage(); }
   }

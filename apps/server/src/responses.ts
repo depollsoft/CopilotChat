@@ -203,6 +203,7 @@ export class ActiveChatResponse {
   readonly listeners = new Set<StreamListener>();
   private readonly temporaryFiles = new Set<string>();
   private readonly cleanupTasks = new Map<string, () => Promise<void>>();
+  private readonly inFlightSteers = new Set<Promise<void>>();
   private finalizing = false;
   assistantContent = "";
   activities: AssistantActivity[] = [];
@@ -282,7 +283,22 @@ export class ActiveChatResponse {
     if (!this.trackResources(resources)) return null;
     const turn = this.createPendingTurn("steer", request.content, "sent");
     this.pendingTurns = [...this.pendingTurns, turn];
-    await steerHandler(providerMessageForActiveInput(request));
+    const delivery = (async () => {
+      try {
+        await steerHandler(providerMessageForActiveInput(request));
+      } catch (error) {
+        this.pendingTurns = this.pendingTurns.filter((pending) => pending.id !== turn.id);
+        this.untrackResources(resources);
+        this.emitPendingTurns();
+        throw error;
+      }
+    })();
+    this.inFlightSteers.add(delivery);
+    try {
+      await delivery;
+    } finally {
+      this.inFlightSteers.delete(delivery);
+    }
     this.emitPendingTurns();
     return { turn, delivered: true };
   }
@@ -476,6 +492,11 @@ export class ActiveChatResponse {
     return true;
   }
 
+  untrackResources(resources?: ResponseResources): void {
+    if (resources?.cleanup) this.cleanupTasks.delete(resources.cleanup.id);
+    if (resources?.temporaryFiles) for (const filePath of resources.temporaryFiles) this.temporaryFiles.delete(filePath);
+  }
+
   trackTemporaryFiles(filePaths: string[]): boolean {
     if (this.finalizing) return false;
     for (const filePath of filePaths) this.temporaryFiles.add(filePath);
@@ -500,6 +521,7 @@ export class ActiveChatResponse {
 
   async cleanupResources(): Promise<void> {
     this.finalizing = true;
+    await Promise.allSettled([...this.inFlightSteers]);
     const errors: unknown[] = [];
     try {
       await this.cleanupTemporaryFiles();

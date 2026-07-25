@@ -182,7 +182,7 @@ export class UploadedFileStore {
     for (const entry of entries) {
       if (!entry.endsWith(".json")) continue;
       const id = path.basename(entry, ".json");
-      if (this.claimsByUpload.has(id) || this.deletingUploads.has(id)) continue;
+      if (this.activeUploadIds.has(id) || this.claimsByUpload.has(id) || this.deletingUploads.has(id)) continue;
       this.deletingUploads.add(id);
       try {
         if (this.claimsByUpload.has(id)) continue;

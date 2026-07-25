@@ -66,6 +66,14 @@ describe("previewImport", () => {
 
     await expect(previewImportPayload("auto", "claude-export.zip", bytes, "base64", { archiveEntryLimit: 1 })).rejects.toThrow("too many files");
   });
+  it("ignores EOCD signatures embedded in ZIP comments", async () => {
+    const zip = new JSZip();
+    zip.file("conversations.json", "[]");
+    zip.file("memories.json", "[]");
+    const bytes = forgeEocdInComment(await zip.generateAsync({ type: "uint8array", comment: "\0".repeat(22) }), 1);
+
+    await expect(previewImportPayload("auto", "claude-export.zip", bytes, "base64", { archiveEntryLimit: 1 })).rejects.toThrow("too many files");
+  });
   it("rejects ZIP archives above the aggregate expansion limit", async () => {
     const zip = new JSZip();
     zip.file("conversations.json", JSON.stringify([{ padding: "x".repeat(80) }]));
@@ -88,5 +96,15 @@ function forgeCentralUncompressedSize(bytes: Uint8Array, size: number): Uint8Arr
   for (let offset = 0; offset <= buffer.length - 46; offset += 1) {
     if (buffer.readUInt32LE(offset) === 0x02014b50) buffer.writeUInt32LE(size, offset + 24);
   }
+  return Uint8Array.from(buffer);
+}
+
+function forgeEocdInComment(bytes: Uint8Array, entries: number): Uint8Array {
+  const buffer = Buffer.from(bytes);
+  const offset = buffer.length - 22;
+  buffer.writeUInt32LE(0x06054b50, offset);
+  buffer.writeUInt16LE(entries, offset + 8);
+  buffer.writeUInt16LE(entries, offset + 10);
+  buffer.writeUInt16LE(0, offset + 20);
   return Uint8Array.from(buffer);
 }

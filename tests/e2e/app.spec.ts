@@ -487,6 +487,24 @@ test("composer retains staged uploads when message acceptance fails", async ({ p
   await expect(page.getByRole("alert")).toBeVisible();
 });
 
+test("Escape discards staged composer uploads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers slash-menu resets.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "escape.txt", mimeType: "text/plain", buffer: Buffer.from("discard me") });
+  let deleteCount = 0;
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await composer.fill("/");
+  await expect(page.getByRole("listbox", { name: "Slash commands" })).toBeVisible();
+
+  await composer.press("Escape");
+
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
+  await expect(composer).toHaveValue("");
+  await expect.poll(() => deleteCount).toBe(1);
+});
+
 test("composer shows slash command autocomplete with descriptions", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers slash command suggestions.");
   await page.goto("/");

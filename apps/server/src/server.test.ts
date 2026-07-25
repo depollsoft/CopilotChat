@@ -6,13 +6,13 @@ import type { CopilotProvider } from "@copilotchat/provider";
 import type { ImportPreview, MessageAttachment } from "@copilotchat/shared";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { materializeMessageAttachments, relocateChatAttachments } from "./attachment-files.js";
+import { materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
-import { ImportDraftStore } from "./import-drafts.js";
+import { assertImportPayloadSize, ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
@@ -213,6 +213,30 @@ describe("chat provider context", () => {
       fs.rmSync(uploadDir, { recursive: true, force: true });
       fs.rmSync(workspaceRoot, { recursive: true, force: true });
       fs.rmSync(nextWorkspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("removes unreferenced workspace attachment files on reconciliation", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Reconcile attachments", projectId: null, workspaceId: null });
+    const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-isolated-"));
+    try {
+      const directory = path.join(isolatedRoot, chat.id, ".copilotchat", "uploads", chat.id);
+      fs.mkdirSync(directory, { recursive: true });
+      const referencedPath = path.join(directory, "referenced.txt");
+      const orphanPath = path.join(directory, "orphan.txt");
+      fs.writeFileSync(referencedPath, "keep");
+      fs.writeFileSync(orphanPath, "remove");
+      const message = db.addMessage({ chatId: chat.id, role: "user", content: "Keep attachment" });
+      db.replaceMessageAttachments(owner.id, chat.id, message.id, [{ id: "referenced", name: "referenced.txt", mimeType: "text/plain", size: 4, filePath: referencedPath }]);
+
+      await expect(reconcileAttachmentFiles({ db, isolatedWorkspaceRoot: isolatedRoot })).resolves.toBe(1);
+
+      expect(fs.existsSync(referencedPath)).toBe(true);
+      expect(fs.existsSync(orphanPath)).toBe(false);
+    } finally {
+      fs.rmSync(isolatedRoot, { recursive: true, force: true });
     }
   });
 
@@ -677,6 +701,39 @@ describe("chat provider context", () => {
     expect(response.trackTemporaryFiles(["/tmp/late.txt"])).toBe(false);
   });
 
+  it("rolls back pending resources when immediate steering fails", async () => {
+    const response = new ActiveChatResponse("chat-1");
+    const unregister = response.decorateProviderRequest({ messages: [], model: "gpt-test" }).controls!.onSteer(async () => { throw new Error("session closed"); });
+    let cleaned = false;
+
+    await expect(response.steer({ mode: "steer", content: "Use this" }, { cleanup: { id: "claim", run: async () => { cleaned = true; } }, temporaryFiles: ["/tmp/steer.txt"] })).rejects.toThrow("session closed");
+
+    expect(response.pendingTurns).toEqual([]);
+    await response.cleanupResources();
+    expect(cleaned).toBe(false);
+    unregister();
+  });
+
+  it("waits for failed in-flight steering before final resource cleanup", async () => {
+    const response = new ActiveChatResponse("chat-1");
+    let rejectSteer!: (error: Error) => void;
+    let markSteerStarted!: () => void;
+    const steerStarted = new Promise<void>((resolve) => { markSteerStarted = resolve; });
+    const steerBlocked = new Promise<void>((_resolve, reject) => { rejectSteer = reject; });
+    const unregister = response.decorateProviderRequest({ messages: [], model: "gpt-test" }).controls!.onSteer(async () => { markSteerStarted(); await steerBlocked; });
+    let cleaned = false;
+    const steering = response.steer({ mode: "steer", content: "Use this" }, { cleanup: { id: "claim", run: async () => { cleaned = true; } } }).catch((error: unknown) => error);
+    await steerStarted;
+    const cleaning = response.cleanupResources();
+
+    rejectSteer(new Error("session closed"));
+    await expect(steering).resolves.toBeInstanceOf(Error);
+    await cleaning;
+
+    expect(cleaned).toBe(false);
+    unregister();
+  });
+
   it("removes staged bytes when an accepted queued upload is abandoned", async () => {
     const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
     try {
@@ -737,6 +794,9 @@ describe("chat provider context", () => {
     try {
       const draftStore = new ImportDraftStore(draftDir, 4);
       await expect(draftStore.create("github:alice", { source: "auto", fileName: "large.json", encoding: "text", content: "12345" })).rejects.toThrow("limit");
+      expect(() => assertImportPayloadSize({ fileName: "export.zip", encoding: "base64", content: Buffer.from("12345").toString("base64") }, 4)).toThrow("limit");
+      expect(() => assertImportPayloadSize({ fileName: "export.zip", encoding: "base64", content: Buffer.from("1234").toString("base64") }, 4)).not.toThrow();
+      expect(() => assertImportPayloadSize({ fileName: "large.json", encoding: "base64", content: " \n[]".repeat(100) }, 4)).toThrow("text encoding");
       const uploads = new UploadedFileStore(uploadDir, 1024);
       const uploaded = await uploads.create("github:alice", { fileName: "large.json", mimeType: "application/json", size: 5 }, Readable.from(["12345"]));
       const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
