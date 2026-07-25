@@ -384,7 +384,8 @@ test("personal context and coarse location are included in chats", async ({ page
   await page.locator(".sidebar-new").click();
   await page.getByPlaceholder(/Ask CopilotChat/).fill("Check deleted personal context.");
   await page.getByRole("button", { name: "Send" }).click();
-  response = page.locator(".msg.assistant .msg-body").last();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check deleted personal context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
   await expect(response).not.toContainText("Updated response style");
 });
 

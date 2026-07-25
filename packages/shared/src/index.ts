@@ -87,6 +87,46 @@ export const memorySchema = z.object({
   updatedAt: z.string(),
 });
 export type Memory = z.infer<typeof memorySchema>;
+export const memoryContextCharacterBudget = 16_000;
+const memoryContextNoticeReserve = 220;
+const memoryTruncationNotice = "\n[Memory truncated to fit the context budget.]";
+
+export function formatMemoryContext(heading: string, memories: Memory[]): string {
+  if (memories.length === 0) return "";
+  const ordered = [...memories].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+  const blocks: string[] = [];
+  const contentLimit = memoryContextCharacterBudget - memoryContextNoticeReserve;
+  let used = heading.length;
+  let omitted = 0;
+  let truncated = 0;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const memory = ordered[index]!;
+    const prefix = `## ${memory.title}\n`;
+    const separatorLength = 2;
+    const available = contentLimit - used - separatorLength;
+    const block = `${prefix}${memory.content}`;
+    if (block.length <= available) {
+      blocks.push(block);
+      used += separatorLength + block.length;
+      continue;
+    }
+    const contentLength = available - prefix.length - memoryTruncationNotice.length;
+    if (contentLength > 0) {
+      blocks.push(`${prefix}${memory.content.slice(0, contentLength)}${memoryTruncationNotice}`);
+      truncated = 1;
+      omitted = ordered.length - index - 1;
+    } else {
+      omitted = ordered.length - index;
+    }
+    break;
+  }
+  const limitations = [
+    truncated ? "1 memory truncated" : "",
+    omitted ? `${omitted} ${omitted === 1 ? "memory" : "memories"} omitted` : "",
+  ].filter(Boolean);
+  const notice = limitations.length > 0 ? `[Memory context limited to ${memoryContextCharacterBudget} characters; ${limitations.join("; ")}.]` : "";
+  return [heading, ...blocks, notice].filter(Boolean).join("\n\n");
+}
 
 export const chatSchema = z.object({
   id: z.string(),
