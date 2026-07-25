@@ -2,6 +2,8 @@
 
 CopilotChat is a local-first, installable web app for using GitHub Copilot in a ChatGPT/Claude-style interface. It runs on your machine, can be installed as a PWA, and supports chats, projects, skills, MCP servers, cowork/workspace mode, artifacts, imports, notifications, Docker, and CI.
 
+When Copilot reports billing usage for a request, the chat header shows the AI credits (AIC) spent so far in that conversation and updates live while a response runs. Each assistant message also shows what it cost. Providers that do not report credit usage simply omit the readout.
+
 ## Quick start
 
 ```bash

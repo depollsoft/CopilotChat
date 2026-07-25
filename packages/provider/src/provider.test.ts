@@ -3,7 +3,7 @@ import { CopilotClient } from "@github/copilot-sdk";
 import type { ModelInfo } from "@github/copilot-sdk";
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo, summarizeSdkFailureMessage } from "./index.js";
+import { createCopilotProvider, mapSdkModelInfo, readSdkUsageNanoAiu, summarizeSdkFailureMessage } from "./index.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -233,8 +233,28 @@ describe("createCopilotProvider", () => {
     expect(events).toContainEqual({ type: "subagent-delta", id: "echo-subagent", text: "Found shared project context and recent chat references." });
     expect(events).toContainEqual({ type: "subagent-complete", id: "echo-subagent", name: "research-helper", displayName: "Research helper", durationMs: 42, model: "gpt-test", totalTokens: 128, totalToolCalls: 1 });
   });
-  it("skips malformed HTTP provider stream chunks without aborting", async () => {
-    const server = http.createServer((request, response) => {
+  it("reads per-request AI credit cost from SDK assistant usage events", () => {
+    expect(readSdkUsageNanoAiu({ model: "gpt-test", copilotUsage: { totalNanoAiu: 42_000_000 } })).toBe(42_000_000);
+    expect(readSdkUsageNanoAiu({ model: "gpt-test", copilotUsage: { totalNanoAiu: 0 } })).toBeNull();
+    expect(readSdkUsageNanoAiu({ model: "gpt-test", inputTokens: 10 })).toBeNull();
+    expect(readSdkUsageNanoAiu(null)).toBeNull();
+  });
+  it("reports AI credit usage from the development provider", async () => {
+    const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test" }));
+    const usage = events.filter((event) => event.type === "usage");
+
+    expect(usage.length).toBeGreaterThan(1);
+    expect(usage.every((event) => event.nanoAiu > 0)).toBe(true);
+  });
+  it("never reports AI credit usage when the development provider is only an SDK fallback", async () => {
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test", sdkCliPath: "/nonexistent/copilot-binary" });
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test" }));
+
+    expect(events.filter((event) => event.type === "delta").map((event) => event.text).join("")).toContain("Copilot SDK was unavailable");
+    expect(events.filter((event) => event.type === "usage")).toEqual([]);
+  }, 20_000);
+  it("skips malformed HTTP provider stream chunks without aborting", async () => {    const server = http.createServer((request, response) => {
       if (request.url === "/chat/completions") {
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         response.end("data: {not-json}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n");
