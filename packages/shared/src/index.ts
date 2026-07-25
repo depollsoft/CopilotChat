@@ -88,16 +88,17 @@ export const memorySchema = z.object({
 });
 export type Memory = z.infer<typeof memorySchema>;
 export const memoryContextCharacterBudget = 16_000;
+export const memoryContextEntryBudget = 100;
 const memoryContextNoticeReserve = 220;
 const memoryTruncationNotice = "\n[Memory truncated to fit the context budget.]";
 
-export function formatMemoryContext(heading: string, memories: Memory[]): string {
+export function formatMemoryContext(heading: string, memories: Memory[], totalMemoryCount = memories.length): string {
   if (memories.length === 0) return "";
-  const ordered = [...memories].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id));
+  const ordered = [...memories].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id)).slice(0, memoryContextEntryBudget);
   const blocks: string[] = [];
   const contentLimit = memoryContextCharacterBudget - memoryContextNoticeReserve;
   let used = heading.length;
-  let omitted = 0;
+  let omitted = Math.max(0, totalMemoryCount - ordered.length);
   let truncated = 0;
   for (let index = 0; index < ordered.length; index += 1) {
     const memory = ordered[index]!;
@@ -114,9 +115,9 @@ export function formatMemoryContext(heading: string, memories: Memory[]): string
     if (contentLength > 0) {
       blocks.push(`${prefix}${memory.content.slice(0, contentLength)}${memoryTruncationNotice}`);
       truncated = 1;
-      omitted = ordered.length - index - 1;
+      omitted += ordered.length - index - 1;
     } else {
-      omitted = ordered.length - index;
+      omitted += ordered.length - index;
     }
     break;
   }
@@ -127,6 +128,13 @@ export function formatMemoryContext(heading: string, memories: Memory[]): string
   const notice = limitations.length > 0 ? `[Memory context limited to ${memoryContextCharacterBudget} characters; ${limitations.join("; ")}.]` : "";
   return [heading, ...blocks, notice].filter(Boolean).join("\n\n");
 }
+
+export const memoryScopeStatsSchema = z.object({ total: z.number().int().nonnegative(), enabled: z.number().int().nonnegative(), contextLength: z.number().int().nonnegative() });
+export type MemoryScopeStats = z.infer<typeof memoryScopeStatsSchema>;
+export const memoryStatsSchema = z.object({ user: memoryScopeStatsSchema, projects: z.record(z.string(), memoryScopeStatsSchema) });
+export type MemoryStats = z.infer<typeof memoryStatsSchema>;
+export const memoryPageSchema = z.object({ items: z.array(memorySchema), total: z.number().int().nonnegative(), nextOffset: z.number().int().nonnegative().nullable() });
+export type MemoryPage = z.infer<typeof memoryPageSchema>;
 
 export const chatSchema = z.object({
   id: z.string(),
@@ -142,6 +150,7 @@ export const chatSchema = z.object({
   titleManuallySet: z.boolean().default(false),
   archived: z.boolean(),
   favorite: z.boolean().default(false),
+  totalNanoAiu: z.number().nonnegative().default(0),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -271,7 +280,7 @@ export type ProviderModel = z.infer<typeof providerModelSchema>;
 export const providerStatusSchema = z.object({ id: z.string(), label: z.string(), available: z.boolean(), details: z.string(), capabilities: z.array(z.string()).default([]), models: z.array(providerModelSchema).default([]), modelsAuthoritative: z.boolean().default(false), defaultModel: z.string().optional() });
 export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 
-export const appStateSchema = z.object({ owner: ownerSchema, authMode: z.enum(["local", "github"]).default("local"), userContext: userContextSchema, memories: z.array(memorySchema), projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
+export const appStateSchema = z.object({ owner: ownerSchema, authMode: z.enum(["local", "github"]).default("local"), userContext: userContextSchema, memoryStats: memoryStatsSchema, projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
 export type AppState = z.infer<typeof appStateSchema>;
 
 export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
@@ -346,4 +355,16 @@ export function titleFromContent(content: string): string {
   const compact = content.replace(/\s+/g, " ").trim();
   if (!compact) return "New chat";
   return compact.split(" ").slice(0, 6).join(" ");
+}
+
+export const nanoAiuPerAic = 1_000_000_000;
+
+/** Formats nano-AI units as AI credits (AIC) using the same thresholds as the Copilot CLI footer. */
+export function formatAic(nanoAiu: number): string {
+  const credits = nanoAiu / nanoAiuPerAic;
+  if (!Number.isFinite(credits) || credits <= 0) return "0";
+  if (credits >= 100) return Math.round(credits).toString();
+  if (credits >= 10) return credits.toFixed(1).replace(/\.0$/, "");
+  if (credits < 0.01) return "<0.01";
+  return credits.toFixed(2).replace(/\.?0+$/, "");
 }

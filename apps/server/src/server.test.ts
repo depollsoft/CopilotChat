@@ -186,7 +186,7 @@ describe("chat provider context", () => {
 
     expect(db.getChat(owner.id, generalChat.id)).toMatchObject({ providerSessionId: null, updatedAt: generalBeforeProfile });
     expect(db.getChat(owner.id, projectChat.id)).toMatchObject({ providerSessionId: null, updatedAt: projectBeforeProfile });
-    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }).memories).toHaveLength(1);
+    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }).memoryStats.projects[project.id]).toMatchObject({ total: 1, enabled: 1 });
   });
 
   it("invalidates surviving chat sessions before deleting their project memories", () => {
@@ -417,6 +417,26 @@ describe("chat provider context", () => {
     expect(db.getArtifact(owner.id, artifact.id).content).toBe(content);
   });
 
+  it("keeps memory content out of app state and pages it on demand", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const content = "sensitive memory ".repeat(1000);
+    for (let index = 0; index < 3; index += 1) db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}:${content}`, enabled: index !== 1 });
+
+    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    const firstPage = db.listMemoriesPage(owner.id, null, 0, 2);
+    const secondPage = db.listMemoriesPage(owner.id, null, firstPage.nextOffset ?? 0, 2);
+
+    expect(state.memoryStats.user).toMatchObject({ total: 3, enabled: 2 });
+    expect(state.memoryStats.user.contextLength).toBeGreaterThan(0);
+    expect(JSON.stringify(state)).not.toContain("sensitive memory");
+    expect(firstPage).toMatchObject({ total: 3, nextOffset: 2 });
+    expect(firstPage.items).toHaveLength(2);
+    expect(firstPage.items[0]?.content).toContain("sensitive memory");
+    expect(secondPage).toMatchObject({ total: 3, nextOffset: null });
+    expect(secondPage.items).toHaveLength(1);
+  });
+
   it("persists favorite project and chat flags", () => {
     const db = createTestDb();
     const owner = db.getOwner();
@@ -574,6 +594,77 @@ describe("chat provider context", () => {
 
     expect(db.getChat(owner.id, chat.id)).toMatchObject({ providerSessionId: null, providerSessionWorkspacePath: null });
     expect(db.listMessages(chat.id).some((message) => message.role === "assistant")).toBe(false);
+  });
+
+  it("accumulates AI credit usage per chat and persists it on the assistant message", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Usage chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Spend some credits" });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "usage", nanoAiu: 120_000_000, model: "gpt-test" };
+        yield { type: "delta", text: "Done." };
+        yield { type: "usage", nanoAiu: 30_000_000, model: "gpt-test" };
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Spend some credits" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+
+    const assistant = db.listMessages(chat.id).find((message) => message.role === "assistant");
+    expect(assistant?.metadata.usage).toEqual({ nanoAiu: 150_000_000 });
+    expect(db.getChat(owner.id, chat.id).totalNanoAiu).toBe(150_000_000);
+  });
+
+  it("attributes subagent AI credit usage to its activity card and the chat total", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Subagent usage chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Delegate and spend" });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "usage", nanoAiu: 100_000_000, model: "gpt-test" };
+        yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent" };
+        yield { type: "usage", nanoAiu: 40_000_000, model: "gpt-test", agentId: "research-agent" };
+        yield { type: "usage", nanoAiu: 35_000_000, model: "gpt-test", agentId: "research-agent" };
+        yield { type: "usage", nanoAiu: 25_000_000, model: "gpt-test", agentId: "unknown-agent" };
+        yield { type: "subagent-complete", id: "research-agent", name: "research", displayName: "Research agent", durationMs: 10 };
+        yield { type: "delta", text: "Done." };
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Delegate and spend" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+
+    const assistant = db.listMessages(chat.id).find((message) => message.role === "assistant");
+    const activities = assistant?.metadata.activities as Array<{ type?: string; details?: { nanoAiu?: number; name?: string } }> | undefined;
+    const subagent = activities?.find((activity) => activity.type === "subagent");
+    expect(subagent?.details?.nanoAiu).toBe(75_000_000);
+    expect(subagent?.details?.name).toBe("research");
+    expect(assistant?.metadata.usage).toEqual({ nanoAiu: 200_000_000 });
+    expect(db.getChat(owner.id, chat.id).totalNanoAiu).toBe(200_000_000);
+  });
+
+  it("keeps chat AI credit totals across turns and ignores non-positive usage", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Running total chat", projectId: null, workspaceId: null });
+
+    expect(db.addChatUsage(owner.id, chat.id, 40_000_000).totalNanoAiu).toBe(40_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 60_000_000).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 0).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, Number.NaN).totalNanoAiu).toBe(100_000_000);
   });
 
   it("hides title-tool activity when the SDK reports it as a generic tool", async () => {

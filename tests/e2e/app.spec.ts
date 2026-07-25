@@ -356,6 +356,8 @@ test("personal context and coarse location are included in chats", async ({ page
   await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
   await drawer.getByRole("button", { name: "Add memory" }).click();
   let memoryCard = drawer.locator(".memory-card").filter({ hasText: "Response style" });
+  const serializedState = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/state")).json()));
+  expect(serializedState).not.toContain("Lead with the recommendation.");
   await memoryCard.getByRole("button", { name: "Edit" }).click();
   const memoryEditor = drawer.locator(".memory-card.memory-editor");
   await memoryEditor.getByLabel("Title").fill("Updated response style");
@@ -583,8 +585,33 @@ test("assistant can auto-title chats until the user renames them", async ({ page
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "completely different topic" })).toHaveCount(0);
 });
 
-test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {
+test("chat header reports AI credit usage as it accumulates", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers the header usage readout.");
   await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const usagePill = page.locator(".usage-pill");
+  await expect(usagePill).toHaveCount(0);
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("First note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
+  await expect(usagePill).toHaveText("0.43 AIC");
+  await expect(page.locator(".msg.assistant .msg-usage").last()).toHaveText("0.43 AIC");
+  await usagePill.click();
+  const details = page.getByRole("dialog", { name: "AI credit usage" });
+  await expect(details).toContainText("0.43 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
+  await page.keyboard.press("Escape");
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Second note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(usagePill).toHaveText("0.86 AIC", { timeout: 15000 });
+  await page.reload();
+  await expect(usagePill).toHaveText("0.86 AIC");
+  await usagePill.click();
+  await expect(details).toContainText("0.86 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
+});
+
+test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {  await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
   if (testInfo.project.name === "desktop") {
     await page.locator(".sidebar-new").click();
@@ -913,6 +940,8 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
   await subagent.locator("summary").first().click();
   await expect(subagent).toContainText("Inspect project context");
   await expect(subagent).toContainText("Found shared project context");
+  await expect(subagent.locator(".subagent-usage")).toHaveText("0.08 AIC used by this subagent");
+  await expect(subagent.locator(".subagent-detail")).not.toContainText("nanoAiu");
   await expect(subagent.locator(".activity-card.reasoning")).toContainText("Thinking");
   await expect(subagent.locator(".activity-card.tool > summary")).toContainText("context.search");
   await subagent.locator(".activity-card.tool > summary").click();

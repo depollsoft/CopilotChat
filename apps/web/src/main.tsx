@@ -4,8 +4,8 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
-import { formatMemoryContext } from "@copilotchat/shared";
+import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
+import { formatAic } from "@copilotchat/shared";
 import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
 import "./styles.css";
 
@@ -42,6 +42,9 @@ type TaskListItem = { title: string; completed: boolean; depth?: number };
 type AssistantActivity = { id: string; type: "reasoning" | "tool" | "subagent" | "task-list"; title: string; status: "running" | "succeeded" | "failed"; content?: string; items?: TaskListItem[]; input?: unknown; output?: unknown; error?: string | null; details?: Record<string, unknown>; steps?: AssistantActivity[] };
 type PendingInteraction = { id: string; kind: "permission" | "user-input" | "elicitation"; title: string; message: string; choices?: string[]; allowFreeform?: boolean; request?: unknown; requestedSchema?: unknown };
 type PendingTurn = { id: string; mode: "steer" | "queue"; content: string; status: "queued" | "sent" | "running" | "done" | "failed"; createdAt: string };
+type ChatUsage = { turnNanoAiu: number; chatNanoAiu: number };
+type UsageStatus = ChatUsage & { reported: boolean };
+const emptyChatUsage: ChatUsage = { turnNanoAiu: 0, chatNanoAiu: 0 };
 type ProjectEditorState = { kind: "instructions"; title: string; value: string; placeholder: string } | { kind: "reference"; title: string; referenceId?: string; referenceTitle: string; value: string };
 type AppDialog = { kind: "text"; title: string; message?: string; label: string; initialValue?: string; placeholder?: string; confirmLabel: string; onConfirm: (value: string) => void | Promise<void> } | { kind: "confirm"; title: string; message: string; confirmLabel: string; danger?: boolean; requireText?: string; onConfirm: () => void | Promise<void> };
 type AppRoute = { kind: "home" } | { kind: "chat"; chatId: string } | { kind: "project"; projectId: string };
@@ -88,6 +91,7 @@ function App(): React.ReactElement {
   const [streamingActivities, setStreamingActivities] = useState<AssistantActivity[]>([]);
   const [pendingInteractions, setPendingInteractions] = useState<PendingInteraction[]>([]);
   const [pendingTurns, setPendingTurns] = useState<PendingTurn[]>([]);
+  const [liveUsage, setLiveUsage] = useState<ChatUsage>(emptyChatUsage);
   const [searchQuery, setSearchQuery] = useState("");
   const [drawer, setDrawer] = useState<Tab | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -135,7 +139,9 @@ function App(): React.ReactElement {
   const selectedModelInfo = providerModels.find((model) => model.id === selectedModel) ?? providerModels.find((model) => model.id === providerDefaultModel) ?? providerModels[0];
   const effortChoices = reasoningEffortChoices(selectedModelInfo);
   const supportsLongContext = Boolean(selectedModelInfo?.supportsLongContext);
-  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile ?? "", state?.userContext.location ?? null, state?.memories ?? [], selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile, state?.userContext.location, state?.memories, selectedModelInfo, contextTier]);
+  const memoryContextLength = (state?.memoryStats.user.contextLength ?? 0) + (activeProject ? state?.memoryStats.projects[activeProject.id]?.contextLength ?? 0 : 0);
+  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile ?? "", state?.userContext.location ?? null, memoryContextLength, selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile, state?.userContext.location, memoryContextLength, selectedModelInfo, contextTier]);
+  const usageStatus = useMemo<UsageStatus>(() => { const chatNanoAiu = Math.max(liveUsage.chatNanoAiu, selectedChat?.totalNanoAiu ?? 0); return { chatNanoAiu, turnNanoAiu: liveUsage.turnNanoAiu, reported: chatNanoAiu > 0 }; }, [liveUsage, selectedChat?.totalNanoAiu]);
   useEffect(() => {
     const query = window.matchMedia(SYSTEM_THEME_QUERY);
     const update = () => setSystemTheme(query.matches ? "dark" : "light");
@@ -212,7 +218,7 @@ function App(): React.ReactElement {
     return () => window.removeEventListener("focus", refreshFocusedModels);
   }, [apiToken]);
   useEffect(() => { if (selectedChat) { markChatSeen(selectedChat.id, selectedChat.updatedAt); setActiveProjectId(selectedChat.projectId); setActiveWorkspaceId(selectedChat.workspaceId); if (selectedChat.model) setSelectedModel(selectedChat.model); setReasoningEffort(selectedChat.reasoningEffort && EFFORT_OPTIONS.includes(selectedChat.reasoningEffort) ? selectedChat.reasoningEffort : "default"); setContextTier(selectedChat.contextTier ?? "default"); } }, [selectedChat]);
-  useEffect(() => { if (!selectedChatId) { setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); return; } const controller = new AbortController(); void loadChatAndReconnect(selectedChatId, controller); return () => controller.abort(); }, [selectedChatId, apiToken, connectionRevision]);
+  useEffect(() => { setLiveUsage(emptyChatUsage); if (!selectedChatId) { setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); return; } const controller = new AbortController(); void loadChatAndReconnect(selectedChatId, controller); return () => controller.abort(); }, [selectedChatId, apiToken, connectionRevision]);
   useEffect(() => {
     setShowJumpToLive(false);
     if (!selectedChatId) {
@@ -290,7 +296,9 @@ function App(): React.ReactElement {
     let networkFailures = 0;
     while (!controller.signal.aborted) {
       try {
-        setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
+        const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
+        setMessages(loaded);
+        setLiveUsage((current) => current.turnNanoAiu > 0 ? current : { ...current, turnNanoAiu: latestResponseNanoAiu(loaded) });
         setError((current) => current && isNetworkError(current) ? null : current);
         await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", false, true);
         return;
@@ -350,7 +358,7 @@ function App(): React.ReactElement {
       setBusy(false);
     }
   }
-  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> { if (event.event === "snapshot") { const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown }; setBusy(true); setStreamingText(data.text ?? ""); setStreamingActivities(readActivities(data.activities)); setPendingInteractions(readInteractions(data.interactions)); setPendingTurns(readPendingTurns(data.pendingTurns)); return false; } if (event.event === "pending") { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); return false; } if (event.event === "message") { setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); setStreamingText(""); setStreamingActivities([]); return false; } if (event.event === "interaction") { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); return false; } if (event.event === "activity") { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); return false; } if (event.event === "delta") { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); return false; } if (event.event === "artifact") { void refreshState(); setToast("Artifact created"); return false; } if (event.event === "error") throw new Error((event.data as { message?: string }).message ?? "Message failed"); if (event.event === "done") { const data = event.data as { active?: boolean; cancelled?: boolean } | undefined; if (data?.active === false) return true; if (data?.cancelled) setToast("Response stopped"); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); return true; } return false; }
+  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> { if (event.event === "snapshot") { const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown; usage?: unknown }; setBusy(true); setStreamingText(data.text ?? ""); setStreamingActivities(readActivities(data.activities)); setPendingInteractions(readInteractions(data.interactions)); setPendingTurns(readPendingTurns(data.pendingTurns)); setLiveUsage(readChatUsage(data.usage)); return false; } if (event.event === "usage") { setLiveUsage(readChatUsage(event.data)); return false; } if (event.event === "pending") { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); return false; } if (event.event === "message") { setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); setStreamingText(""); setStreamingActivities([]); return false; } if (event.event === "interaction") { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); return false; } if (event.event === "activity") { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); return false; } if (event.event === "delta") { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); return false; } if (event.event === "artifact") { void refreshState(); setToast("Artifact created"); return false; } if (event.event === "error") throw new Error((event.data as { message?: string }).message ?? "Message failed"); if (event.event === "done") { const data = event.data as { active?: boolean; cancelled?: boolean } | undefined; if (data?.active === false) return true; if (data?.cancelled) setToast("Response stopped"); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); return true; } return false; }
   async function resolveInteraction(interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }): Promise<void> { const chatId = selectedChatIdRef.current; if (!chatId) return; setPendingInteractions((current) => current.filter((item) => item.id !== interaction.id)); await api<void>(`/api/chats/${chatId}/interactions/${interaction.id}`, { method: "POST", body: resolution, raw: true }, apiToken); }
   async function stopActiveResponse(): Promise<void> {
     const chatId = selectedChatIdRef.current;
@@ -451,7 +459,7 @@ function App(): React.ReactElement {
     {sidebarOpen ? <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} /> : null}
     <Sidebar open={sidebarOpen} chats={chats} projects={projects} selectedChatId={selectedChatId} activeProjectId={activeProjectId} runningChatIds={runningChatIds} unreadChatIds={unreadChatIds} searchQuery={searchQuery} owner={state?.owner.login ?? "Local"} providerLabel={provider.id === "sdk" ? "GitHub Copilot" : provider.label} onSearch={setSearchQuery} onSelectChat={(id) => { selectChat(id); setSidebarOpen(false); }} onNewChat={() => void createChat()} onNewProject={() => void createProjectFromSidebar()} onSelectProject={(id) => { selectProject(id); setSidebarOpen(false); }} onToggleChatFavorite={(chat) => void toggleChatFavorite(chat)} onToggleProjectFavorite={(project) => void toggleProjectFavorite(project)} onRenameProject={(project) => void renameProject(project)} onDeleteProject={(project) => void deleteProject(project)} onRenameChat={(chat) => void renameChat(chat)} onArchiveChat={(chat) => void archiveChat(chat)} onDeleteChat={(chat) => void deleteChat(chat)} onOpenDrawer={(tab) => { setDrawer(tab); setSidebarOpen(false); }} />
     <main className="main">
-      <Header chatTitle={selectedChat?.title ?? "New conversation"} projectName={activeProject?.name ?? null} chatFavorite={selectedChat?.favorite ?? null} projectFavorite={activeProject?.favorite ?? null} provider={provider} model={selectedModelInfo?.id ?? selectedModel} models={providerModels} modelInfo={selectedModelInfo ?? null} effort={reasoningEffort} effortChoices={effortChoices} contextTier={contextTier} context={contextStatus} busy={busy} modelsRefreshing={modelsRefreshing} onModelPickerOpen={() => void refreshModels()} onRefreshModels={() => void refreshModels(true)} onModelChange={changeModel} onEffortChange={changeReasoningEffort} onContextTierChange={changeContextTier} onToggleSidebar={() => setSidebarOpen((v) => !v)} onToggleChatFavorite={selectedChat ? () => void toggleChatFavorite(selectedChat) : undefined} onToggleProjectFavorite={activeProject ? () => void toggleProjectFavorite(activeProject) : undefined} onRenameChat={selectedChat ? () => void renameChat(selectedChat) : undefined} onArchiveChat={selectedChat ? () => void archiveChat(selectedChat) : undefined} onDeleteChat={selectedChat ? () => void deleteChat(selectedChat) : undefined} onRenameProject={activeProject ? () => void renameProject(activeProject) : undefined} onDeleteProject={activeProject ? () => void deleteProject(activeProject) : undefined} onOpenTab={setDrawer} onNewChat={() => void createChat()} onOpenShortcuts={() => setShortcutsOpen(true)} />
+      <Header chatTitle={selectedChat?.title ?? "New conversation"} projectName={activeProject?.name ?? null} chatFavorite={selectedChat?.favorite ?? null} projectFavorite={activeProject?.favorite ?? null} provider={provider} model={selectedModelInfo?.id ?? selectedModel} models={providerModels} modelInfo={selectedModelInfo ?? null} effort={reasoningEffort} effortChoices={effortChoices} contextTier={contextTier} context={contextStatus} usage={usageStatus} busy={busy} modelsRefreshing={modelsRefreshing} onModelPickerOpen={() => void refreshModels()} onRefreshModels={() => void refreshModels(true)} onModelChange={changeModel} onEffortChange={changeReasoningEffort} onContextTierChange={changeContextTier} onToggleSidebar={() => setSidebarOpen((v) => !v)} onToggleChatFavorite={selectedChat ? () => void toggleChatFavorite(selectedChat) : undefined} onToggleProjectFavorite={activeProject ? () => void toggleProjectFavorite(activeProject) : undefined} onRenameChat={selectedChat ? () => void renameChat(selectedChat) : undefined} onArchiveChat={selectedChat ? () => void archiveChat(selectedChat) : undefined} onDeleteChat={selectedChat ? () => void deleteChat(selectedChat) : undefined} onRenameProject={activeProject ? () => void renameProject(activeProject) : undefined} onDeleteProject={activeProject ? () => void deleteProject(activeProject) : undefined} onOpenTab={setDrawer} onNewChat={() => void createChat()} onOpenShortcuts={() => setShortcutsOpen(true)} />
       {error ? <ErrorBanner error={error} onDismiss={() => setError(null)} onRetry={() => void refreshState()} /> : null}
       {state && !provider.available ? <SetupBanner details={provider.details} onOpenSettings={() => setDrawer("preferences")} /> : null}
       <div ref={scrollRef} className="scroll" onScroll={handleThreadScroll}>
@@ -495,7 +503,7 @@ function SidebarProjectRow(p: { project: Project; active: boolean; menuOpen: boo
   return <div className={`sidebar-row project-row${p.active ? " active" : ""}`} role="button" tabIndex={0} aria-label={p.project.name} onClick={p.onSelect} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelect(); } }}><span className="sidebar-row-title"><SidebarFlags favorite={p.project.favorite}/>{p.project.name}</span><span className="sidebar-row-meta"/><div ref={p.menuOpen ? p.menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Project actions" className="sidebar-row-menu" aria-expanded={p.menuOpen} onClick={p.onMenu}><IconMore width={16}/></button>{p.menuOpen ? <div className="menu" role="menu" aria-label="Project actions menu"><button onClick={p.onToggleFavorite}>{p.project.favorite ? "Unstar" : "Star"}</button><button onClick={p.onRename}>Rename</button><button className="danger" onClick={p.onDelete}>Delete</button></div> : null}</div></div>;
 }
 function SidebarFlags(p: { favorite?: boolean }) { return p.favorite ? <span className="sidebar-row-flags"><IconStar width={12} height={12}/></span> : null; }
-function Header(p: { chatTitle: string; projectName: string | null; chatFavorite: boolean | null; projectFavorite: boolean | null; provider: ProviderStatus; model: string; models: ProviderStatus["models"]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; context: ContextStatus; busy: boolean; modelsRefreshing: boolean; onModelPickerOpen: () => void; onRefreshModels: () => void; onModelChange: (v: string) => void; onEffortChange: (v: ReasoningEffort) => void; onContextTierChange: (v: ContextTier) => void; onToggleSidebar: () => void; onToggleChatFavorite?: () => void; onToggleProjectFavorite?: () => void; onRenameChat?: () => void; onArchiveChat?: () => void; onDeleteChat?: () => void; onRenameProject?: () => void; onDeleteProject?: () => void; onOpenTab: (t: Tab) => void; onNewChat: () => void; onOpenShortcuts: () => void }) {
+function Header(p: { chatTitle: string; projectName: string | null; chatFavorite: boolean | null; projectFavorite: boolean | null; provider: ProviderStatus; model: string; models: ProviderStatus["models"]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; context: ContextStatus; usage: UsageStatus; busy: boolean; modelsRefreshing: boolean; onModelPickerOpen: () => void; onRefreshModels: () => void; onModelChange: (v: string) => void; onEffortChange: (v: ReasoningEffort) => void; onContextTierChange: (v: ContextTier) => void; onToggleSidebar: () => void; onToggleChatFavorite?: () => void; onToggleProjectFavorite?: () => void; onRenameChat?: () => void; onArchiveChat?: () => void; onDeleteChat?: () => void; onRenameProject?: () => void; onDeleteProject?: () => void; onOpenTab: (t: Tab) => void; onNewChat: () => void; onOpenShortcuts: () => void }) {
   const [showContext, setShowContext] = useState(false);
   const [showOverflow, setShowOverflow] = useState(false);
   const contextRef = useDismissablePopup<HTMLDivElement>(showContext, () => setShowContext(false));
@@ -509,6 +517,7 @@ function Header(p: { chatTitle: string; projectName: string | null; chatFavorite
     </div>
     <div className="header-controls">
       <ModelPicker model={p.model} models={p.models} modelInfo={p.modelInfo} effort={p.effort} effortChoices={p.effortChoices} contextTier={p.contextTier} refreshing={p.modelsRefreshing} onOpen={p.onModelPickerOpen} onRefresh={p.onRefreshModels} onModelChange={p.onModelChange} onEffortChange={p.onEffortChange} onContextTierChange={p.onContextTierChange} />
+      {p.usage.reported ? <UsagePill usage={p.usage} busy={p.busy} /> : null}
       <div ref={contextRef} className="context-ring-wrap"><button type="button" className={`context-ring ${p.context.state}`} title={p.context.detail} aria-label={`Context: ${p.context.detail}`} aria-expanded={showContext} aria-controls="context-details" style={{ background: contextRingBackground(p.context) }} onClick={() => setShowContext((value) => !value)}><span>{contextRingLabel(p.context)}</span></button>{showContext ? <div id="context-details" className="context-popover" role="dialog" aria-label="Context details"><strong>Context</strong><span>{p.context.detail}</span><small>{p.context.label}</small></div> : null}</div>
     </div>
     <div className="header-actions">
@@ -524,6 +533,15 @@ function Header(p: { chatTitle: string; projectName: string | null; chatFavorite
       </div> : null}</div> : null}
     </div>
   </header>;
+}
+function UsagePill(p: { usage: UsageStatus; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const ref = useDismissablePopup<HTMLDivElement>(open, () => setOpen(false));
+  const chatLabel = `${formatAic(p.usage.chatNanoAiu)} AIC`;
+  return <div ref={ref} className="usage-pill-wrap">
+    <button type="button" className={`header-pill usage-pill${p.busy ? " live" : ""}`} aria-label={`AI credits used in this chat: ${chatLabel}`} title={`${chatLabel} used in this chat`} aria-expanded={open} aria-controls="usage-details" onClick={() => setOpen((value) => !value)}><IconSparkle width={14}/><span>{chatLabel}</span></button>
+    {open ? <div id="usage-details" className="context-popover" role="dialog" aria-label="AI credit usage"><strong>AI credits</strong><span>{chatLabel} used in this chat.</span>{p.usage.turnNanoAiu > 0 ? <span>{formatAic(p.usage.turnNanoAiu)} AIC in the {p.busy ? "current" : "latest"} response.</span> : null}<small>Copilot reports credit usage for every model request, including sub-agents.</small></div> : null}
+  </div>;
 }
 function ModelPicker(p: { model: string; models: ProviderModel[]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; refreshing: boolean; onOpen: () => void; onRefresh: () => void; onModelChange: (model: string) => void; onEffortChange: (effort: ReasoningEffort) => void; onContextTierChange: (tier: ContextTier) => void }) {
   const [open, setOpen] = useState(false);
@@ -561,7 +579,7 @@ function FormField(p: { label: string; hint?: string; children: React.ReactEleme
 function Welcome(p: { userName: string; project: Project | null; onPrompt: (v: string) => void }) { const name = cleanName(p.userName); return <div className="welcome"><div className="welcome-inner"><div className="welcome-mark"><IconCopilot width={46} height={46}/></div><h1>{p.project ? `Ready in ${p.project.name}` : name ? `Back at it, ${name}` : "Back at it"}</h1><p className="welcome-sub">{p.project ? "Project instructions will be included with every turn in this conversation." : "Start a focused chat, connect tools, or work against a local folder."}</p><div className="welcome-grid">{STARTERS.map(([title, body, prompt]) => <button className="welcome-card" key={title} onClick={() => p.onPrompt(prompt)}><strong>{title}</strong><span>{body}</span><em>Start</em></button>)}</div></div></div>; }
 function ProjectHome(p: { project: Project; state: AppState; models: ProviderStatus["models"]; modelsAuthoritative: boolean; chats: Chat[]; onSelectChat: (id: string) => void; onNewChat: () => void; onOpenContext: () => void; refresh: () => Promise<void>; showToast: (s: string) => void }) {
   const [editor, setEditor] = useState<ProjectEditorState | null>(null);
-  const projectMemories = p.state.memories.filter((memory) => memory.projectId === p.project.id);
+  const projectMemories = p.state.memoryStats.projects[p.project.id] ?? { total: 0, enabled: 0, contextLength: 0 };
   const references = p.state.projectReferences.filter((reference) => reference.projectId === p.project.id);
   const chatReferences = p.state.projectChatReferences.filter((reference) => reference.projectId === p.project.id);
   async function saveEditor(next: ProjectEditorState): Promise<void> {
@@ -575,7 +593,7 @@ function ProjectHome(p: { project: Project; state: AppState; models: ProviderSta
     await p.refresh();
   }
   async function saveDefaultModel(defaultModel: string): Promise<void> { await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { defaultModel: defaultModel || null } }); p.showToast(defaultModel ? "Project default model saved" : "Project default model cleared"); await p.refresh(); }
-  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} modelsAuthoritative={p.modelsAuthoritative} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={p.onOpenContext}><div className="card-h"><strong>Memories</strong><span className="btn btn-sm">Manage</span></div><p>{projectMemories.length > 0 ? `${projectMemories.filter((memory) => memory.enabled).length} active of ${projectMemories.length} saved memories.${p.project.memory ? " A shared project note is also included." : ""}` : p.project.memory ? "A shared project note is included. Add individual memories to keep facts easier to browse." : "No project memories yet."}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
+  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} modelsAuthoritative={p.modelsAuthoritative} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={p.onOpenContext}><div className="card-h"><strong>Memories</strong><span className="btn btn-sm">Manage</span></div><p>{projectMemories.total > 0 ? `${projectMemories.enabled} active of ${projectMemories.total} saved memories.${p.project.memory ? " A shared project note is also included." : ""}` : p.project.memory ? "A shared project note is included. Add individual memories to keep facts easier to browse." : "No project memories yet."}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
 }
 function ProjectDefaultModelCard(p: { project: Project; models: ProviderStatus["models"]; modelsAuthoritative: boolean; onChange: (model: string) => void }) {
   const configuredModel = p.project.defaultModel;
@@ -611,8 +629,9 @@ const Message = React.memo(function Message(p: MessageProps) {
   const activities = !isUser ? (p.activities ?? readActivities(p.message.metadata.activities)) : [];
   const attachments = messageAttachments(p.message);
   const intent = p.streaming ? currentReportIntent(activities) : null;
+  const nanoAiu = !isUser ? messageNanoAiu(p.message) : 0;
   const actions = !p.streaming ? <div className="msg-actions"><button aria-label={isUser ? "Copy message" : "Copy response"} title="Copy" className="msg-action-button" onClick={() => void copyText(p.message.content)}><IconCopy width={18}/></button>{isUser ? <button aria-label="Edit message" title="Edit" className="msg-action-button" disabled={!p.canEdit} onClick={() => p.onEditStart?.(p.message)}><IconEdit width={18}/></button> : <button aria-label="Retry response" title="Retry" className="msg-action-button" disabled={!p.canRetry} onClick={() => p.onRetry?.(p.message)}><IconRetry width={18}/></button>}</div> : null;
-  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{!p.editing ? actions : null}</div></article>;
+  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{nanoAiu > 0 ? <span className="msg-usage" title={`This response used ${formatAic(nanoAiu)} AI credits`}>{formatAic(nanoAiu)} AIC</span> : null}{!p.editing ? actions : null}</div></article>;
 }, areMessagePropsEqual);
 function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<MessageProps>): boolean {
   return prev.message === next.message &&
@@ -746,7 +765,8 @@ function parseJsonValue(value: string): unknown {
   try { return JSON.parse(value); } catch { return null; }
 }
 function humanizeFieldName(value: string): string { return value.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\b\w/g, (char) => char.toUpperCase()); }
-function SubagentActivity(p: { activity: AssistantActivity }) { const detail = p.activity.details && Object.keys(p.activity.details).length > 0 ? formatActivityValue(p.activity.details) : ""; return <div className="subagent-activity">{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function SubagentActivity(p: { activity: AssistantActivity }) { const nanoAiu = readNanoAiu(p.activity.details?.nanoAiu); const detailRecord = subagentDetailRecord(p.activity.details); const detail = Object.keys(detailRecord).length > 0 ? formatActivityValue(detailRecord) : ""; return <div className="subagent-activity">{nanoAiu > 0 ? <p className="subagent-usage">{formatAic(nanoAiu)} AIC used by this subagent</p> : null}{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && nanoAiu === 0 && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function subagentDetailRecord(details: Record<string, unknown> | undefined): Record<string, unknown> { if (!details) return {}; return Object.fromEntries(Object.entries(details).filter(([key]) => key !== "nanoAiu")); }
 function TaskListActivity(p: { activity: AssistantActivity }) { const items = p.activity.items?.length ? p.activity.items : parseTaskListItems(p.activity.content ?? ""); return items.length ? <TaskListCard title={p.activity.title} items={items} source={typeof p.activity.details?.source === "string" ? p.activity.details.source : undefined} /> : <Markdown>{p.activity.content ?? ""}</Markdown>; }
 function InteractionDock(p: { interactions: PendingInteraction[]; onResolve: (interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }) => void }) {
   if (p.interactions.length === 0) return null;
@@ -891,10 +911,13 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState("");
   const [editContent, setEditContent] = useState("");
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [memoryTotal, setMemoryTotal] = useState(0);
+  const [nextMemoryOffset, setNextMemoryOffset] = useState<number | null>(null);
+  const [memoriesLoading, setMemoriesLoading] = useState(false);
   const [working, setWorking] = useState<string | null>(null);
   const [panelError, setPanelError] = useState<string | null>(null);
   const selectedProject = scope === "user" ? null : p.state.projects.find((project) => project.id === scope) ?? null;
-  const memories = p.state.memories.filter((memory) => selectedProject ? memory.projectId === selectedProject.id : memory.projectId === null);
   const currentLocation = p.state.userContext.location;
   useEffect(() => { setProfile(p.state.userContext.profile); }, [p.state.userContext.profile]);
   useEffect(() => { setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.locationLevel]);
@@ -907,6 +930,46 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
     setNewContent("");
   }, [selectedProject?.id]);
   useEffect(() => { setProjectNote(selectedProject?.memory ?? ""); }, [selectedProject?.id, selectedProject?.memory]);
+  useEffect(() => {
+    let cancelled = false;
+    setMemories([]);
+    setMemoryTotal(0);
+    setNextMemoryOffset(null);
+    setMemoriesLoading(true);
+    setPanelError(null);
+    void api<MemoryPage>(memoryPageUrl(selectedProject?.id ?? null, 0)).then((page) => {
+      if (cancelled) return;
+      setMemories(page.items);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    }).catch((error) => {
+      if (!cancelled) setPanelError(toErr(error));
+    }).finally(() => {
+      if (!cancelled) setMemoriesLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [selectedProject?.id]);
+  async function reloadMemories(): Promise<void> {
+    const page = await api<MemoryPage>(memoryPageUrl(selectedProject?.id ?? null, 0));
+    setMemories(page.items);
+    setMemoryTotal(page.total);
+    setNextMemoryOffset(page.nextOffset);
+  }
+  async function loadMoreMemories(): Promise<void> {
+    if (nextMemoryOffset === null || memoriesLoading) return;
+    setMemoriesLoading(true);
+    setPanelError(null);
+    try {
+      const page = await api<MemoryPage>(memoryPageUrl(selectedProject?.id ?? null, nextMemoryOffset));
+      setMemories((current) => [...current, ...page.items.filter((item) => !current.some((existing) => existing.id === item.id))]);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    } catch (error) {
+      setPanelError(toErr(error));
+    } finally {
+      setMemoriesLoading(false);
+    }
+  }
   async function perform(key: string, task: () => Promise<void>, message?: string): Promise<void> {
     setWorking(key);
     setPanelError(null);
@@ -939,6 +1002,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
       await api<Memory>("/api/memories", { method: "POST", body: { projectId: selectedProject?.id ?? null, title: newTitle, content: newContent, enabled: true } });
       setNewTitle("");
       setNewContent("");
+      await reloadMemories();
     }, "Memory saved");
   }
   function startEditing(memory: Memory): void { setEditingId(memory.id); setEditTitle(memory.title); setEditContent(memory.content); }
@@ -947,13 +1011,14 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
     await perform(`edit-${memory.id}`, async () => {
       await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { title: editTitle, content: editContent } });
       setEditingId(null);
+      await reloadMemories();
     }, "Memory updated");
   }
   async function toggleMemory(memory: Memory): Promise<void> {
-    await perform(`toggle-${memory.id}`, async () => { await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { enabled: !memory.enabled } }); }, memory.enabled ? "Memory paused" : "Memory included");
+    await perform(`toggle-${memory.id}`, async () => { await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { enabled: !memory.enabled } }); await reloadMemories(); }, memory.enabled ? "Memory paused" : "Memory included");
   }
   async function deleteMemory(memory: Memory): Promise<void> {
-    await perform(`delete-${memory.id}`, async () => { await api(`/api/memories/${memory.id}`, { method: "DELETE", raw: true }); }, "Memory deleted");
+    await perform(`delete-${memory.id}`, async () => { await api(`/api/memories/${memory.id}`, { method: "DELETE", raw: true }); await reloadMemories(); }, "Memory deleted");
   }
   return <div className="settings-panel context-settings">
     <div className="settings-note context-privacy-note"><strong>You stay in control.</strong><p>Only saved profile text, enabled memories, and the location precision you choose are added to future chats. Fine location can be sensitive; turn it off whenever it is not needed.</p></div>
@@ -983,7 +1048,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
       </div>
     </section>
     <section className="settings-section">
-      <div className="settings-section-title"><div><strong>Memories</strong><span>Browse and edit durable facts for every chat or one project.</span></div><span className="tag">{memories.length}</span></div>
+      <div className="settings-section-title"><div><strong>Memories</strong><span>Browse and edit durable facts for every chat or one project.</span></div><span className="tag">{memoryTotal}</span></div>
       <div className="settings-card memory-scope-card">
         <FormField label="Memory scope" hint={selectedProject ? `Only chats in ${selectedProject.name} receive these memories.` : "User memories are available in general and project chats."}>
           <select value={scope} onChange={(event) => setScope(event.currentTarget.value)}>
@@ -1005,7 +1070,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
         <div className="settings-actions"><button className="btn btn-primary" disabled={working === "new-memory" || !newTitle.trim() || !newContent.trim()}>{working === "new-memory" ? "Saving…" : "Add memory"}</button></div>
       </form>
       <div className="memory-list">
-        {memories.length === 0 ? <div className="settings-note"><strong>No memories in this scope</strong><p>Add a durable preference, decision, or fact above. You can pause it without deleting it later.</p></div> : memories.map((memory) => editingId === memory.id
+        {memoriesLoading && memories.length === 0 ? <div className="settings-note"><strong>Loading memories…</strong><p>Fetching this scope only while the context manager is open.</p></div> : memories.length === 0 ? <div className="settings-note"><strong>No memories in this scope</strong><p>Add a durable preference, decision, or fact above. You can pause it without deleting it later.</p></div> : memories.map((memory) => editingId === memory.id
           ? <form key={memory.id} className="memory-card memory-editor" onSubmit={(event) => { event.preventDefault(); void saveMemory(memory); }}>
               <FormField label="Title"><input maxLength={120} value={editTitle} onChange={(event) => setEditTitle(event.currentTarget.value)}/></FormField>
               <FormField label="Memory"><textarea rows={5} maxLength={20_000} value={editContent} onChange={(event) => setEditContent(event.currentTarget.value)}/></FormField>
@@ -1017,6 +1082,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
               <div className="card-actions"><button className="btn btn-sm" onClick={() => startEditing(memory)}><IconEdit width={14}/>Edit</button><button className="btn btn-sm" disabled={working === `toggle-${memory.id}`} onClick={() => void toggleMemory(memory)}>{memory.enabled ? "Pause" : "Include"}</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" disabled={working === `delete-${memory.id}`} onConfirm={() => deleteMemory(memory)}/></div>
             </article>)}
       </div>
+      {nextMemoryOffset !== null ? <div className="settings-actions"><button type="button" className="btn" disabled={memoriesLoading} onClick={() => void loadMoreMemories()}>{memoriesLoading ? "Loading…" : `Load more (${memories.length} of ${memoryTotal})`}</button></div> : null}
     </section>
   </div>;
 }
@@ -1109,6 +1175,10 @@ function readTaskListItems(value: unknown): TaskListItem[] | undefined { if (!Ar
 function readInteractions(value: unknown): PendingInteraction[] { if (!Array.isArray(value)) return []; return value.map(readInteraction).filter((interaction): interaction is PendingInteraction => Boolean(interaction)); }
 function readInteraction(value: unknown, index: number): PendingInteraction | null { if (!isObjectRecord(value)) return null; const kind = value.kind === "permission" || value.kind === "user-input" || value.kind === "elicitation" ? value.kind : null; if (!kind) return null; const choices = Array.isArray(value.choices) ? value.choices.map(String) : undefined; return { id: typeof value.id === "string" && value.id ? value.id : `${kind}-${index}`, kind, title: typeof value.title === "string" ? value.title : kind === "permission" ? "Permission request" : "Agent request", message: typeof value.message === "string" ? value.message : "", choices, allowFreeform: value.allowFreeform !== false, request: value.request, requestedSchema: value.requestedSchema }; }
 function readPendingTurns(value: unknown): PendingTurn[] { if (!Array.isArray(value)) return []; return value.map(readPendingTurn).filter((turn): turn is PendingTurn => Boolean(turn)); }
+function readChatUsage(value: unknown): ChatUsage { if (!isObjectRecord(value)) return emptyChatUsage; return { turnNanoAiu: readNanoAiu(value.turnNanoAiu), chatNanoAiu: readNanoAiu(value.chatNanoAiu) }; }
+function readNanoAiu(value: unknown): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0; }
+function messageNanoAiu(message: ChatMessage): number { const usage = message.metadata.usage; return isObjectRecord(usage) ? readNanoAiu(usage.nanoAiu) : 0; }
+function latestResponseNanoAiu(messages: ChatMessage[]): number { const latest = [...messages].reverse().find((message) => message.role === "assistant"); return latest ? messageNanoAiu(latest) : 0; }
 function readPendingTurn(value: unknown, index: number): PendingTurn | null { if (!isObjectRecord(value)) return null; const mode = value.mode === "steer" ? "steer" : value.mode === "queue" ? "queue" : null; if (!mode) return null; const status = value.status === "sent" || value.status === "running" || value.status === "done" || value.status === "failed" ? value.status : "queued"; return { id: typeof value.id === "string" && value.id ? value.id : `${mode}-${index}`, mode, content: typeof value.content === "string" ? value.content : "", status, createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString() }; }
 function upsertPendingTurn(turns: PendingTurn[], next: PendingTurn): PendingTurn[] { return turns.some((turn) => turn.id === next.id) ? turns.map((turn) => turn.id === next.id ? next : turn) : [...turns, next]; }
 function formatActivityValue(value: unknown): string { if (typeof value === "string") return value; return JSON.stringify(value, null, 2) ?? String(value); }
@@ -1219,6 +1289,7 @@ function useDismissablePopup<T extends HTMLElement>(active: boolean, onDismiss: 
 function resizeComposerTextarea(textarea: HTMLTextAreaElement | null): void { if (!textarea) return; textarea.style.height = "0px"; textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 44), 180)}px`; }
 function isAtLiveEdge(element: HTMLElement): boolean { return element.scrollHeight - element.scrollTop - element.clientHeight <= LIVE_SCROLL_THRESHOLD; }
 function cleanName(s:string){const t=s.trim();return !t||t.toLowerCase()==="local"||t.toLowerCase()==="local user"?"":t.split(/\s+/)[0]??"";}
+function memoryPageUrl(projectId: string | null, offset: number): string { const query = new URLSearchParams({ offset: String(offset), limit: "20" }); if (projectId) query.set("projectId", projectId); return `/api/memories?${query.toString()}`; }
 function requestBrowserLocation(level: Exclude<LocationLevel, "off">): Promise<UserLocation> {
   if (!navigator.geolocation) return Promise.reject(new Error("Location is not available in this browser."));
   return new Promise((resolve, reject) => {
@@ -1243,7 +1314,7 @@ function locationSummary(location: UserLocation): string {
   const accuracy = location.accuracy >= 1000 ? `${trimNumber(location.accuracy / 1000)} km` : `${Math.round(location.accuracy)} m`;
   return `${location.latitude.toFixed(digits)}, ${location.longitude.toFixed(digits)} · about ${accuracy} · ${formatProjectDate(location.capturedAt)}`;
 }
-function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],profile:string,location:UserLocation|null,memories:Memory[],model:ProviderModel|null,tier:ContextTier):ContextStatus{const userMemories=formatMemoryContext("User memories:",memories.filter(memory=>memory.enabled&&memory.projectId===null));const projectMemories=project?formatMemoryContext("Project memories:",memories.filter(memory=>memory.enabled&&memory.projectId===project.id)):"";const contextText=[...messages.map(m=>m.content),streamingText,draft,profile,userMemories,location?`${location.latitude},${location.longitude}`:"",project?.instructions??"",project?.memory??"",projectMemories,workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil(contextText.length/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
+function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],profile:string,location:UserLocation|null,memoryContextLength:number,model:ProviderModel|null,tier:ContextTier):ContextStatus{const contextText=[...messages.map(m=>m.content),streamingText,draft,profile,location?`${location.latitude},${location.longitude}`:"",project?.instructions??"",project?.memory??"",workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil((contextText.length+memoryContextLength)/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
 function formatTokens(value:number):string{if(value>=1000000)return`${trimNumber(value/1000000)}M`;if(value>=1000)return`${trimNumber(value/1000)}k`;return String(value);}
 function trimNumber(value:number):string{return value>=10?String(Math.round(value)):value.toFixed(1).replace(/\.0$/,"");}
 function formatPercent(value:number):string{return value>0&&value<1?"<1%":`${trimNumber(Math.min(100,value))}%`;}
