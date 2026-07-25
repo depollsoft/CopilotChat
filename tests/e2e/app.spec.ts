@@ -489,8 +489,28 @@ test("assistant can auto-title chats until the user renames them", async ({ page
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "completely different topic" })).toHaveCount(0);
 });
 
-test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {
+test("chat header reports AI credit usage as it accumulates", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers the header usage readout.");
   await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const usagePill = page.locator(".usage-pill");
+  await expect(usagePill).toHaveCount(0);
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("First note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
+  await expect(usagePill).toHaveText("0.43 AIC");
+  await expect(page.locator(".msg.assistant .msg-usage").last()).toHaveText("0.43 AIC");
+  await usagePill.click();
+  const details = page.getByRole("dialog", { name: "AI credit usage" });
+  await expect(details).toContainText("0.43 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
+  await page.keyboard.press("Escape");
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Second note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(usagePill).toHaveText("0.86 AIC", { timeout: 15000 });
+});
+
+test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {  await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
   if (testInfo.project.name === "desktop") {
     await page.locator(".sidebar-new").click();

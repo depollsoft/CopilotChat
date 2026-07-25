@@ -54,7 +54,7 @@ const persistedMetadataLimit = 950_000;
 const persistedActivityStringLimit = 8_000;
 const persistedNestedStepLimit = 24;
 const sseBackpressureLimit = 256 * 1024;
-const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interaction"]);
+const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interaction", "usage"]);
 
 export class ActiveChatResponses {
   private readonly active = new Map<string, ActiveChatResponse>();
@@ -158,6 +158,7 @@ export class ActiveChatResponses {
       if (event.type === "subagent-tool-result") { response.finishSubagentTool(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "subagent-complete" || event.type === "subagent-failed") { response.finishSubagent(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "task-list") { response.setTaskList(event); response.emit("activity", { activities: response.activities }); continue; }
+      if (event.type === "usage") { const updated = input.db.addChatUsage(input.ownerId, chat.id, event.nanoAiu); response.addUsage(event.nanoAiu, updated.totalNanoAiu); continue; }
       if (event.type === "session") chat = input.db.setChatProviderSession(input.ownerId, chat.id, { providerSessionId: event.sessionId, providerSessionWorkspacePath: event.workspacePath });
       if (event.type === "artifact") {
         const artifact = workspaceDir
@@ -171,7 +172,7 @@ export class ActiveChatResponses {
     if (workspaceDir) await syncArtifactFiles({ db: input.db, ownerId: input.ownerId, chat, workspaceDir });
     response.finishOpenActivities();
     if (!response.cancelled) {
-      const assistant = input.db.addMessage({ chatId: chat.id, role: "assistant", content: response.assistantContent, provider: input.provider.id, metadata: messageMetadataForActivities(response.activities) });
+      const assistant = input.db.addMessage({ chatId: chat.id, role: "assistant", content: response.assistantContent, provider: input.provider.id, metadata: { ...messageMetadataForActivities(response.activities), ...messageMetadataForUsage(response.turnNanoAiu) } });
       response.finishRunningPendingTurn();
       response.emit("message", assistant);
     }
@@ -186,6 +187,8 @@ export class ActiveChatResponse {
   activities: AssistantActivity[] = [];
   interactions: PendingInteraction[] = [];
   pendingTurns: PendingTurn[] = [];
+  turnNanoAiu = 0;
+  chatNanoAiu = 0;
   cancelled = false;
   assistantContentLimitReached = false;
   private activityIndex = 0;
@@ -204,7 +207,16 @@ export class ActiveChatResponse {
     const listener: StreamListener = { reply, queue: [], draining: false };
     this.listeners.add(listener);
     reply.raw.on("close", () => this.listeners.delete(listener));
-    if (this.assistantContent || this.activities.length > 0 || this.interactions.length > 0 || this.pendingTurns.length > 0) this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns });
+    if (this.assistantContent || this.activities.length > 0 || this.interactions.length > 0 || this.pendingTurns.length > 0 || this.turnNanoAiu > 0) this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns, usage: this.usage });
+  }
+
+  get usage(): { turnNanoAiu: number; chatNanoAiu: number } { return { turnNanoAiu: this.turnNanoAiu, chatNanoAiu: this.chatNanoAiu }; }
+
+  addUsage(nanoAiu: number, chatNanoAiu: number): void {
+    if (!Number.isFinite(nanoAiu) || nanoAiu <= 0) return;
+    this.turnNanoAiu += nanoAiu;
+    this.chatNanoAiu = Math.max(chatNanoAiu, this.turnNanoAiu);
+    this.emit("usage", this.usage);
   }
 
   decorateProviderRequest(request: ProviderChatRequest): ProviderChatRequest {
@@ -228,7 +240,8 @@ export class ActiveChatResponse {
     this.assistantContentLimitReached = false;
     this.activities = [];
     this.interactions = [];
-    this.emit("snapshot", { text: "", activities: [], interactions: this.interactions, pendingTurns: this.pendingTurns });
+    this.turnNanoAiu = 0;
+    this.emit("snapshot", { text: "", activities: [], interactions: this.interactions, pendingTurns: this.pendingTurns, usage: this.usage });
   }
 
   appendAssistantContent(text: string): string {
@@ -576,6 +589,10 @@ function finishActivities(activities: AssistantActivity[]): void {
     if (activity.status === "running") activity.status = "succeeded";
     if (activity.steps) finishActivities(activity.steps);
   }
+}
+function messageMetadataForUsage(turnNanoAiu: number): Record<string, unknown> {
+  if (!Number.isFinite(turnNanoAiu) || turnNanoAiu <= 0) return {};
+  return { usage: { nanoAiu: Math.round(turnNanoAiu) } };
 }
 function messageMetadataForActivities(activities: AssistantActivity[]): Record<string, unknown> {
   if (activities.length === 0) return {};

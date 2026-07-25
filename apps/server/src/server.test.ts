@@ -452,6 +452,43 @@ describe("chat provider context", () => {
     expect(request.permissionMode).toBe("yolo");
   });
 
+  it("accumulates AI credit usage per chat and persists it on the assistant message", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Usage chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Spend some credits" });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "usage", nanoAiu: 120_000_000, model: "gpt-test" };
+        yield { type: "delta", text: "Done." };
+        yield { type: "usage", nanoAiu: 30_000_000, model: "gpt-test" };
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Spend some credits" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+
+    const assistant = db.listMessages(chat.id).find((message) => message.role === "assistant");
+    expect(assistant?.metadata.usage).toEqual({ nanoAiu: 150_000_000 });
+    expect(db.getChat(owner.id, chat.id).totalNanoAiu).toBe(150_000_000);
+  });
+
+  it("keeps chat AI credit totals across turns and ignores non-positive usage", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Running total chat", projectId: null, workspaceId: null });
+
+    expect(db.addChatUsage(owner.id, chat.id, 40_000_000).totalNanoAiu).toBe(40_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 60_000_000).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 0).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, Number.NaN).totalNanoAiu).toBe(100_000_000);
+  });
+
   it("hides title-tool activity when the SDK reports it as a generic tool", async () => {
     const db = createTestDb();
     const owner = db.getOwner();
