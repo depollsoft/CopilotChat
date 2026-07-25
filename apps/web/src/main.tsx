@@ -896,16 +896,17 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
   const selectedProject = scope === "user" ? null : p.state.projects.find((project) => project.id === scope) ?? null;
   const memories = p.state.memories.filter((memory) => selectedProject ? memory.projectId === selectedProject.id : memory.projectId === null);
   const currentLocation = p.state.userContext.location;
-  useEffect(() => { setProfile(p.state.userContext.profile); setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.profile, p.state.userContext.locationLevel]);
+  useEffect(() => { setProfile(p.state.userContext.profile); }, [p.state.userContext.profile]);
+  useEffect(() => { setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.locationLevel]);
   useEffect(() => {
     if (p.activeProjectId && p.state.projects.some((project) => project.id === p.activeProjectId)) setScope(p.activeProjectId);
   }, [p.activeProjectId]);
   useEffect(() => {
-    setProjectNote(selectedProject?.memory ?? "");
     setEditingId(null);
     setNewTitle("");
     setNewContent("");
-  }, [selectedProject?.id, selectedProject?.memory]);
+  }, [selectedProject?.id]);
+  useEffect(() => { setProjectNote(selectedProject?.memory ?? ""); }, [selectedProject?.id, selectedProject?.memory]);
   async function perform(key: string, task: () => Promise<void>, message?: string): Promise<void> {
     setWorking(key);
     setPanelError(null);

@@ -296,9 +296,11 @@ test("project navigation shows editable context and project chats", async ({ pag
   const contextDrawer = page.getByRole("dialog", { name: "Personal context" });
   await expect(contextDrawer.getByLabel("Memory scope")).toHaveValue(/.+/);
   await contextDrawer.getByLabel("Shared project note").fill("Landing memory.");
-  await contextDrawer.getByRole("button", { name: "Save project note" }).click();
   await contextDrawer.getByLabel("Title").fill("Landing decision");
   await contextDrawer.getByLabel("What should CopilotChat remember?").fill("Prefer the landing deployment plan.");
+  await contextDrawer.getByRole("button", { name: "Save project note" }).click();
+  await expect(contextDrawer.getByLabel("Title")).toHaveValue("Landing decision");
+  await expect(contextDrawer.getByLabel("What should CopilotChat remember?")).toHaveValue("Prefer the landing deployment plan.");
   await contextDrawer.getByRole("button", { name: "Add memory" }).click();
   await expect(contextDrawer.getByText("Landing decision")).toBeVisible();
   await contextDrawer.getByRole("button", { name: "Close" }).click();
@@ -337,12 +339,18 @@ test("personal context and coarse location are included in chats", async ({ page
   await expect(page.getByText(/Back at it/i)).toBeVisible();
   await page.locator(".sidebar-footer-user").click();
   const drawer = page.getByRole("dialog", { name: "Personal context" });
-  await drawer.getByLabel("About you").fill("I am a staff engineer who prefers concise TypeScript examples.");
-  await drawer.getByRole("button", { name: "Save profile" }).click();
+  const profile = "I am a staff engineer who prefers concise TypeScript examples.";
+  await drawer.getByLabel("About you").fill(profile);
   const coarseLocation = drawer.getByRole("radio", { name: /^Coarse/ });
   await coarseLocation.click();
   await expect(coarseLocation).toHaveAttribute("aria-checked", "true");
   await drawer.getByRole("button", { name: "Save current location" }).click();
+  await expect(drawer.getByLabel("About you")).toHaveValue(profile);
+  const fineLocation = drawer.getByRole("radio", { name: /^Fine/ });
+  await fineLocation.click();
+  await drawer.getByRole("button", { name: "Save profile" }).click();
+  await expect(fineLocation).toHaveAttribute("aria-checked", "true");
+  await coarseLocation.click();
   await expect(drawer.locator(".location-summary")).toContainText("47.6, -122.3");
   await drawer.getByLabel("Title").fill("Response style");
   await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
@@ -388,6 +396,22 @@ test("personal context and coarse location are included in chats", async ({ page
   response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check deleted personal context." }).last();
   await expect(response).toBeVisible({ timeout: 15000 });
   await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  const locationDrawer = page.getByRole("dialog", { name: "Personal context" });
+  const offLocation = locationDrawer.getByRole("radio", { name: /^Off/ });
+  await offLocation.click();
+  await locationDrawer.getByRole("button", { name: "Turn off location" }).click();
+  await expect(locationDrawer.locator(".location-summary")).toContainText("No location saved.");
+  await expect(offLocation).toHaveAttribute("aria-checked", "true");
+  await locationDrawer.getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check disabled location context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check disabled location context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
+  await expect(response).not.toContainText("Location shared by the user");
+  await expect(response).not.toContainText("47.6, -122.3");
 });
 
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
