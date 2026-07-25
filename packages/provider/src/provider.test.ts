@@ -25,6 +25,7 @@ describe("createCopilotProvider", () => {
       resumeSession: true,
       model: "gpt-test",
       contextTier: "long_context",
+      userContext: "The user prefers concise recommendations.",
       projectContext: "Use the project voice.",
       skills: [],
       mcpServers: [],
@@ -34,6 +35,7 @@ describe("createCopilotProvider", () => {
     expect(text).toContain("Messages in context: 3.");
     expect(text).toContain("Provider session: copilotchat-test (resume).");
     expect(text).toContain("Previous context: user: First question | assistant: First answer");
+    expect(text).toContain("Personal context: The user prefers concise recommendations.");
     expect(text).toContain("Project context: Use the project voice.");
     expect(text).toContain("Context size: long_context.");
   });

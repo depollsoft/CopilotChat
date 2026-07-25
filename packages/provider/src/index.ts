@@ -20,7 +20,7 @@ export type ProviderInteractionHandlers = {
   requestElicitation?: (request: ProviderElicitationRequest) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, ProviderElicitationValue> }>;
 };
 export type ProviderChatControls = { onSteer: (handler: (message: ProviderMessage) => void | Promise<void>) => () => void };
-export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; contextTier?: "default" | "long_context"; permissionMode?: PermissionMode; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
+export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; contextTier?: "default" | "long_context"; permissionMode?: PermissionMode; userContext?: string | null; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
 export type ProviderEvent =
   | { type: "delta"; text: string }
   | { type: "reasoning-delta"; text: string }
@@ -198,6 +198,7 @@ class EchoProvider implements CopilotProvider {
     const enabledSkills = request.skills?.map((skill) => skill.name).join(", ") || "none";
     const attachmentSummary = summarizeAttachments(lastUser?.attachments);
     const priorMessages = request.messages.slice(0, -1);
+    const userContext = summarizeInline(request.userContext);
     const projectContext = summarizeInline(request.projectContext);
     const shouldShowActivity = /thinking|reasoning|tool|search|workspace|file|artifact/i.test(lastUser?.content ?? "");
     if (shouldShowActivity) {
@@ -285,6 +286,7 @@ class EchoProvider implements CopilotProvider {
       "- Messages in context: " + request.messages.length + ".",
       request.sessionId ? "- Provider session: " + request.sessionId + (request.resumeSession ? " (resume)" : " (new)") + "." : "",
       priorMessages.length > 0 ? "- Previous context: " + summarizeInline(priorMessages.map((message) => `${message.role}: ${message.content}`).join(" | ")) : "",
+      userContext ? "- Personal context: " + userContext : "",
       projectContext ? "- Project context: " + projectContext : "",
       "- Enabled skills: " + enabledSkills + ".",
       attachmentSummary ? "- Attachments: " + attachmentSummary + "." : "",
@@ -399,7 +401,7 @@ function echoSteeringText(message?: ProviderMessage): string {
   return `\n\nSteering received: ${message.content || "(no text)"}${attachmentSummary ? `\n\nSteering attachments: ${attachmentSummary}.` : ""}`;
 }
 function formatBytes(value: number): string { if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; if (value >= 1024) return `${Math.round(value / 1024)} KB`; return `${Math.max(0, Math.round(value))} B`; }
-function buildSystemContext(request: ProviderChatRequest): string { return [request.projectContext ? `Project context:\n${request.projectContext}` : "", request.workingDirectory ? `Active workspace: ${request.workingDirectory}\nSandbox: local filesystem and tool access must stay inside this workspace. Do not use paths outside it.` : "", request.titleTool ? `Conversation title: ${request.titleTool.currentTitle}\n${request.titleTool.required ? "You must call set_conversation_title after this first user message." : "Use the set_conversation_title tool whenever the conversation title should substantively change."} Titles must be concise, specific, and six words maximum. Do not mention that you are setting the title.` : "", request.artifactContext ?? "", ...(request.skills ?? []).map((skill) => [`Skill: ${skill.name}`, skill.description, skill.instructions, skill.workflow.length > 0 ? `Workflow:\n${skill.workflow.join("\n")}` : ""].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n"); }
+function buildSystemContext(request: ProviderChatRequest): string { return [request.userContext ? `Personal context shared by the user:\n${request.userContext}` : "", request.projectContext ? `Project context:\n${request.projectContext}` : "", request.workingDirectory ? `Active workspace: ${request.workingDirectory}\nSandbox: local filesystem and tool access must stay inside this workspace. Do not use paths outside it.` : "", request.titleTool ? `Conversation title: ${request.titleTool.currentTitle}\n${request.titleTool.required ? "You must call set_conversation_title after this first user message." : "Use the set_conversation_title tool whenever the conversation title should substantively change."} Titles must be concise, specific, and six words maximum. Do not mention that you are setting the title.` : "", request.artifactContext ?? "", ...(request.skills ?? []).map((skill) => [`Skill: ${skill.name}`, skill.description, skill.instructions, skill.workflow.length > 0 ? `Workflow:\n${skill.workflow.join("\n")}` : ""].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n"); }
 async function maybeRunEchoImportPreview(request: ProviderChatRequest, content: string): Promise<string> {
   const draftId = /Import draft ID:\s*([a-zA-Z0-9_.-]+)/i.exec(content)?.[1];
   const previewTool = request.tools?.find((tool) => tool.name === "preview_import_draft");

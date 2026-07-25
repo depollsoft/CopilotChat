@@ -89,6 +89,53 @@ describe("chat provider context", () => {
     expect(request.messages.map((message) => `${message.role}:${message.content}`)).toEqual(["user:First question", "assistant:First answer", "user:Second question"]);
   });
 
+  it("injects profile, consented location, and scoped memories into chat context", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Context project", description: null, instructions: "Use project rules." });
+    db.updateUserContext(owner.id, {
+      profile: "I am a staff engineer who prefers concise TypeScript examples.",
+      locationLevel: "coarse",
+      location: { latitude: 47.60621, longitude: -122.33207, accuracy: 25, capturedAt: "2026-07-24T08:00:00.000Z", precision: "coarse" },
+    });
+    db.createMemory(owner.id, { projectId: null, title: "Response style", content: "Lead with the recommendation.", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Deployment target", content: "Deploy to the edge runtime.", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Old decision", content: "Use the retired runtime.", enabled: false });
+    const chat = db.createChat(owner.id, { title: "Context chat", projectId: project.id, workspaceId: null });
+    db.addMessage({ chatId: chat.id, role: "user", content: "What should we do?" });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "What should we do?", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.userContext).toContain("staff engineer");
+    expect(request.userContext).toContain("47.6, -122.3");
+    expect(request.userContext).toContain("Response style");
+    expect(request.projectContext).toContain("Deployment target");
+    expect(request.projectContext).not.toContain("Old decision");
+    expect(db.getUserContext(owner.id).location).toMatchObject({ latitude: 47.6, longitude: -122.3, accuracy: 10_000, precision: "coarse" });
+  });
+
+  it("invalidates provider sessions when user or scoped memory context changes", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Scoped context", description: null, instructions: "" });
+    const generalChat = db.createChat(owner.id, { title: "General", projectId: null, workspaceId: null });
+    const projectChat = db.createChat(owner.id, { title: "Project", projectId: project.id, workspaceId: null });
+    db.setChatProviderSession(owner.id, generalChat.id, { providerSessionId: "general-session" });
+    db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session" });
+
+    db.createMemory(owner.id, { projectId: project.id, title: "Project fact", content: "Use durable storage.", enabled: true });
+
+    expect(db.getChat(owner.id, generalChat.id).providerSessionId).toBe("general-session");
+    expect(db.getChat(owner.id, projectChat.id).providerSessionId).toBeNull();
+
+    db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session-2" });
+    db.updateUserContext(owner.id, { profile: "Prefer concise answers." });
+
+    expect(db.getChat(owner.id, generalChat.id).providerSessionId).toBeNull();
+    expect(db.getChat(owner.id, projectChat.id).providerSessionId).toBeNull();
+    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [] }).memories).toHaveLength(1);
+  });
+
   it("uses saved chat model choices when a request does not override them", () => {
     const db = createTestDb();
     const owner = db.getOwner();

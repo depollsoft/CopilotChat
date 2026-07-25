@@ -20,6 +20,25 @@ export const ownerSchema = z.object({
 });
 export type Owner = z.infer<typeof ownerSchema>;
 
+export const locationLevelSchema = z.enum(["off", "coarse", "fine"]);
+export type LocationLevel = z.infer<typeof locationLevelSchema>;
+export const userLocationSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  accuracy: z.number().nonnegative(),
+  capturedAt: z.string().datetime(),
+  precision: z.enum(["coarse", "fine"]),
+});
+export type UserLocation = z.infer<typeof userLocationSchema>;
+export const userContextSchema = z.object({
+  ownerId: z.string(),
+  profile: z.string(),
+  locationLevel: locationLevelSchema,
+  location: userLocationSchema.nullable(),
+  updatedAt: z.string(),
+});
+export type UserContext = z.infer<typeof userContextSchema>;
+
 export const projectSchema = z.object({
   id: z.string(),
   ownerId: z.string(),
@@ -56,6 +75,18 @@ export const projectChatReferenceSchema = z.object({
   createdAt: z.string(),
 });
 export type ProjectChatReference = z.infer<typeof projectChatReferenceSchema>;
+
+export const memorySchema = z.object({
+  id: z.string(),
+  ownerId: z.string(),
+  projectId: z.string().nullable(),
+  title: z.string(),
+  content: z.string(),
+  enabled: z.boolean(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Memory = z.infer<typeof memorySchema>;
 
 export const chatSchema = z.object({
   id: z.string(),
@@ -200,7 +231,7 @@ export type ProviderModel = z.infer<typeof providerModelSchema>;
 export const providerStatusSchema = z.object({ id: z.string(), label: z.string(), available: z.boolean(), details: z.string(), capabilities: z.array(z.string()).default([]), models: z.array(providerModelSchema).default([]), defaultModel: z.string().optional() });
 export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 
-export const appStateSchema = z.object({ owner: ownerSchema, projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
+export const appStateSchema = z.object({ owner: ownerSchema, userContext: userContextSchema, memories: z.array(memorySchema), projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
 export type AppState = z.infer<typeof appStateSchema>;
 
 export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
@@ -213,6 +244,25 @@ export const createProjectRequestSchema = z.object({ name: z.string().min(1), de
 export type CreateProjectRequest = z.infer<typeof createProjectRequestSchema>;
 export const updateProjectRequestSchema = z.object({ name: z.string().min(1).optional(), description: z.string().optional().nullable(), instructions: z.string().optional().nullable(), memory: z.string().optional().nullable(), defaultModel: z.string().optional().nullable(), favorite: z.boolean().optional() });
 export type UpdateProjectRequest = z.infer<typeof updateProjectRequestSchema>;
+export const updateUserContextRequestSchema = z.object({
+  profile: z.string().max(20_000).optional(),
+  locationLevel: locationLevelSchema.optional(),
+  location: userLocationSchema.nullable().optional(),
+});
+export type UpdateUserContextRequest = z.infer<typeof updateUserContextRequestSchema>;
+export const createMemoryRequestSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
+  title: z.string().trim().min(1).max(120),
+  content: z.string().trim().min(1).max(20_000),
+  enabled: z.boolean().optional().default(true),
+});
+export type CreateMemoryRequest = z.infer<typeof createMemoryRequestSchema>;
+export const updateMemoryRequestSchema = z.object({
+  title: z.string().trim().min(1).max(120).optional(),
+  content: z.string().trim().min(1).max(20_000).optional(),
+  enabled: z.boolean().optional(),
+});
+export type UpdateMemoryRequest = z.infer<typeof updateMemoryRequestSchema>;
 export const createProjectReferenceRequestSchema = z.object({ projectId: z.string().min(1), title: z.string().min(1), content: z.string().min(1) });
 export type CreateProjectReferenceRequest = z.infer<typeof createProjectReferenceRequestSchema>;
 export const updateProjectReferenceRequestSchema = z.object({ title: z.string().min(1).optional(), content: z.string().min(1).optional() });

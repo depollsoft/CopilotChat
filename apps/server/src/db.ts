@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AppState, Artifact, ArtifactSummary, Chat, ChatMessage, ConversationScope, ConversationSearchResult, ConversationSummary, ConversationTranscript, CreateArtifactRequest, CreateChatRequest, CreateProjectReferenceRequest, CreateProjectRequest, McpServer, MessageAttachment, Owner, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderStatus, RegisterWorkspaceRequest, Skill, SkillManifest, ToolRun, UpdateArtifactRequest, UpdateChatRequest, UpdateMcpServerRequest, UpdateProjectReferenceRequest, UpdateProjectRequest, UpdateSkillRequest, UpdateWorkspaceRequest, Workspace } from "@copilotchat/shared";
+import type { AppState, Artifact, ArtifactSummary, Chat, ChatMessage, ConversationScope, ConversationSearchResult, ConversationSummary, ConversationTranscript, CreateArtifactRequest, CreateChatRequest, CreateMemoryRequest, CreateProjectReferenceRequest, CreateProjectRequest, McpServer, Memory, MessageAttachment, Owner, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderStatus, RegisterWorkspaceRequest, Skill, SkillManifest, ToolRun, UpdateArtifactRequest, UpdateChatRequest, UpdateMcpServerRequest, UpdateMemoryRequest, UpdateProjectReferenceRequest, UpdateProjectRequest, UpdateSkillRequest, UpdateUserContextRequest, UpdateWorkspaceRequest, UserContext, UserLocation, Workspace } from "@copilotchat/shared";
 import { builtInSkills } from "./builtins.js";
 
 type Row = Record<string, unknown>;
@@ -20,16 +20,57 @@ export class AppDatabase {
     const now = iso();
     if (existing) {
       this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ?, auth_provider = 'github' WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, id);
+      this.ensureUserContext(id, now);
       return this.getOwnerById(id);
     }
     this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, ?, ?, ?, 'github', ?)").run(id, input.login, input.displayName, input.avatarUrl, now);
+    this.ensureUserContext(id, now);
     for (const skill of builtInSkills) this.upsertSkill(id, skill, true, null);
     return this.getOwnerById(id);
   }
   hasGitHubAuth(): boolean { return Boolean(this.db.prepare("SELECT 1 FROM auth_tokens WHERE provider = 'github' LIMIT 1").get() as Row | undefined); }
   getGitHubToken(): string | null { const row = this.db.prepare("SELECT access_token FROM auth_tokens WHERE provider = 'github' LIMIT 1").get() as Row | undefined; return nullableString(row?.access_token); }
   setGitHubAuth(input: { accessToken: string; login: string; displayName: string | null; avatarUrl: string | null }): Owner { const now = iso(); const ownerId = this.getOwner().id; this.db.prepare(`INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET access_token = excluded.access_token, updated_at = excluded.updated_at`).run(ownerId, input.accessToken, now, now); this.db.prepare("UPDATE owners SET login = ?, display_name = ?, avatar_url = ?, auth_provider = 'github' WHERE id = ?").run(input.login, input.displayName, input.avatarUrl, ownerId); return this.getOwner(); }
-  getState(provider: ProviderStatus, activeChatIds: string[] = [], ownerId = this.getOwner().id): AppState { const owner = this.getOwnerById(ownerId); return { owner, projects: this.listProjects(owner.id), projectReferences: this.listProjectReferences(owner.id), projectChatReferences: this.listProjectChatReferences(owner.id), chats: this.listChats(owner.id), archivedChats: this.listArchivedChats(owner.id), artifacts: this.listArtifactSummaries(owner.id), skills: this.listSkills(owner.id), mcpServers: this.listMcpServers(owner.id), workspaces: this.listWorkspaces(owner.id), provider, activeChatIds }; }
+  getState(provider: ProviderStatus, activeChatIds: string[] = [], ownerId = this.getOwner().id): AppState { const owner = this.getOwnerById(ownerId); return { owner, userContext: this.getUserContext(owner.id), memories: this.listMemories(owner.id), projects: this.listProjects(owner.id), projectReferences: this.listProjectReferences(owner.id), projectChatReferences: this.listProjectChatReferences(owner.id), chats: this.listChats(owner.id), archivedChats: this.listArchivedChats(owner.id), artifacts: this.listArtifactSummaries(owner.id), skills: this.listSkills(owner.id), mcpServers: this.listMcpServers(owner.id), workspaces: this.listWorkspaces(owner.id), provider, activeChatIds }; }
+
+  getUserContext(ownerId: string): UserContext { this.getOwnerById(ownerId); this.ensureUserContext(ownerId, iso()); return mapUserContext(this.db.prepare("SELECT * FROM user_contexts WHERE owner_id = ?").get(ownerId) as Row); }
+  updateUserContext(ownerId: string, input: UpdateUserContextRequest): UserContext {
+    const current = this.getUserContext(ownerId);
+    const locationLevel = input.locationLevel ?? current.locationLevel;
+    const location = normalizedLocation(input.location === undefined ? (locationLevel === current.locationLevel ? current.location : null) : input.location, locationLevel);
+    const profile = input.profile === undefined ? current.profile : input.profile.trim();
+    const now = iso();
+    this.db.prepare("UPDATE user_contexts SET profile = ?, location_level = ?, latitude = ?, longitude = ?, accuracy = ?, location_captured_at = ?, updated_at = ? WHERE owner_id = ?").run(profile, locationLevel, location?.latitude ?? null, location?.longitude ?? null, location?.accuracy ?? null, location?.capturedAt ?? null, now, ownerId);
+    if (profile !== current.profile || locationLevel !== current.locationLevel || JSON.stringify(location) !== JSON.stringify(current.location)) this.clearOwnerProviderSessions(ownerId, now);
+    return this.getUserContext(ownerId);
+  }
+
+  listMemories(ownerId: string, projectId?: string | null): Memory[] {
+    const rows = projectId === undefined
+      ? this.db.prepare("SELECT * FROM memories WHERE owner_id = ? ORDER BY updated_at DESC").all(ownerId)
+      : projectId === null
+        ? this.db.prepare("SELECT * FROM memories WHERE owner_id = ? AND project_id IS NULL ORDER BY updated_at DESC").all(ownerId)
+        : this.db.prepare("SELECT * FROM memories WHERE owner_id = ? AND project_id = ? ORDER BY updated_at DESC").all(ownerId, projectId);
+    return (rows as Row[]).map(mapMemory);
+  }
+  createMemory(ownerId: string, input: CreateMemoryRequest): Memory {
+    const projectId = input.projectId ?? null;
+    if (projectId) this.getProject(ownerId, projectId);
+    const now = iso();
+    const id = randomUUID();
+    this.db.prepare("INSERT INTO memories (id, owner_id, project_id, title, content, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, ownerId, projectId, input.title, input.content, input.enabled ? 1 : 0, now, now);
+    this.clearMemoryProviderSessions(ownerId, projectId, now);
+    return this.getMemory(ownerId, id);
+  }
+  getMemory(ownerId: string, id: string): Memory { const row = this.db.prepare("SELECT * FROM memories WHERE owner_id = ? AND id = ?").get(ownerId, id) as Row | undefined; if (!row) throw new Error("Memory not found."); return mapMemory(row); }
+  updateMemory(ownerId: string, id: string, input: UpdateMemoryRequest): Memory {
+    const current = this.getMemory(ownerId, id);
+    const now = iso();
+    this.db.prepare("UPDATE memories SET title = ?, content = ?, enabled = ?, updated_at = ? WHERE owner_id = ? AND id = ?").run(input.title ?? current.title, input.content ?? current.content, input.enabled === undefined ? (current.enabled ? 1 : 0) : input.enabled ? 1 : 0, now, ownerId, id);
+    this.clearMemoryProviderSessions(ownerId, current.projectId, now);
+    return this.getMemory(ownerId, id);
+  }
+  deleteMemory(ownerId: string, id: string): void { const current = this.getMemory(ownerId, id); const now = iso(); this.db.prepare("DELETE FROM memories WHERE owner_id = ? AND id = ?").run(ownerId, id); this.clearMemoryProviderSessions(ownerId, current.projectId, now); }
 
   listProjects(ownerId: string): Project[] { return (this.db.prepare("SELECT * FROM projects WHERE owner_id = ? ORDER BY favorite DESC, updated_at DESC").all(ownerId) as Row[]).map(mapProject); }
   createProject(ownerId: string, input: CreateProjectRequest): Project { const now = iso(); const id = randomUUID(); this.db.prepare("INSERT INTO projects (id, owner_id, name, description, instructions, memory, default_model, favorite, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)").run(id, ownerId, input.name, input.description ?? null, input.instructions ?? null, input.memory ?? null, input.defaultModel ?? null, now, now); return this.getProject(ownerId, id); }
@@ -131,6 +172,8 @@ export class AppDatabase {
     const run = this.db.transaction(() => {
       this.db.prepare("DELETE FROM tool_runs WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM artifacts WHERE owner_id = ?").run(ownerId);
+      this.db.prepare("DELETE FROM memories WHERE owner_id = ?").run(ownerId);
+      this.db.prepare("DELETE FROM user_contexts WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM project_chat_references WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM chats WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM project_references WHERE owner_id = ?").run(ownerId);
@@ -138,6 +181,7 @@ export class AppDatabase {
       this.db.prepare("DELETE FROM mcp_servers WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM workspaces WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM skills WHERE owner_id = ?").run(ownerId);
+      this.ensureUserContext(ownerId, iso());
       for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null);
     });
     run();
@@ -147,7 +191,9 @@ export class AppDatabase {
   private migrate(): void { this.db.exec(`
     CREATE TABLE IF NOT EXISTS owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS auth_tokens (provider TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS user_contexts (owner_id TEXT PRIMARY KEY REFERENCES owners(id) ON DELETE CASCADE, profile TEXT NOT NULL DEFAULT '', location_level TEXT NOT NULL DEFAULT 'off', latitude REAL, longitude REAL, accuracy REAL, location_captured_at TEXT, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT, instructions TEXT, memory TEXT, default_model TEXT, favorite INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL, content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_chat_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, source_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, title TEXT NOT NULL, excerpt TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, root_path TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -158,16 +204,26 @@ export class AppDatabase {
     CREATE TABLE IF NOT EXISTS skills (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 1, built_in INTEGER NOT NULL DEFAULT 0, manifest TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS mcp_servers (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, transport TEXT NOT NULL, command TEXT, args TEXT NOT NULL DEFAULT '[]', url TEXT, tools TEXT NOT NULL DEFAULT '[]', enabled INTEGER NOT NULL DEFAULT 1, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS tool_runs (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL, workspace_id TEXT REFERENCES workspaces(id) ON DELETE SET NULL, tool_name TEXT NOT NULL, status TEXT NOT NULL, input TEXT NOT NULL, output TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS memories_owner_project_updated ON memories(owner_id, project_id, updated_at);
   `); this.ensureColumn("projects", "memory", "TEXT"); this.ensureColumn("projects", "default_model", "TEXT"); this.ensureColumn("projects", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "workspace_id", "TEXT REFERENCES workspaces(id) ON DELETE SET NULL"); this.ensureColumn("chats", "provider_session_id", "TEXT"); this.ensureColumn("chats", "provider_session_workspace_path", "TEXT"); this.ensureColumn("chats", "model", "TEXT"); this.ensureColumn("chats", "reasoning_effort", "TEXT"); this.ensureColumn("chats", "context_tier", "TEXT"); this.ensureColumn("chats", "title_manually_set", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("chats", "favorite", "INTEGER NOT NULL DEFAULT 0"); this.ensureColumn("artifacts", "file_path", "TEXT"); this.ensureColumn("mcp_servers", "tools", "TEXT NOT NULL DEFAULT '[]'"); this.migrateLegacyPinsToFavorites(); }
+  private clearOwnerProviderSessions(ownerId: string, updatedAt: string): void { this.db.prepare("UPDATE chats SET provider_session_id = NULL, provider_session_workspace_path = NULL, updated_at = ? WHERE owner_id = ?").run(updatedAt, ownerId); }
   private clearProjectProviderSessions(ownerId: string, projectId: string, updatedAt: string): void { this.db.prepare("UPDATE chats SET provider_session_id = NULL, provider_session_workspace_path = NULL, updated_at = ? WHERE owner_id = ? AND project_id = ?").run(updatedAt, ownerId, projectId); }
+  private clearMemoryProviderSessions(ownerId: string, projectId: string | null, updatedAt: string): void { if (projectId) this.clearProjectProviderSessions(ownerId, projectId, updatedAt); else this.clearOwnerProviderSessions(ownerId, updatedAt); }
   private ensureColumn(table: string, column: string, definition: string): void { const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]; if (!rows.some((row) => row.name === column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`); }
   private migrateLegacyPinsToFavorites(): void { for (const table of ["projects", "chats"]) { const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]; if (rows.some((row) => row.name === "pinned")) this.db.prepare(`UPDATE ${table} SET favorite = 1 WHERE pinned = 1`).run(); } }
-  private seed(): void { const existing = this.db.prepare("SELECT id FROM owners LIMIT 1").get() as Row | undefined; const now = iso(); const ownerId = typeof existing?.id === "string" ? existing.id : "local"; if (!existing) this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, 'local', 'Local user', NULL, 'local', ?)").run(ownerId, now); for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null); }
+  private ensureUserContext(ownerId: string, updatedAt: string): void { this.db.prepare("INSERT OR IGNORE INTO user_contexts (owner_id, profile, location_level, updated_at) VALUES (?, '', 'off', ?)").run(ownerId, updatedAt); }
+  private seed(): void { const existing = this.db.prepare("SELECT id FROM owners LIMIT 1").get() as Row | undefined; const now = iso(); const ownerId = typeof existing?.id === "string" ? existing.id : "local"; if (!existing) this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, 'local', 'Local user', NULL, 'local', ?)").run(ownerId, now); this.ensureUserContext(ownerId, now); for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null); }
 }
 function iso(): string { return new Date().toISOString(); }
 function skillRowId(ownerId: string, manifestId: string): string { return ownerId === "local" ? manifestId : `${ownerId}:${manifestId}`; }
 function mapOwner(row: Row): Owner { return { id: String(row.id), login: String(row.login), displayName: nullableString(row.display_name), avatarUrl: nullableString(row.avatar_url), authProvider: row.auth_provider === "github" ? "github" : "local" }; }
+function mapUserContext(row: Row): UserContext {
+  const locationLevel = normalizeLocationLevel(row.location_level);
+  const hasLocation = locationLevel !== "off" && typeof row.latitude === "number" && typeof row.longitude === "number" && typeof row.accuracy === "number" && typeof row.location_captured_at === "string";
+  return { ownerId: String(row.owner_id), profile: typeof row.profile === "string" ? row.profile : "", locationLevel, location: hasLocation ? { latitude: row.latitude as number, longitude: row.longitude as number, accuracy: row.accuracy as number, capturedAt: String(row.location_captured_at), precision: locationLevel } : null, updatedAt: String(row.updated_at) };
+}
 function mapProject(row: Row): Project { return { id: String(row.id), ownerId: String(row.owner_id), name: String(row.name), description: nullableString(row.description), instructions: nullableString(row.instructions), memory: nullableString(row.memory), defaultModel: nullableString(row.default_model), favorite: Boolean(row.favorite), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
+function mapMemory(row: Row): Memory { return { id: String(row.id), ownerId: String(row.owner_id), projectId: nullableString(row.project_id), title: String(row.title), content: String(row.content), enabled: Boolean(row.enabled), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 function mapProjectReference(row: Row): ProjectReference { return { id: String(row.id), ownerId: String(row.owner_id), projectId: String(row.project_id), title: String(row.title), content: String(row.content), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 function mapProjectChatReference(row: Row): ProjectChatReference { return { id: String(row.id), ownerId: String(row.owner_id), projectId: String(row.project_id), sourceChatId: String(row.source_chat_id), sourceMessageId: String(row.source_message_id), title: String(row.title), excerpt: String(row.excerpt), createdAt: String(row.created_at) }; }
 function mapChat(row: Row): Chat { return { id: String(row.id), ownerId: String(row.owner_id), projectId: nullableString(row.project_id), workspaceId: nullableString(row.workspace_id), providerSessionId: nullableString(row.provider_session_id), providerSessionWorkspacePath: nullableString(row.provider_session_workspace_path), model: nullableString(row.model), reasoningEffort: normalizeReasoningEffort(row.reasoning_effort), contextTier: normalizeContextTier(row.context_tier), title: String(row.title), titleManuallySet: Boolean(row.title_manually_set), archived: Boolean(row.archived), favorite: Boolean(row.favorite), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
@@ -184,6 +240,12 @@ function withoutRuntimeAttachments(metadata: Record<string, unknown>): Record<st
 function parseObject(v: unknown): Record<string, unknown> { if (typeof v !== "string") return {}; const parsed = JSON.parse(v) as unknown; return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}; }
 function parseArray(v: unknown): unknown[] { if (typeof v !== "string") return []; const parsed = JSON.parse(v) as unknown; return Array.isArray(parsed) ? parsed : []; }
 function nullableString(v: unknown): string | null { return typeof v === "string" && v.length > 0 ? v : null; }
+function normalizeLocationLevel(value: unknown): UserContext["locationLevel"] { return value === "coarse" || value === "fine" ? value : "off"; }
+function normalizedLocation(location: UserLocation | null, level: UserContext["locationLevel"]): UserLocation | null {
+  if (!location || level === "off") return null;
+  const digits = level === "coarse" ? 1 : 5;
+  return { latitude: Number(location.latitude.toFixed(digits)), longitude: Number(location.longitude.toFixed(digits)), accuracy: level === "coarse" ? Math.max(10_000, location.accuracy) : location.accuracy, capturedAt: location.capturedAt, precision: level };
+}
 function excerptText(value: string): string { const compact = value.replace(/\s+/g, " ").trim(); return compact.length > 420 ? `${compact.slice(0, 417)}...` : compact; }
 function clampContent(value: string, max: number): string { const compact = value.replace(/\s+/g, " ").trim(); return compact.length > max ? `${compact.slice(0, Math.max(0, max - 3))}...` : compact; }
 function clampLimit(value: number | undefined, fallback: number, max: number): number { if (typeof value !== "number" || !Number.isFinite(value)) return fallback; return Math.min(Math.max(1, Math.trunc(value)), max); }
