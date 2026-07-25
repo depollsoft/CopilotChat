@@ -65,11 +65,15 @@ const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interact
 
 export class ActiveChatResponses {
   private readonly active = new Map<string, ActiveChatResponse>();
+  private readonly preparing = new Set<string>();
 
   has(chatId: string): boolean { return this.active.has(chatId); }
   chatIds(): string[] { return [...this.active.keys()]; }
+  reserve(chatId: string): boolean { if (this.active.has(chatId) || this.preparing.has(chatId)) return false; this.preparing.add(chatId); return true; }
+  releaseReservation(chatId: string): void { this.preparing.delete(chatId); }
 
   start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
+    this.preparing.delete(input.chat.id);
     const existing = this.active.get(input.chat.id);
     if (existing) return existing;
     const response = new ActiveChatResponse(input.chat.id);

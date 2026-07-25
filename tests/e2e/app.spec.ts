@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
+import type { MessageAttachment } from "@copilotchat/shared";
 
 test("core app flows work end to end", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers full management flow.");
@@ -444,6 +445,42 @@ test("composer sends attached files and pasted images", async ({ page }, testInf
   await expect(response).toContainText("pasted.png");
 });
 
+test("upload endpoint reports invalid metadata and limits as client errors", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers upload API errors.");
+  const headers = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+
+  const tooLarge = await page.request.post("/api/uploads?fileName=large.bin&mimeType=application%2Foctet-stream&size=1073741825", { headers, data: Buffer.alloc(0) });
+  const invalid = await page.request.post("/api/uploads?fileName=bad.bin&mimeType=application%2Foctet-stream&size=invalid", { headers, data: Buffer.alloc(0) });
+  const invalidName = await page.request.post("/api/uploads?fileName=%2F&mimeType=application%2Foctet-stream&size=1", { headers, data: Buffer.from("x") });
+  const sizeMismatch = await page.request.post("/api/uploads?fileName=short.bin&mimeType=application%2Foctet-stream&size=2", { headers, data: Buffer.from("x") });
+
+  expect(tooLarge.status()).toBe(413);
+  expect(invalid.status()).toBe(400);
+  expect(invalidName.status()).toBe(400);
+  expect(sizeMismatch.status()).toBe(400);
+});
+
+test("failed turn preparation does not persist messages or consume uploads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers turn rollback.");
+  const workspaceRoot = testInfo.outputPath("failed-turn-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed turn", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Failed turn", workspaceId: workspace.id } });
+  const chat = await chatResponse.json() as { id: string };
+  const uploadResponse = await page.request.post("/api/uploads?fileName=retry.txt&mimeType=text%2Fplain&size=5", { headers: { ...csrfHeaders, "Content-Type": "application/x-copilotchat-upload" }, data: Buffer.from("retry") });
+  const attachment = await uploadResponse.json() as MessageAttachment;
+
+  const messageResponse = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "This preparation should fail.", attachments: [attachment], workspaceId: workspace.id } });
+
+  expect(messageResponse.status()).toBe(500);
+  expect(await (await page.request.get(`/api/chats/${chat.id}/messages`)).json()).toEqual([]);
+  const discard = await page.request.delete(`/api/uploads/${attachment.uploadId}`, { headers: csrfHeaders });
+  expect(discard.ok()).toBe(true);
+});
+
 test("composer retains successful files and discards each upload once", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer upload errors.");
   await page.route("**/api/uploads?*", async (route) => {
@@ -485,6 +522,31 @@ test("composer retains staged uploads when message acceptance fails", async ({ p
   await expect(page.locator(".attachment-tray").filter({ hasText: "retry.txt" })).toBeVisible();
   await expect(composer).toHaveValue("Please retry this.");
   await expect(page.getByRole("alert")).toBeVisible();
+});
+
+test("composer disables submission while selected files are uploading", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers pending uploads.");
+  let releaseUpload!: () => void;
+  let markUploadStarted!: () => void;
+  const uploadBlocked = new Promise<void>((resolve) => { releaseUpload = resolve; });
+  const uploadStarted = new Promise<void>((resolve) => { markUploadStarted = resolve; });
+  await page.route("**/api/uploads?*", async (route) => {
+    if (new URL(route.request().url()).searchParams.get("fileName") === "pending.txt") { markUploadStarted(); await uploadBlocked; }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const selecting = page.locator('.composer input[type="file"]').setInputFiles({ name: "pending.txt", mimeType: "text/plain", buffer: Buffer.from("pending") });
+  await uploadStarted;
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await composer.fill("Wait for the file.");
+
+  await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+  releaseUpload();
+  await selecting;
+  await expect(page.locator(".attachment-tray").filter({ hasText: "pending.txt" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+  await page.getByRole("button", { name: "Remove pending.txt" }).click();
 });
 
 test("Escape discards staged composer uploads", async ({ page }, testInfo) => {
@@ -945,6 +1007,26 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".msg.user").filter({ hasText: "queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "You said: Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "Attachments: queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
+});
+
+test("message POST rejects payloads while a response is active", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers active response message routing.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
+  const chatId = decodeURIComponent(new URL(page.url()).pathname.split("/").pop()!);
+  const upload = await page.request.post("/api/uploads?fileName=active.txt&mimeType=text%2Fplain&size=6", { headers: { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" }, data: Buffer.from("active") });
+  expect(upload.ok()).toBe(true);
+  const attachment = await upload.json() as MessageAttachment;
+
+  const response = await page.request.post(`/api/chats/${chatId}/messages`, { headers: { "X-CopilotChat-CSRF": "1" }, data: { content: "Do not ignore this.", attachments: [attachment] } });
+
+  expect(response.status()).toBe(409);
+  const discard = await page.request.delete(`/api/uploads/${attachment.uploadId}`, { headers: { "X-CopilotChat-CSRF": "1" } });
+  expect(discard.ok()).toBe(true);
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
 });
 
 test("chat viewport follows live updates and can jump back to live", async ({ page }, testInfo) => {

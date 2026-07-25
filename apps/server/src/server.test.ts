@@ -127,6 +127,29 @@ describe("chat provider context", () => {
     expect(request.messages.map((message) => `${message.role}:${message.content}`)).toEqual(["user:First question", "assistant:First answer", "user:Second question"]);
   });
 
+  it("includes a pending user message before it is persisted", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Pending message", projectId: null, workspaceId: null });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Pending question" }, pendingUserMessage: { content: "Pending question", attachments: [{ id: "pending-file", name: "notes.txt", mimeType: "text/plain", size: 4, filePath: `/tmp/isolated/${chat.id}/.copilotchat/uploads/${chat.id}/notes.txt` }] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.messages).toEqual([{ role: "user", content: "Pending question", attachments: [{ type: "file", path: `/tmp/isolated/${chat.id}/.copilotchat/uploads/${chat.id}/notes.txt`, displayName: "notes.txt", size: 4 }] }]);
+    expect(db.listMessages(chat.id)).toEqual([]);
+  });
+
+  it("overrides existing message attachments in provider context", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Override attachments", projectId: null, workspaceId: null });
+    const message = db.addMessage({ chatId: chat.id, role: "user", content: "Updated question" });
+    db.replaceMessageAttachments(owner.id, chat.id, message.id, [{ id: "old", name: "old.txt", mimeType: "text/plain", size: 3, filePath: "/tmp/old.txt" }]);
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Updated question" }, messageOverride: { id: message.id, content: "Updated question", attachments: [{ id: "new", name: "new.txt", mimeType: "text/plain", size: 3, filePath: "/tmp/new.txt" }] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.messages).toEqual([{ role: "user", content: "Updated question", attachments: [{ type: "file", path: "/tmp/new.txt", displayName: "new.txt", size: 3 }] }]);
+  });
+
   it("uses saved chat model choices when a request does not override them", () => {
     const db = createTestDb();
     const owner = db.getOwner();
@@ -222,6 +245,9 @@ describe("chat provider context", () => {
     const chat = db.createChat(owner.id, { title: "Reconcile attachments", projectId: null, workspaceId: null });
     const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-isolated-"));
     try {
+      const unavailableRoot = path.join(isolatedRoot, "unavailable-root");
+      fs.writeFileSync(unavailableRoot, "not a directory");
+      db.registerWorkspace(owner.id, { name: "Unavailable", rootPath: unavailableRoot });
       const directory = path.join(isolatedRoot, chat.id, ".copilotchat", "uploads", chat.id);
       fs.mkdirSync(directory, { recursive: true });
       const referencedPath = path.join(directory, "referenced.txt");
@@ -230,11 +256,13 @@ describe("chat provider context", () => {
       fs.writeFileSync(orphanPath, "remove");
       const message = db.addMessage({ chatId: chat.id, role: "user", content: "Keep attachment" });
       db.replaceMessageAttachments(owner.id, chat.id, message.id, [{ id: "referenced", name: "referenced.txt", mimeType: "text/plain", size: 4, filePath: referencedPath }]);
+      const errors: string[] = [];
 
-      await expect(reconcileAttachmentFiles({ db, isolatedWorkspaceRoot: isolatedRoot })).resolves.toBe(1);
+      await expect(reconcileAttachmentFiles({ db, isolatedWorkspaceRoot: isolatedRoot, onError: (rootPath) => errors.push(rootPath) })).resolves.toBe(1);
 
       expect(fs.existsSync(referencedPath)).toBe(true);
       expect(fs.existsSync(orphanPath)).toBe(false);
+      expect(errors).toEqual([unavailableRoot]);
     } finally {
       fs.rmSync(isolatedRoot, { recursive: true, force: true });
     }
@@ -487,6 +515,23 @@ describe("chat provider context", () => {
     }
   });
 
+  it("serializes import assignment updates with owner deletion", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const draft = await draftStore.create("github:alice", { source: "auto", fileName: "alice.json", encoding: "text", content: "{}" });
+
+      const updated = draftStore.setAssignments("github:alice", draft.id, [{ conversationTitle: "Chat", projectName: "Project" }]);
+      const deleted = draftStore.deleteOwner("github:alice");
+
+      await expect(updated).resolves.toMatchObject({ assignments: [{ conversationTitle: "Chat", projectName: "Project" }] });
+      await expect(deleted).resolves.toBe(1);
+      await expect(draftStore.get("github:alice", draft.id)).rejects.toThrow();
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
   it("keeps import draft metadata when content deletion fails", async () => {
     const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
     try {
@@ -681,6 +726,15 @@ describe("chat provider context", () => {
 
     expect(responses.has(chat.id)).toBe(false);
     releaseCleanup();
+  });
+
+  it("reserves chat preparation before an active response starts", () => {
+    const responses = new ActiveChatResponses();
+
+    expect(responses.reserve("chat-1")).toBe(true);
+    expect(responses.reserve("chat-1")).toBe(false);
+    responses.releaseReservation("chat-1");
+    expect(responses.reserve("chat-1")).toBe(true);
   });
 
   it("queues original upload references when steering is unavailable", async () => {

@@ -126,10 +126,16 @@ export function forgetValidatedAttachmentTree(rootPath: string): void {
   for (const filePath of validatedFiles.keys()) if (isPathInside(rootPath, filePath)) validatedFiles.delete(filePath);
 }
 
-export async function reconcileAttachmentFiles(input: { db: AppDatabase; isolatedWorkspaceRoot: string }): Promise<number> {
+export async function reconcileAttachmentFiles(input: { db: AppDatabase; isolatedWorkspaceRoot: string; onError?: (rootPath: string, error: unknown) => void }): Promise<number> {
   const referenced = new Set(input.db.listAllAttachmentFilePaths().map((filePath) => path.resolve(filePath)));
   let deleted = 0;
-  for (const workspaceRoot of input.db.listAllWorkspaceRoots()) deleted += await cleanManagedUploadRoot(path.join(workspaceRoot, attachmentDirectoryName), referenced);
+  for (const workspaceRoot of input.db.listAllWorkspaceRoots()) {
+    try {
+      deleted += await cleanManagedUploadRoot(path.join(workspaceRoot, attachmentDirectoryName), referenced);
+    } catch (error) {
+      input.onError?.(workspaceRoot, error);
+    }
+  }
   let isolatedWorkspaces: Dirent[];
   try {
     isolatedWorkspaces = await fs.readdir(input.isolatedWorkspaceRoot, { withFileTypes: true });
@@ -139,7 +145,12 @@ export async function reconcileAttachmentFiles(input: { db: AppDatabase; isolate
   }
   for (const workspace of isolatedWorkspaces) {
     if (!workspace.isDirectory() || workspace.isSymbolicLink()) continue;
-    deleted += await cleanManagedUploadRoot(path.join(input.isolatedWorkspaceRoot, workspace.name, attachmentDirectoryName), referenced);
+    const workspaceRoot = path.join(input.isolatedWorkspaceRoot, workspace.name);
+    try {
+      deleted += await cleanManagedUploadRoot(path.join(workspaceRoot, attachmentDirectoryName), referenced);
+    } catch (error) {
+      input.onError?.(workspaceRoot, error);
+    }
   }
   return deleted;
 }

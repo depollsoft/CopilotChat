@@ -26,7 +26,7 @@ import { ActiveChatResponses } from "./responses.js";
 import type { InternalSendMessageRequest } from "./responses.js";
 import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
-import { UploadedFileStore } from "./uploaded-files.js";
+import { UploadLimitError, UploadedFileStore, UploadValidationError } from "./uploaded-files.js";
 
 const config = loadConfig();
 if (config.authMode === "github" && !config.sessionSecret) throw new Error("COPILOTCHAT_SESSION_SECRET is required when COPILOTCHAT_AUTH_MODE=github.");
@@ -37,10 +37,10 @@ const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-draf
 const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes, config.stagedUploadLimitBytes, config.stagedUploadLimitFiles);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
 await importDrafts.cleanupOrphans();
-await reconcileAttachmentFiles({ db, isolatedWorkspaceRoot });
 const provider = createConfiguredProvider(config.authMode === "local" ? config.copilotGitHubToken : undefined);
 const activeResponses = new ActiveChatResponses();
 const app = Fastify({ logger: true, bodyLimit: config.bodyLimitBytes });
+await reconcileAttachmentFiles({ db, isolatedWorkspaceRoot, onError: (workspaceRoot, error) => app.log.warn({ err: error, workspaceRoot }, "Could not reconcile workspace attachments.") });
 await uploadedFiles.cleanupExpired();
 const uploadCleanupTimer = setInterval(() => { void uploadedFiles.cleanupExpired().catch((error) => app.log.error({ err: error }, "Could not clean expired uploads.")); }, 60 * 60 * 1000);
 uploadCleanupTimer.unref();
@@ -91,22 +91,25 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: InternalS
   const materialized = await materializeMessageAttachments({ uploads: uploadedFiles, ownerId, chatId: chat.id, workspaceDir, maxBytes: config.uploadLimitBytes, uploadClaimId: input.uploadClaimId, attachments: input.attachments });
   const attachments = materialized.attachments;
   let filesPersisted = materialized.createdFilePaths.length === 0;
+  let addedUserMessage: ChatMessage | null = null;
   try {
     if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
+    const titleRequired = db.listMessages(chat.id).filter((message) => message.role === "user").length + (existingUserMessage ? 0 : 1) <= 1;
+    const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, pendingUserMessage: existingUserMessage ? undefined : { content: input.content, attachments }, messageOverride: existingUserMessage && input.attachments !== undefined ? { id: existingUserMessage.id, content: input.content, attachments } : undefined, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
+    attachImportGuidance(ownerId, input, providerRequest);
+    providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
     const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
+    if (!existingUserMessage) addedUserMessage = userMessage;
     if ((!existingUserMessage && attachments.length > 0) || (existingUserMessage && input.attachments !== undefined)) {
       db.replaceMessageAttachments(ownerId, chat.id, userMessage.id, attachments);
       filesPersisted = true;
     }
     if (!existingUserMessage && !chat.titleManuallySet && (chat.title === "New chat" || chat.title === "Untitled chat")) chat = db.updateChatTitle(ownerId, chat.id, input.content.trim() ? titleFromContent(input.content) : titleFromContent(attachments.map((attachment) => attachment.name).join(" ")), "auto");
-    const titleRequired = !chat.titleManuallySet && db.listMessages(chat.id).filter((message) => message.role === "user").length <= 1;
-    const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
-    attachImportGuidance(ownerId, input, providerRequest);
-    providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
     await completeUploadClaim(ownerId, input.uploadClaimId);
     return { chat, userMessage, providerRequest: { ...providerRequest, reasoningEffort: providerRequest.reasoningEffort ?? "default" } };
   } catch (error) {
-    if (!filesPersisted) await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
+    if (addedUserMessage) db.deleteMessage(ownerId, chat.id, addedUserMessage.id);
+    if (addedUserMessage || !filesPersisted) await removeTemporaryAttachmentFiles(materialized.createdFilePaths);
     throw error;
   }
 }
@@ -253,8 +256,14 @@ app.post(`${apiPrefix}/chats/:chatId/messages`, async (request, reply) => {
   const params = z.object({ chatId: z.string() }).parse(request.params);
   const input = sendMessageRequestSchema.parse(request.body);
   const existing = db.getChat(owner.id, params.chatId);
-  if (activeResponses.has(existing.id)) { activeResponses.attach(existing.id, reply); return; }
-  const turn = await withUploadClaim(owner.id, input, (claimedInput) => prepareChatTurn(owner.id, params.chatId, claimedInput));
+  if (!activeResponses.reserve(existing.id)) { reply.code(409).send({ error: "A response is already active or being prepared. Use the active-response input endpoint to steer or queue another message." }); return; }
+  let turn: Awaited<ReturnType<typeof prepareChatTurn>>;
+  try {
+    turn = await withUploadClaim(owner.id, input, (claimedInput) => prepareChatTurn(owner.id, params.chatId, claimedInput));
+  } catch (error) {
+    activeResponses.releaseReservation(existing.id);
+    throw error;
+  }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -264,12 +273,19 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, 
   const input = editMessageRequestSchema.parse(request.body);
   db.getChat(owner.id, params.chatId);
   activeResponses.cancel(params.chatId);
-  const turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
-    return withUploadClaim(owner.id, input, async (claimedInput) => {
-      const userMessage = db.editUserMessageAndTruncate(owner.id, params.chatId, params.messageId, input.content);
-      return prepareChatTurn(owner.id, params.chatId, claimedInput, userMessage);
+  if (!activeResponses.reserve(params.chatId)) { reply.code(409).send({ error: "A response is already being prepared for this chat." }); return; }
+  let turn: Awaited<ReturnType<typeof prepareChatTurn>>;
+  try {
+    turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
+      return withUploadClaim(owner.id, input, async (claimedInput) => {
+        const userMessage = db.editUserMessageAndTruncate(owner.id, params.chatId, params.messageId, input.content);
+        return prepareChatTurn(owner.id, params.chatId, claimedInput, userMessage);
+      });
     });
-  });
+  } catch (error) {
+    activeResponses.releaseReservation(params.chatId);
+    throw error;
+  }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -279,12 +295,19 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request,
   const input = sendMessageRequestSchema.omit({ content: true, projectId: true, workspaceId: true }).parse(request.body);
   db.getChat(owner.id, params.chatId);
   activeResponses.cancel(params.chatId);
-  const turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
-    return withUploadClaim(owner.id, { ...input, content: "" }, async (claimedInput) => {
-      const userMessage = db.retryAssistantMessage(owner.id, params.chatId, params.messageId);
-      return prepareChatTurn(owner.id, params.chatId, { ...claimedInput, content: userMessage.content }, userMessage);
+  if (!activeResponses.reserve(params.chatId)) { reply.code(409).send({ error: "A response is already being prepared for this chat." }); return; }
+  let turn: Awaited<ReturnType<typeof prepareChatTurn>>;
+  try {
+    turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
+      return withUploadClaim(owner.id, { ...input, content: "" }, async (claimedInput) => {
+        const userMessage = db.retryAssistantMessage(owner.id, params.chatId, params.messageId);
+        return prepareChatTurn(owner.id, params.chatId, { ...claimedInput, content: userMessage.content }, userMessage);
+      });
     });
-  });
+  } catch (error) {
+    activeResponses.releaseReservation(params.chatId);
+    throw error;
+  }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
   activeResponses.attach(turn.chat.id, reply);
 });
@@ -302,11 +325,22 @@ app.post(`${apiPrefix}/workspaces`, async (request) => { const owner = ownerFor(
 app.patch(`${apiPrefix}/workspaces/:workspaceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); return db.updateWorkspace(owner.id, params.workspaceId, updateWorkspaceRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/workspaces/:workspaceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); db.deleteWorkspace(owner.id, params.workspaceId); return { ok: true }; });
 app.post(`${apiPrefix}/workspaces/:workspaceId/commands`, async (request) => { const owner = ownerFor(request); const params = z.object({ workspaceId: z.string() }).parse(request.params); const input = runWorkspaceCommandRequestSchema.parse(request.body); const workspace = db.getWorkspace(owner.id, params.workspaceId); const toolRun = db.createToolRun(owner.id, { chatId: null, workspaceId: workspace.id, toolName: "workspace.command", input }); try { const output = await runWorkspaceCommand({ workspace, command: input.command, cwd: input.cwd, timeoutMs: input.timeoutMs }); return db.finishToolRun(toolRun.id, output.exitCode === 0 ? "succeeded" : "failed", output, null); } catch (error) { return db.finishToolRun(toolRun.id, "failed", {}, (error as Error).message); } });
-app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (request) => {
+app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (request, reply) => {
   const owner = ownerFor(request);
-  const query = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).parse(request.query);
-  if (!(request.body instanceof Readable)) throw new Error("Upload body must be a binary stream.");
-  return uploadedFiles.create(owner.id, query, request.body);
+  const parsed = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).safeParse(request.query);
+  if (!parsed.success) {
+    const tooLarge = parsed.error.issues.some((issue) => issue.path[0] === "size" && issue.code === "too_big");
+    reply.code(tooLarge ? 413 : 400).send({ error: parsed.error.issues[0]?.message ?? "Invalid upload metadata." });
+    return;
+  }
+  if (!(request.body instanceof Readable)) { reply.code(400).send({ error: "Upload body must be a binary stream." }); return; }
+  try {
+    return await uploadedFiles.create(owner.id, parsed.data, request.body);
+  } catch (error) {
+    if (error instanceof UploadLimitError) { reply.code(413).send({ error: error.message }); return; }
+    if (error instanceof UploadValidationError) { reply.code(400).send({ error: error.message }); return; }
+    throw error;
+  }
 });
 app.delete(`${apiPrefix}/uploads/:uploadId`, async (request) => { const owner = ownerFor(request); const params = z.object({ uploadId: z.string().min(1) }).parse(request.params); await uploadedFiles.delete(owner.id, params.uploadId); return { ok: true }; });
 app.post(`${apiPrefix}/imports/drafts`, async (request) => {

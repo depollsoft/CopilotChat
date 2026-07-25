@@ -19,6 +19,8 @@ const uploadedFileSchema = z.object({
 });
 
 export type UploadedFile = z.infer<typeof uploadedFileSchema>;
+export class UploadLimitError extends Error {}
+export class UploadValidationError extends Error {}
 
 export class UploadedFileStore {
   private readonly claimsByUpload = new Map<string, { claimId: string; ownerId: string }>();
@@ -31,10 +33,10 @@ export class UploadedFileStore {
   constructor(private readonly rootDir: string, private readonly maxBytes: number, private readonly maxStagedBytes = maxBytes, private readonly maxStagedFiles = 100) {}
 
   async create(ownerId: string, input: { fileName: string; mimeType: string; size: number }, source: Readable): Promise<MessageAttachment> {
-    if (input.size > this.maxBytes) throw new Error(`Upload exceeds the ${formatBytes(this.maxBytes)} limit.`);
+    if (input.size > this.maxBytes) throw new UploadLimitError(`Upload exceeds the ${formatBytes(this.maxBytes)} limit.`);
     await fs.mkdir(this.rootDir, { recursive: true });
     const fileName = path.basename(input.fileName).trim();
-    if (!fileName || fileName === "." || fileName === "..") throw new Error("Upload requires a valid file name.");
+    if (!fileName || fileName === "." || fileName === "..") throw new UploadValidationError("Upload requires a valid file name.");
     const id = randomUUID();
     const releaseReservation = await this.reserve(ownerId, input.size);
     this.activeUploadIds.add(id);
@@ -44,14 +46,14 @@ export class UploadedFileStore {
     const limiter = new Transform({
       transform(chunk: Buffer, _encoding, callback) {
         received += chunk.length;
-        if (received > input.size) { callback(new Error("Upload contained more bytes than declared.")); return; }
+        if (received > input.size) { callback(new UploadValidationError("Upload contained more bytes than declared.")); return; }
         hash.update(chunk);
         callback(null, chunk);
       },
     });
     try {
       await pipeline(source, limiter, createWriteStream(temporaryPath, { flags: "wx" }));
-      if (received !== input.size) throw new Error(`Upload size mismatch: expected ${input.size} bytes but received ${received}.`);
+      if (received !== input.size) throw new UploadValidationError(`Upload size mismatch: expected ${input.size} bytes but received ${received}.`);
       const uploaded: UploadedFile = { id, ownerId, fileName, mimeType: input.mimeType, size: input.size, sha256: hash.digest("hex"), createdAt: new Date().toISOString() };
       await fs.rename(temporaryPath, this.dataPath(uploaded.id));
       await fs.writeFile(this.metadataPath(uploaded.id), JSON.stringify(uploaded), { encoding: "utf8", flag: "wx" });
@@ -227,8 +229,8 @@ export class UploadedFileStore {
       await this.cleanupExpiredUnlocked();
       const usage = await this.ownerUsage(ownerId);
       const reserved = this.reservationsByOwner.get(ownerId) ?? { bytes: 0, count: 0 };
-      if (usage.bytes + reserved.bytes + size > this.maxStagedBytes) throw new Error(`Staged uploads exceed the ${formatBytes(this.maxStagedBytes)} per-owner limit.`);
-      if (usage.count + reserved.count + 1 > this.maxStagedFiles) throw new Error(`Staged uploads exceed the ${this.maxStagedFiles}-file per-owner limit.`);
+      if (usage.bytes + reserved.bytes + size > this.maxStagedBytes) throw new UploadLimitError(`Staged uploads exceed the ${formatBytes(this.maxStagedBytes)} per-owner limit.`);
+      if (usage.count + reserved.count + 1 > this.maxStagedFiles) throw new UploadLimitError(`Staged uploads exceed the ${this.maxStagedFiles}-file per-owner limit.`);
       this.reservationsByOwner.set(ownerId, { bytes: reserved.bytes + size, count: reserved.count + 1 });
     });
     let released = false;

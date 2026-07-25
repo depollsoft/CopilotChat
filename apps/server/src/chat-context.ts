@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderChatRequest, ProviderMessage, ProviderTitleTool } from "@copilotchat/provider";
-import type { Chat, SendMessageRequest } from "@copilotchat/shared";
+import type { Chat, MessageAttachment, SendMessageRequest } from "@copilotchat/shared";
 import { messageAttachmentSchema } from "@copilotchat/shared";
 import { buildConversationTools } from "./conversation-tools.js";
 import type { AppDatabase } from "./db.js";
@@ -14,9 +14,10 @@ export function applyChatTurnScope(db: AppDatabase, ownerId: string, chatId: str
   return db.updateChat(ownerId, chat.id, { projectId, workspaceId });
 }
 
-export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: string; chat: Chat; message: SendMessageRequest; defaultModel: string; gitHubToken: string | null; context: ChatContextOptions; titleTool?: ProviderTitleTool }): ProviderChatRequest {
+export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: string; chat: Chat; message: SendMessageRequest; pendingUserMessage?: { content: string; attachments: MessageAttachment[] }; messageOverride?: { id: string; content: string; attachments: MessageAttachment[] }; defaultModel: string; gitHubToken: string | null; context: ChatContextOptions; titleTool?: ProviderTitleTool }): ProviderChatRequest {
   const project = input.chat.projectId ? input.db.getProject(input.ownerId, input.chat.projectId) : null;
-  const messages: ProviderMessage[] = input.db.listMessages(input.chat.id, { includeAttachmentData: true, includeAttachmentFilePaths: true }).map((message) => ({ role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) }));
+  const messages: ProviderMessage[] = input.db.listMessages(input.chat.id, { includeAttachmentData: true, includeAttachmentFilePaths: true }).map((message) => message.id === input.messageOverride?.id ? { role: message.role, content: input.messageOverride.content, attachments: providerAttachments(input.messageOverride.attachments) } : { role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) });
+  if (input.pendingUserMessage) messages.push({ role: "user", content: input.pendingUserMessage.content, attachments: providerAttachments(input.pendingUserMessage.attachments) });
   const workingDirectory = chatWorkingDirectory(input.db, input.ownerId, input.chat, input.context.isolatedWorkspaceRoot);
   return {
     messages,
@@ -39,12 +40,16 @@ export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: stri
 function readProviderAttachments(metadata: Record<string, unknown>): ProviderMessage["attachments"] {
   const parsed = messageAttachmentSchema.array().safeParse(metadata.attachments);
   if (!parsed.success || parsed.data.length === 0) return undefined;
+  return providerAttachments(parsed.data);
+}
+
+function providerAttachments(values: MessageAttachment[]): ProviderMessage["attachments"] {
   const attachments: NonNullable<ProviderMessage["attachments"]> = [];
-  for (const attachment of parsed.data) {
+  for (const attachment of values) {
     if (attachment.filePath) attachments.push({ type: "file", path: attachment.filePath, displayName: attachment.name, size: attachment.size });
     else if (attachment.data) attachments.push({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name, size: attachment.size });
   }
-  return attachments;
+  return attachments.length > 0 ? attachments : undefined;
 }
 
 function newProviderSessionId(ownerId: string, chatId: string): string {

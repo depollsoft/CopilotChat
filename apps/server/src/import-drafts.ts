@@ -77,6 +77,10 @@ export class ImportDraftStore {
   }
 
   async setAssignments(ownerId: string, id: string, assignments: ImportProjectAssignment[]): Promise<StoredImportDraft> {
+    return this.withOperationLock(() => this.setAssignmentsUnlocked(ownerId, id, assignments));
+  }
+
+  private async setAssignmentsUnlocked(ownerId: string, id: string, assignments: ImportProjectAssignment[]): Promise<StoredImportDraft> {
     const draft = await this.get(ownerId, id);
     const next = { ...draft, assignments: z.array(assignmentSchema).parse(assignments) };
     await fs.writeFile(this.pathFor(id), JSON.stringify(next), "utf8");
