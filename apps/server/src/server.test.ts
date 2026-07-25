@@ -12,7 +12,7 @@ import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js"
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
-import { assertImportPayloadSize, ImportDraftStore } from "./import-drafts.js";
+import { assertImportPayloadSize, ImportDraftStore, ImportLimitError } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
@@ -494,6 +494,55 @@ describe("chat provider context", () => {
       expect(applied.importedConversations).toBe(1);
       expect(db.listProjects(owner.id).map((project) => project.name)).toContain("Imported Project");
       expect(db.listChats(owner.id).map((chat) => chat.title)).toContain("Imported strategy chat");
+      await expect(draftStore.get(owner.id, draft.id)).rejects.toThrow();
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("allows only one concurrent apply for an import draft", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const draft = await draftStore.create(owner.id, { source: "auto", fileName: "chatgpt.json", encoding: "text", content: JSON.stringify([{ id: "chatgpt-once", title: "Import once", current_node: "m1", mapping: { m1: { id: "m1", parent: null, children: [], message: { author: { role: "user" }, content: { content_type: "text", parts: ["Only once"] }, create_time: 1, metadata: {} } } } }]) });
+      const applyTool = buildImportTools({ db, ownerId: owner.id, drafts: draftStore }).find((tool) => tool.name === "apply_import_draft")!;
+
+      const results = await Promise.allSettled([
+        applyTool.handler({ draftId: draft.id, confirmed: true }),
+        applyTool.handler({ draftId: draft.id, confirmed: true }),
+      ]);
+
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      expect(db.listChats(owner.id).filter((chat) => chat.title === "Import once")).toHaveLength(1);
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
+    }
+  });
+
+  it("holds the import owner clear barrier until draft consumption finishes", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    let releaseConsume!: () => void;
+    let markConsumeStarted!: () => void;
+    const consumeBlocked = new Promise<void>((resolve) => { releaseConsume = resolve; });
+    const consumeStarted = new Promise<void>((resolve) => { markConsumeStarted = resolve; });
+    try {
+      const draftStore = new ImportDraftStore(draftDir);
+      const draft = await draftStore.create("github:alice", { source: "auto", fileName: "draft.json", encoding: "text", content: "{}" });
+      const consuming = draftStore.consume("github:alice", draft.id, async () => { markConsumeStarted(); await consumeBlocked; });
+      await consumeStarted;
+      let clearActionRan = false;
+      const clearing = draftStore.clearOwner("github:alice", async () => { clearActionRan = true; });
+
+      expect(clearActionRan).toBe(false);
+      releaseConsume();
+      await consuming;
+      await clearing;
+
+      expect(clearActionRan).toBe(true);
+      await expect(draftStore.get("github:alice", draft.id)).rejects.toThrow();
     } finally {
       fs.rmSync(draftDir, { recursive: true, force: true });
     }
@@ -735,6 +784,11 @@ describe("chat provider context", () => {
     expect(responses.reserve("chat-1")).toBe(false);
     responses.releaseReservation("chat-1");
     expect(responses.reserve("chat-1")).toBe(true);
+    responses.releaseReservation("chat-1");
+    expect(responses.beginDeletion("chat-1")).toBe(true);
+    expect(responses.reserve("chat-1")).toBe(false);
+    responses.endDeletion("chat-1");
+    expect(responses.reserve("chat-1")).toBe(true);
   });
 
   it("queues original upload references when steering is unavailable", async () => {
@@ -815,15 +869,48 @@ describe("chat provider context", () => {
       const staleTime = new Date(Date.now() - 25 * 60 * 60 * 1000);
       const orphanPath = path.join(uploadDir, "orphan.upload");
       const partialPath = path.join(uploadDir, "partial.upload.part");
+      const metadataPartialPath = path.join(uploadDir, "metadata.json.part");
       fs.writeFileSync(orphanPath, "orphan");
       fs.writeFileSync(partialPath, "partial");
+      fs.writeFileSync(metadataPartialPath, "partial");
       fs.utimesSync(orphanPath, staleTime, staleTime);
       fs.utimesSync(partialPath, staleTime, staleTime);
+      fs.utimesSync(metadataPartialPath, staleTime, staleTime);
 
       await uploads.cleanupExpired();
 
       expect(fs.existsSync(orphanPath)).toBe(false);
       expect(fs.existsSync(partialPath)).toBe(false);
+      expect(fs.existsSync(metadataPartialPath)).toBe(false);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("coordinates owner deletion with active upload streams", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    let releaseStream!: () => void;
+    let markStreamStarted!: () => void;
+    const streamBlocked = new Promise<void>((resolve) => { releaseStream = resolve; });
+    const streamStarted = new Promise<void>((resolve) => { markStreamStarted = resolve; });
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const source = Readable.from((async function* () { markStreamStarted(); await streamBlocked; yield "data"; })());
+      const creating = uploads.create("github:alice", { fileName: "active.bin", mimeType: "application/octet-stream", size: 4 }, source);
+      await streamStarted;
+      let deletionSettled = false;
+      let clearActionRan = false;
+      const deleting = uploads.clearOwner("github:alice", async () => { clearActionRan = true; }).finally(() => { deletionSettled = true; });
+
+      await expect(uploads.create("github:alice", { fileName: "late.bin", mimeType: "application/octet-stream", size: 1 }, Readable.from(["x"]))).rejects.toThrow("being cleared");
+      expect(deletionSettled).toBe(false);
+      expect(clearActionRan).toBe(false);
+      releaseStream();
+      const uploaded = await creating;
+
+      await expect(deleting).resolves.toBeUndefined();
+      expect(clearActionRan).toBe(true);
+      await expect(uploads.get("github:alice", uploaded.uploadId!)).rejects.toThrow();
     } finally {
       fs.rmSync(uploadDir, { recursive: true, force: true });
     }
@@ -847,10 +934,11 @@ describe("chat provider context", () => {
     const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
     try {
       const draftStore = new ImportDraftStore(draftDir, 4);
-      await expect(draftStore.create("github:alice", { source: "auto", fileName: "large.json", encoding: "text", content: "12345" })).rejects.toThrow("limit");
+      await expect(draftStore.create("github:alice", { source: "auto", fileName: "large.json", encoding: "text", content: "12345" })).rejects.toBeInstanceOf(ImportLimitError);
       expect(() => assertImportPayloadSize({ fileName: "export.zip", encoding: "base64", content: Buffer.from("12345").toString("base64") }, 4)).toThrow("limit");
       expect(() => assertImportPayloadSize({ fileName: "export.zip", encoding: "base64", content: Buffer.from("1234").toString("base64") }, 4)).not.toThrow();
       expect(() => assertImportPayloadSize({ fileName: "large.json", encoding: "base64", content: " \n[]".repeat(100) }, 4)).toThrow("text encoding");
+      expect(() => assertImportPayloadSize({ fileName: "export.zip", encoding: "base64", content: "!!!!" }, 4)).toThrow("valid base64");
       const uploads = new UploadedFileStore(uploadDir, 1024);
       const uploaded = await uploads.create("github:alice", { fileName: "large.json", mimeType: "application/json", size: 5 }, Readable.from(["12345"]));
       const claimId = await uploads.claim("github:alice", [uploaded.uploadId!]);
@@ -860,6 +948,31 @@ describe("chat provider context", () => {
     } finally {
       fs.rmSync(draftDir, { recursive: true, force: true });
       fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces aggregate import draft storage per owner", async () => {
+    const draftDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-import-drafts-"));
+    try {
+      const seedStore = new ImportDraftStore(draftDir, 10, 10_000);
+      const first = await seedStore.create("github:alice", { source: "auto", fileName: "draft.json", encoding: "text", content: "1234" });
+      const firstBytes = fs.statSync(path.join(draftDir, `${first.id}.json`)).size + fs.statSync(path.join(draftDir, `${first.id}.data`)).size;
+      const draftStore = new ImportDraftStore(draftDir, 10, firstBytes + 1);
+
+      await expect(draftStore.create("github:alice", { source: "auto", fileName: "draft.json", encoding: "text", content: "5678" })).rejects.toThrow("per-owner limit");
+
+      await draftStore.delete("github:alice", first.id);
+      await expect(draftStore.create("github:alice", { source: "auto", fileName: "draft.json", encoding: "text", content: "5678" })).resolves.toBeDefined();
+
+      const encodedDir = path.join(draftDir, "encoded");
+      const encodedSeed = new ImportDraftStore(encodedDir, 10, 10_000);
+      const encoded = await encodedSeed.create("github:alice", { source: "auto", fileName: "encoded.zip", encoding: "base64", content: Buffer.from("1234").toString("base64") });
+      const encodedBytes = fs.statSync(path.join(encodedDir, `${encoded.id}.json`)).size + fs.statSync(path.join(encodedDir, `${encoded.id}.data`)).size;
+      await encodedSeed.delete("github:alice", encoded.id);
+      const encodedLimited = new ImportDraftStore(encodedDir, 10, encodedBytes - 1);
+      await expect(encodedLimited.create("github:alice", { source: "auto", fileName: "encoded.zip", encoding: "base64", content: Buffer.from("1234").toString("base64") })).rejects.toThrow("per-owner limit");
+    } finally {
+      fs.rmSync(draftDir, { recursive: true, force: true });
     }
   });
 

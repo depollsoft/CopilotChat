@@ -66,11 +66,16 @@ const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interact
 export class ActiveChatResponses {
   private readonly active = new Map<string, ActiveChatResponse>();
   private readonly preparing = new Set<string>();
+  private readonly deleting = new Set<string>();
+  private readonly completions = new Map<string, Set<Promise<void>>>();
+  private readonly chatOwners = new Map<string, string>();
 
   has(chatId: string): boolean { return this.active.has(chatId); }
   chatIds(): string[] { return [...this.active.keys()]; }
-  reserve(chatId: string): boolean { if (this.active.has(chatId) || this.preparing.has(chatId)) return false; this.preparing.add(chatId); return true; }
+  reserve(chatId: string): boolean { if (this.active.has(chatId) || this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.preparing.add(chatId); return true; }
   releaseReservation(chatId: string): void { this.preparing.delete(chatId); }
+  beginDeletion(chatId: string): boolean { if (this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.deleting.add(chatId); return true; }
+  endDeletion(chatId: string): void { this.deleting.delete(chatId); }
 
   start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
     this.preparing.delete(input.chat.id);
@@ -78,8 +83,16 @@ export class ActiveChatResponses {
     if (existing) return existing;
     const response = new ActiveChatResponse(input.chat.id);
     this.active.set(input.chat.id, response);
+    this.chatOwners.set(input.chat.id, input.ownerId);
     const providerRequest = response.decorateProviderRequest(input.providerRequest);
-    void Promise.resolve().then(() => this.run(response, { ...input, providerRequest }));
+    const completion = Promise.resolve().then(() => this.run(response, { ...input, providerRequest })).finally(() => {
+      const chatCompletions = this.completions.get(input.chat.id);
+      chatCompletions?.delete(completion);
+      if (chatCompletions?.size === 0) { this.completions.delete(input.chat.id); this.chatOwners.delete(input.chat.id); }
+    });
+    const chatCompletions = this.completions.get(input.chat.id) ?? new Set<Promise<void>>();
+    chatCompletions.add(completion);
+    this.completions.set(input.chat.id, chatCompletions);
     return response;
   }
 
@@ -106,6 +119,20 @@ export class ActiveChatResponses {
 
   cancelAll(): void {
     for (const chatId of [...this.active.keys()]) this.cancel(chatId);
+  }
+
+  async cancelAndWait(chatId: string): Promise<boolean> {
+    const cancelled = this.cancel(chatId);
+    const completions = [...(this.completions.get(chatId) ?? [])];
+    if (completions.length > 0) await Promise.allSettled(completions);
+    return cancelled;
+  }
+
+  async cancelOwnerAndWait(ownerId: string): Promise<void> {
+    const chatIds = [...this.chatOwners.entries()].filter(([, owner]) => owner === ownerId).map(([chatId]) => chatId);
+    for (const chatId of chatIds) this.cancel(chatId);
+    const completions = chatIds.flatMap((chatId) => [...(this.completions.get(chatId) ?? [])]);
+    if (completions.length > 0) await Promise.allSettled(completions);
   }
 
   resolveInteraction(chatId: string, interactionId: string, resolution: InteractionResolution): boolean {

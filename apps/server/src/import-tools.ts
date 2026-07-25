@@ -59,9 +59,11 @@ export function buildImportTools(input: { db: AppDatabase; ownerId: string; draf
       handler: async (args) => {
         const parsed = applyArgsSchema.parse(args);
         if (!parsed.confirmed) throw new Error("Import apply requires explicit user confirmation.");
-        const { draft, preview } = await loadPreview(input, parsed.draftId);
-        const result = applyImportPreview(input.db, input.ownerId, preview, draft.assignments);
-        return { importedConversations: result.imported.length, importedProjects: result.importedProjects, warnings: result.warnings };
+        return input.drafts.consume(input.ownerId, parsed.draftId, async (draft) => {
+          const preview = await parseDraft(input.drafts, draft);
+          const result = applyImportPreview(input.db, input.ownerId, preview, draft.assignments);
+          return { importedConversations: result.imported.length, importedProjects: result.importedProjects, warnings: result.warnings };
+        });
       },
     },
   ];

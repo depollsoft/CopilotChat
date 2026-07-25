@@ -251,7 +251,7 @@ export const updateWorkspaceRequestSchema = z.object({ name: z.string().min(1).o
 export type UpdateWorkspaceRequest = z.infer<typeof updateWorkspaceRequestSchema>;
 export const runWorkspaceCommandRequestSchema = z.object({ command: z.string().min(1), cwd: z.string().optional().default("."), timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000) });
 export type RunWorkspaceCommandRequest = z.infer<typeof runWorkspaceCommandRequestSchema>;
-export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
+export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1).max(1024), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
 export type ImportPreviewRequest = z.infer<typeof importPreviewRequestSchema>;
 
 export function titleFromContent(content: string): string {

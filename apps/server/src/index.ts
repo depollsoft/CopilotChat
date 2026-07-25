@@ -19,7 +19,7 @@ import { applyChatTurnScope, buildProviderChatRequest, chatWorkingDirectory } fr
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
-import { assertImportPayloadSize, ImportDraftStore } from "./import-drafts.js";
+import { assertImportPayloadSize, ImportDraftStore, ImportLimitError } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
 import { ProviderStatusCache } from "./provider-status-cache.js";
 import { ActiveChatResponses } from "./responses.js";
@@ -28,12 +28,46 @@ import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspa
 import { isAllowedCorsOrigin } from "./cors-origin.js";
 import { UploadLimitError, UploadedFileStore, UploadValidationError } from "./uploaded-files.js";
 
+class OwnerClearingError extends Error {}
+class OwnerMutationBarrier {
+  private readonly clearing = new Set<string>();
+  private readonly active = new Map<string, number>();
+  private readonly waiters = new Map<string, Set<() => void>>();
+
+  begin(ownerId: string): () => void {
+    if (this.clearing.has(ownerId)) throw new OwnerClearingError("Owner data is currently being cleared.");
+    this.active.set(ownerId, (this.active.get(ownerId) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = Math.max(0, (this.active.get(ownerId) ?? 1) - 1);
+      if (next > 0) { this.active.set(ownerId, next); return; }
+      this.active.delete(ownerId);
+      const ownerWaiters = this.waiters.get(ownerId);
+      this.waiters.delete(ownerId);
+      for (const resolve of ownerWaiters ?? []) resolve();
+    };
+  }
+
+  async clear<T>(ownerId: string, action: () => Promise<T>): Promise<T> {
+    if (this.clearing.has(ownerId)) throw new OwnerClearingError("Owner data is already being cleared.");
+    this.clearing.add(ownerId);
+    if (this.active.has(ownerId)) await new Promise<void>((resolve) => { const ownerWaiters = this.waiters.get(ownerId) ?? new Set<() => void>(); ownerWaiters.add(resolve); this.waiters.set(ownerId, ownerWaiters); });
+    try {
+      return await action();
+    } finally {
+      this.clearing.delete(ownerId);
+    }
+  }
+}
+
 const config = loadConfig();
 if (config.authMode === "github" && !config.sessionSecret) throw new Error("COPILOTCHAT_SESSION_SECRET is required when COPILOTCHAT_AUTH_MODE=github.");
 if (config.authMode === "github" && config.githubClientSecret && !config.publicUrl) throw new Error("COPILOTCHAT_PUBLIC_URL is required for GitHub OAuth web login.");
 const db = new AppDatabase(config.dataDir);
 const isolatedWorkspaceRoot = path.join(config.dataDir, "isolated-workspaces");
-const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"), config.importLimitBytes);
+const importDrafts = new ImportDraftStore(path.join(config.dataDir, "import-drafts"), config.importLimitBytes, config.importDraftLimitBytes);
 const uploadedFiles = new UploadedFileStore(path.join(config.dataDir, "uploads"), config.uploadLimitBytes, config.stagedUploadLimitBytes, config.stagedUploadLimitFiles);
 fs.mkdirSync(isolatedWorkspaceRoot, { recursive: true });
 await importDrafts.cleanupOrphans();
@@ -45,6 +79,8 @@ await uploadedFiles.cleanupExpired();
 const uploadCleanupTimer = setInterval(() => { void uploadedFiles.cleanupExpired().catch((error) => app.log.error({ err: error }, "Could not clean expired uploads.")); }, 60 * 60 * 1000);
 uploadCleanupTimer.unref();
 const requestOwners = new WeakMap<FastifyRequest, Owner>();
+const requestMutationReleases = new WeakMap<FastifyRequest, () => void>();
+const ownerMutations = new OwnerMutationBarrier();
 const sessionCookieName = "copilotchat_session";
 const oauthStateCookieName = "copilotchat_oauth_state";
 const providerStatusTtlMs = 5 * 60_000;
@@ -73,9 +109,19 @@ app.addHook("preHandler", async (request, reply) => {
   } else if (config.apiToken && !bearerOk && config.authMode !== "github") {
     reply.code(401).send({ error: "Unauthorized" }); return;
   }
-  if (!config.requireCsrf || !isMutatingMethod(request.method) || isAuthExemptPath(request.raw.url)) return;
-  if (request.headers["x-copilotchat-csrf"] !== "1") { reply.code(403).send({ error: "Missing X-CopilotChat-CSRF header." }); return; }
+  const mutating = isMutatingMethod(request.method);
+  const authExempt = isAuthExemptPath(request.raw.url);
+  if (config.requireCsrf && mutating && !authExempt && request.headers["x-copilotchat-csrf"] !== "1") { reply.code(403).send({ error: "Missing X-CopilotChat-CSRF header." }); return; }
+  if (!mutating || authExempt || isDataClearPath(request.raw.url)) return;
+  try {
+    requestMutationReleases.set(request, ownerMutations.begin(ownerFor(request).id));
+  } catch (error) {
+    if (error instanceof OwnerClearingError) { reply.code(409).send({ error: error.message }); return; }
+    throw error;
+  }
 });
+app.addHook("onSend", async (request, _reply, payload) => { releaseRequestMutation(request); return payload; });
+app.addHook("onError", async (request) => releaseRequestMutation(request));
 const githubDeviceStartResponseSchema = z.object({ device_code: z.string(), user_code: z.string(), verification_uri: z.string(), expires_in: z.number(), interval: z.number() });
 const githubDevicePollResponseSchema = z.union([z.object({ access_token: z.string(), token_type: z.string(), scope: z.string() }), z.object({ error: z.string(), error_description: z.string().optional() })]);
 const githubUserSchema = z.object({ id: z.number().int().positive(), login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
@@ -158,16 +204,23 @@ app.post(`${apiPrefix}/provider/refresh`, async (request) => {
   const body = z.object({ force: z.boolean().optional().default(false) }).parse(request.body ?? {});
   return freshProviderStatus(owner.id, body.force);
 });
-app.delete(`${apiPrefix}/data`, async (request) => {
+app.delete(`${apiPrefix}/data`, async (request, reply) => {
   const owner = ownerFor(request);
-  const chats = [...db.listChats(owner.id), ...db.listArchivedChats(owner.id)];
-  const chatFileTargets = chats.flatMap((chat) => chatFiles(owner.id, chat));
-  for (const chat of chats) activeResponses.cancel(chat.id);
-  db.clearAllData(owner.id);
-  await Promise.all(chatFileTargets.map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); }));
-  await importDrafts.deleteOwner(owner.id);
-  await uploadedFiles.deleteOwner(owner.id);
-  await fs.promises.mkdir(isolatedWorkspaceRoot, { recursive: true });
+  try {
+    await ownerMutations.clear(owner.id, async () => {
+      await activeResponses.cancelOwnerAndWait(owner.id);
+      const chats = [...db.listChats(owner.id), ...db.listArchivedChats(owner.id)];
+      const chatFileTargets = chats.flatMap((chat) => chatFiles(owner.id, chat));
+      await uploadedFiles.clearOwner(owner.id, () => importDrafts.clearOwner(owner.id, async () => {
+        db.clearAllData(owner.id);
+        await Promise.all(chatFileTargets.map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); }));
+        await fs.promises.mkdir(isolatedWorkspaceRoot, { recursive: true });
+      }));
+    });
+  } catch (error) {
+    if (error instanceof OwnerClearingError) { reply.code(409).send({ error: error.message }); return; }
+    throw error;
+  }
   return { ok: true };
 });
 app.post(`${apiPrefix}/projects`, async (request) => db.createProject(ownerFor(request).id, createProjectRequestSchema.parse(request.body)));
@@ -182,7 +235,7 @@ app.delete(`${apiPrefix}/project-chat-references/:referenceId`, async (request) 
 app.post(`${apiPrefix}/chats`, async (request) => db.createChat(ownerFor(request).id, createChatRequestSchema.parse(request.body)));
 app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); const chats = db.listChats(owner.id); const filesByChat = new Map(chats.map((chat) => [chat.id, chatFiles(owner.id, chat)])); const deletedChatIds = db.deleteEmptyChats(owner.id, query.except ?? null); await Promise.all(deletedChatIds.flatMap((chatId) => filesByChat.get(chatId) ?? []).map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); })); return { deletedChatIds }; });
 app.patch(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); return db.updateChat(owner.id, params.chatId, updateChatRequestSchema.parse(request.body)); });
-app.delete(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); const chat = db.getChat(owner.id, params.chatId); await removeChatFiles(owner.id, chat); db.deleteChat(owner.id, params.chatId); return { ok: true }; });
+app.delete(`${apiPrefix}/chats/:chatId`, async (request, reply) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); const chat = db.getChat(owner.id, params.chatId); if (!activeResponses.beginDeletion(chat.id)) { reply.code(409).send({ error: "The chat is currently being prepared or deleted." }); return; } try { await activeResponses.cancelAndWait(chat.id); await removeChatFiles(owner.id, chat); db.deleteChat(owner.id, params.chatId); return { ok: true }; } finally { activeResponses.endDeletion(chat.id); } });
 app.get(`${apiPrefix}/chats/:chatId/messages`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); return db.listMessages(params.chatId); });
 app.get(`${apiPrefix}/chats/:chatId/active-response`, async (request, reply) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); activeResponses.attach(params.chatId, reply); });
 app.patch(`${apiPrefix}/chats/:chatId/active-response`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); const body = z.object({ permissionMode: permissionModeSchema }).parse(request.body); return { active: activeResponses.setPermissionMode(params.chatId, body.permissionMode) }; });
@@ -265,6 +318,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages`, async (request, reply) => {
     throw error;
   }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
+  releaseRequestMutation(request);
   activeResponses.attach(turn.chat.id, reply);
 });
 app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, reply) => {
@@ -272,7 +326,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, 
   const params = z.object({ chatId: z.string(), messageId: z.string() }).parse(request.params);
   const input = editMessageRequestSchema.parse(request.body);
   db.getChat(owner.id, params.chatId);
-  activeResponses.cancel(params.chatId);
+  await activeResponses.cancelAndWait(params.chatId);
   if (!activeResponses.reserve(params.chatId)) { reply.code(409).send({ error: "A response is already being prepared for this chat." }); return; }
   let turn: Awaited<ReturnType<typeof prepareChatTurn>>;
   try {
@@ -287,6 +341,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, 
     throw error;
   }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
+  releaseRequestMutation(request);
   activeResponses.attach(turn.chat.id, reply);
 });
 app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request, reply) => {
@@ -294,7 +349,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request,
   const params = z.object({ chatId: z.string(), messageId: z.string() }).parse(request.params);
   const input = sendMessageRequestSchema.omit({ content: true, projectId: true, workspaceId: true }).parse(request.body);
   db.getChat(owner.id, params.chatId);
-  activeResponses.cancel(params.chatId);
+  await activeResponses.cancelAndWait(params.chatId);
   if (!activeResponses.reserve(params.chatId)) { reply.code(409).send({ error: "A response is already being prepared for this chat." }); return; }
   let turn: Awaited<ReturnType<typeof prepareChatTurn>>;
   try {
@@ -309,6 +364,7 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request,
     throw error;
   }
   activeResponses.start({ db, provider, ownerId: owner.id, ...turn, prepareTurn: (queued) => prepareChatTurn(owner.id, params.chatId, queued) });
+  releaseRequestMutation(request);
   activeResponses.attach(turn.chat.id, reply);
 });
 app.get(`${apiPrefix}/artifacts/:artifactId`, async (request) => { const owner = ownerFor(request); const params = z.object({ artifactId: z.string() }).parse(request.params); return db.getArtifact(owner.id, params.artifactId); });
@@ -343,26 +399,30 @@ app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (
   }
 });
 app.delete(`${apiPrefix}/uploads/:uploadId`, async (request) => { const owner = ownerFor(request); const params = z.object({ uploadId: z.string().min(1) }).parse(request.params); await uploadedFiles.delete(owner.id, params.uploadId); return { ok: true }; });
-app.post(`${apiPrefix}/imports/drafts`, async (request) => {
+app.post(`${apiPrefix}/imports/drafts`, async (request, reply) => {
   const owner = ownerFor(request);
-  const uploaded = z.object({ source: z.enum(["chatgpt", "claude", "gemini", "auto"]).default("auto"), uploadId: z.string().min(1) }).safeParse(request.body);
-  if (!uploaded.success) return importDrafts.create(owner.id, importPreviewRequestSchema.parse(request.body));
-  const claimId = await uploadedFiles.claim(owner.id, [uploaded.data.uploadId]);
+  let claimId: string | null = null;
   try {
+    const uploaded = z.object({ source: z.enum(["chatgpt", "claude", "gemini", "auto"]).default("auto"), uploadId: z.string().min(1) }).safeParse(request.body);
+    if (!uploaded.success) return await importDrafts.create(owner.id, importPreviewRequestSchema.parse(request.body));
+    claimId = await uploadedFiles.claim(owner.id, [uploaded.data.uploadId]);
     const draft = await importDrafts.createFromUpload(owner.id, uploaded.data.source, uploadedFiles, uploaded.data.uploadId, claimId!);
     await completeUploadClaim(owner.id, claimId);
     return draft;
   } catch (error) {
     abandonUploadClaim(owner.id, claimId);
+    if (error instanceof ImportLimitError) { reply.code(413).send({ error: error.message }); return; }
     throw error;
   }
 });
-app.post(`${apiPrefix}/imports/preview`, async (request) => { const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return slimImportPreview(await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
-app.post(`${apiPrefix}/imports/apply`, async (request) => { const owner = ownerFor(request); const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return applyImportPreview(db, owner.id, await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); });
+app.post(`${apiPrefix}/imports/preview`, async (request, reply) => { try { const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return slimImportPreview(await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); } catch (error) { if (error instanceof ImportLimitError) { reply.code(413).send({ error: error.message }); return; } throw error; } });
+app.post(`${apiPrefix}/imports/apply`, async (request, reply) => { const owner = ownerFor(request); try { const input = importPreviewRequestSchema.parse(request.body); assertImportPayloadSize(input, config.importLimitBytes); return applyImportPreview(db, owner.id, await previewImportPayload(input.source, input.fileName, input.content, input.encoding)); } catch (error) { if (error instanceof ImportLimitError) { reply.code(413).send({ error: error.message }); return; } throw error; } });
 const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../web/dist");
 if (fs.existsSync(webDist)) { await app.register(fastifyStatic, { root: webDist, prefix: "/", wildcard: false }); app.setNotFoundHandler((request, reply) => { if (request.raw.url?.startsWith(apiPrefix)) { reply.code(404).send({ error: "Not found" }); return; } reply.sendFile("index.html"); }); }
 await app.listen({ host: config.host, port: config.port });
 function isMutatingMethod(method: string): boolean { return method === "POST" || method === "PATCH" || method === "DELETE"; }
+function isDataClearPath(rawUrl: string): boolean { return (rawUrl.split("?")[0] ?? rawUrl) === `${apiPrefix}/data`; }
+function releaseRequestMutation(request: FastifyRequest): void { const release = requestMutationReleases.get(request); if (!release) return; requestMutationReleases.delete(request); release(); }
 function isAuthExemptPath(rawUrl: string): boolean {
   const pathname = rawUrl.split("?")[0] ?? rawUrl;
   return pathname === `${apiPrefix}/health` || pathname === `${apiPrefix}/auth/status` || pathname === `${apiPrefix}/auth/logout` || pathname.startsWith(`${apiPrefix}/auth/github/`);
