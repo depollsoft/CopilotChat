@@ -508,6 +508,11 @@ test("chat header reports AI credit usage as it accumulates", async ({ page }, t
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Second note about credits.");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(usagePill).toHaveText("0.86 AIC", { timeout: 15000 });
+  await page.reload();
+  await expect(usagePill).toHaveText("0.86 AIC");
+  await usagePill.click();
+  await expect(details).toContainText("0.86 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
 });
 
 test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {  await page.goto("/");
@@ -839,6 +844,8 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
   await subagent.locator("summary").first().click();
   await expect(subagent).toContainText("Inspect project context");
   await expect(subagent).toContainText("Found shared project context");
+  await expect(subagent.locator(".subagent-usage")).toHaveText("0.08 AIC used by this subagent");
+  await expect(subagent.locator(".subagent-detail")).not.toContainText("nanoAiu");
   await expect(subagent.locator(".activity-card.reasoning")).toContainText("Thinking");
   await expect(subagent.locator(".activity-card.tool > summary")).toContainText("context.search");
   await subagent.locator(".activity-card.tool > summary").click();

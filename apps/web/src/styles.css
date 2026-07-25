@@ -396,6 +396,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .activity-raw .code-block { border-top: 1px solid var(--border); border-radius: 0; }
 .subagent-activity { display: grid; gap: 10px; }
 .subagent-detail { max-height: 150px; overflow: auto; margin: 0; padding: 10px; border-radius: 10px; background: var(--surface); color: var(--text-muted); font-size: calc(12px * var(--text-scale)); white-space: pre-wrap; }
+.subagent-usage { margin: 0; color: var(--text-muted); font-size: calc(12px * var(--text-scale)); font-weight: 800; font-variant-numeric: tabular-nums; }
 .subagent-activity strong { display: block; margin-bottom: 5px; color: var(--text); font-size: calc(12px * var(--text-scale)); text-transform: uppercase; letter-spacing: .05em; }
 .msg-actions { display: flex; align-items: center; gap: 4px; }
 .edit-message-form .msg-actions { grid-column: auto; margin-top: 8px; }

@@ -158,7 +158,7 @@ export class ActiveChatResponses {
       if (event.type === "subagent-tool-result") { response.finishSubagentTool(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "subagent-complete" || event.type === "subagent-failed") { response.finishSubagent(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "task-list") { response.setTaskList(event); response.emit("activity", { activities: response.activities }); continue; }
-      if (event.type === "usage") { const updated = input.db.addChatUsage(input.ownerId, chat.id, event.nanoAiu); response.addUsage(event.nanoAiu, updated.totalNanoAiu); continue; }
+      if (event.type === "usage") { const updated = input.db.addChatUsage(input.ownerId, chat.id, event.nanoAiu); if (response.addUsage(event.nanoAiu, updated.totalNanoAiu, event.agentId ?? null)) response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "session") chat = input.db.setChatProviderSession(input.ownerId, chat.id, { providerSessionId: event.sessionId, providerSessionWorkspacePath: event.workspacePath });
       if (event.type === "artifact") {
         const artifact = workspaceDir
@@ -212,11 +212,21 @@ export class ActiveChatResponse {
 
   get usage(): { turnNanoAiu: number; chatNanoAiu: number } { return { turnNanoAiu: this.turnNanoAiu, chatNanoAiu: this.chatNanoAiu }; }
 
-  addUsage(nanoAiu: number, chatNanoAiu: number): void {
-    if (!Number.isFinite(nanoAiu) || nanoAiu <= 0) return;
+  addUsage(nanoAiu: number, chatNanoAiu: number, agentId: string | null = null): boolean {
+    if (!Number.isFinite(nanoAiu) || nanoAiu <= 0) return false;
     this.turnNanoAiu += nanoAiu;
     this.chatNanoAiu = Math.max(chatNanoAiu, this.turnNanoAiu);
     this.emit("usage", this.usage);
+    return agentId ? this.addSubagentUsage(agentId, nanoAiu) : false;
+  }
+
+  /** Attributes a sub-agent's model call to its activity card. Usage still counts toward the turn and chat totals. */
+  private addSubagentUsage(agentId: string, nanoAiu: number): boolean {
+    const activity = this.activities.find((item) => item.type === "subagent" && item.id === agentId);
+    if (!activity) return false;
+    const current = typeof activity.details?.nanoAiu === "number" ? activity.details.nanoAiu : 0;
+    activity.details = limitActivityRecord({ ...(activity.details ?? {}), nanoAiu: current + nanoAiu });
+    return true;
   }
 
   decorateProviderRequest(request: ProviderChatRequest): ProviderChatRequest {
@@ -470,7 +480,7 @@ export class ActiveChatResponse {
     const activity = this.ensureSubagent(event.id, event.displayName);
     activity.title = event.displayName;
     activity.status = "running";
-    activity.details = limitActivityRecord(compactRecord({ name: event.name, description: event.description, model: event.model, toolCallId: event.toolCallId }));
+    activity.details = limitActivityRecord({ ...(activity.details ?? {}), ...compactRecord({ name: event.name, description: event.description, model: event.model, toolCallId: event.toolCallId }) });
   }
 
   appendSubagentContent(id: string, text: string): void {

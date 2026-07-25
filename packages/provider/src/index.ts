@@ -37,7 +37,7 @@ export type ProviderEvent =
   | { type: "tool-call"; id?: string | null; toolName: string; input?: unknown }
   | { type: "tool-result"; id?: string | null; toolName: string; output?: unknown; error?: string | null; status: "succeeded" | "failed" }
   | { type: "artifact"; title: string; kind: string; content: string; language?: string | null }
-  | { type: "usage"; nanoAiu: number; model?: string | null }
+  | { type: "usage"; nanoAiu: number; model?: string | null; agentId?: string | null }
   | { type: "done"; usage?: Record<string, unknown> };
 export interface CopilotProvider { id: string; label: string; status(): Promise<ProviderStatus>; streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> }
 export interface ProviderFactoryOptions { provider: "auto" | "sdk" | "http" | "cli" | "echo"; apiBaseUrl?: string; apiToken?: string; model: string; cliCommand?: string; sdkCliPath?: string; gitHubToken?: string }
@@ -183,7 +183,7 @@ class SdkCopilotProvider implements CopilotProvider {
       if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
       if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(sdkEvent.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
       if (eventType === "session.plan_changed") { void session.rpc.plan.read().then((plan) => { const items = parseTaskListItems(plan.content ?? ""); if (items.length > 0) queue.push({ type: "task-list", id: "session-plan", title: "Session plan", source: "plan.md", content: plan.content, items }); }).catch(() => undefined); return; }
-      if (eventType === "assistant.usage") { const nanoAiu = readSdkUsageNanoAiu(event.data); if (nanoAiu !== null) queue.push({ type: "usage", nanoAiu, model: readNestedString(event.data, ["model"]) }); return; }
+      if (eventType === "assistant.usage") { const nanoAiu = readSdkUsageNanoAiu(sdkEvent.data); if (nanoAiu !== null) queue.push({ type: "usage", nanoAiu, model: readNestedString(sdkEvent.data, ["model"]), agentId }); return; }
       if (eventType === "session.idle") { queue.push({ type: "done", usage: { provider: this.id } }); queue.close(); return; }
       if (eventType === "session.error") queue.fail(new Error(readNestedString(sdkEvent.data, ["message"]) ?? "Copilot SDK session failed."));
     });
@@ -245,6 +245,7 @@ class EchoProvider implements CopilotProvider {
       await delay(12);
       yield { type: "subagent-delta", id: "echo-subagent", text: "Found shared project context and recent chat references." };
       await delay(12);
+      if (this.options.reportUsage) yield { type: "usage", nanoAiu: 80_000_000, model: request.model, agentId: "echo-subagent" };
       yield { type: "subagent-complete", id: "echo-subagent", name: "research-helper", displayName: "Research helper", durationMs: 42, model: request.model, totalTokens: 128, totalToolCalls: 1 };
       await delay(12);
     }

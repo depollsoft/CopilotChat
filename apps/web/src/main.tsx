@@ -293,7 +293,9 @@ function App(): React.ReactElement {
     let networkFailures = 0;
     while (!controller.signal.aborted) {
       try {
-        setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
+        const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
+        setMessages(loaded);
+        setLiveUsage((current) => current.turnNanoAiu > 0 ? current : { ...current, turnNanoAiu: latestResponseNanoAiu(loaded) });
         setError((current) => current && isNetworkError(current) ? null : current);
         await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", false, true);
         return;
@@ -760,7 +762,8 @@ function parseJsonValue(value: string): unknown {
   try { return JSON.parse(value); } catch { return null; }
 }
 function humanizeFieldName(value: string): string { return value.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\b\w/g, (char) => char.toUpperCase()); }
-function SubagentActivity(p: { activity: AssistantActivity }) { const detail = p.activity.details && Object.keys(p.activity.details).length > 0 ? formatActivityValue(p.activity.details) : ""; return <div className="subagent-activity">{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function SubagentActivity(p: { activity: AssistantActivity }) { const nanoAiu = readNanoAiu(p.activity.details?.nanoAiu); const detailRecord = subagentDetailRecord(p.activity.details); const detail = Object.keys(detailRecord).length > 0 ? formatActivityValue(detailRecord) : ""; return <div className="subagent-activity">{nanoAiu > 0 ? <p className="subagent-usage">{formatAic(nanoAiu)} AIC used by this subagent</p> : null}{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && nanoAiu === 0 && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function subagentDetailRecord(details: Record<string, unknown> | undefined): Record<string, unknown> { if (!details) return {}; return Object.fromEntries(Object.entries(details).filter(([key]) => key !== "nanoAiu")); }
 function TaskListActivity(p: { activity: AssistantActivity }) { const items = p.activity.items?.length ? p.activity.items : parseTaskListItems(p.activity.content ?? ""); return items.length ? <TaskListCard title={p.activity.title} items={items} source={typeof p.activity.details?.source === "string" ? p.activity.details.source : undefined} /> : <Markdown>{p.activity.content ?? ""}</Markdown>; }
 function InteractionDock(p: { interactions: PendingInteraction[]; onResolve: (interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }) => void }) {
   if (p.interactions.length === 0) return null;
@@ -981,6 +984,7 @@ function readPendingTurns(value: unknown): PendingTurn[] { if (!Array.isArray(va
 function readChatUsage(value: unknown): ChatUsage { if (!isObjectRecord(value)) return emptyChatUsage; return { turnNanoAiu: readNanoAiu(value.turnNanoAiu), chatNanoAiu: readNanoAiu(value.chatNanoAiu) }; }
 function readNanoAiu(value: unknown): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0; }
 function messageNanoAiu(message: ChatMessage): number { const usage = message.metadata.usage; return isObjectRecord(usage) ? readNanoAiu(usage.nanoAiu) : 0; }
+function latestResponseNanoAiu(messages: ChatMessage[]): number { const latest = [...messages].reverse().find((message) => message.role === "assistant"); return latest ? messageNanoAiu(latest) : 0; }
 function readPendingTurn(value: unknown, index: number): PendingTurn | null { if (!isObjectRecord(value)) return null; const mode = value.mode === "steer" ? "steer" : value.mode === "queue" ? "queue" : null; if (!mode) return null; const status = value.status === "sent" || value.status === "running" || value.status === "done" || value.status === "failed" ? value.status : "queued"; return { id: typeof value.id === "string" && value.id ? value.id : `${mode}-${index}`, mode, content: typeof value.content === "string" ? value.content : "", status, createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString() }; }
 function upsertPendingTurn(turns: PendingTurn[], next: PendingTurn): PendingTurn[] { return turns.some((turn) => turn.id === next.id) ? turns.map((turn) => turn.id === next.id ? next : turn) : [...turns, next]; }
 function formatActivityValue(value: unknown): string { if (typeof value === "string") return value; return JSON.stringify(value, null, 2) ?? String(value); }
