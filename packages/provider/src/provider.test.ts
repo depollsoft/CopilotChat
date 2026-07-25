@@ -14,7 +14,9 @@ describe("createCopilotProvider", () => {
   }, 20_000);
   it("can use echo provider explicitly", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
-    expect((await provider.status()).id).toBe("echo");
+    const status = await provider.status();
+    expect(status.id).toBe("echo");
+    expect(status.modelsAuthoritative).toBe(true);
   });
   it("extracts actionable CLI failures without returning bundled source", () => {
     const source = "minified-source ".repeat(5000);
@@ -38,6 +40,7 @@ describe("createCopilotProvider", () => {
     const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
 
     expect(status.available).toBe(false);
+    expect(status.modelsAuthoritative).toBe(false);
     expect(stop).toHaveBeenCalledOnce();
   });
   it("stops the SDK client when model discovery fails", async () => {
@@ -48,6 +51,7 @@ describe("createCopilotProvider", () => {
     const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
 
     expect(status.available).toBe(false);
+    expect(status.modelsAuthoritative).toBe(false);
     expect(stop).toHaveBeenCalledOnce();
   });
   it("aborts an active SDK session when the request is cancelled", async () => {
@@ -292,10 +296,33 @@ describe("createCopilotProvider", () => {
       if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
       const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
 
+      const status = await provider.status();
       const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test" }));
 
+      expect(status.modelsAuthoritative).toBe(true);
+      expect(status.models.map((model) => model.id)).toEqual(["gpt-test"]);
       expect(events).toContainEqual({ type: "delta", text: "ok" });
       expect(events.at(-1)).toEqual({ type: "done" });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+  it("marks HTTP fallback models as non-authoritative when discovery fails", async () => {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "unavailable" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
+      const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
+
+      const status = await provider.status();
+
+      expect(status.available).toBe(true);
+      expect(status.modelsAuthoritative).toBe(false);
+      expect(status.models.some((model) => model.id === "gpt-test")).toBe(true);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }

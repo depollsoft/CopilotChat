@@ -21,6 +21,7 @@ import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
 import { buildImportTools } from "./import-tools.js";
+import { ProviderStatusCache } from "./provider-status-cache.js";
 import { ActiveChatResponses } from "./responses.js";
 import type { InternalSendMessageRequest } from "./responses.js";
 import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
@@ -46,8 +47,7 @@ const requestOwners = new WeakMap<FastifyRequest, Owner>();
 const sessionCookieName = "copilotchat_session";
 const oauthStateCookieName = "copilotchat_oauth_state";
 const providerStatusTtlMs = 5 * 60_000;
-const providerStatusCache = new Map<string, { credentialKey: string; status: ProviderStatus; expiresAt: number }>();
-const providerStatusInFlight = new Map<string, { credentialKey: string; promise: Promise<ProviderStatus> }>();
+const providerStatuses = new ProviderStatusCache(providerStatusTtlMs);
 const configuredPublicOrigin = config.publicUrl ? new URL(config.publicUrl).origin : null;
 const allowedOrigins = new Set([`http://127.0.0.1:${config.port}`, `http://localhost:${config.port}`, "http://127.0.0.1:5173", "http://localhost:5173", ...(configuredPublicOrigin ? [configuredPublicOrigin] : []), ...config.allowedOrigins]);
 app.addContentTypeParser("application/x-copilotchat-upload", (_request, payload, done) => done(null, payload));
@@ -127,7 +127,7 @@ app.get(`${apiPrefix}/auth/github/callback`, async (request, reply) => {
   const legacyOwnerId = db.getGitHubOwnerByProviderId(providerUserId) ? null : await verifiedLegacyGitHubOwnerId(request, githubUser);
   const owner = db.getOrCreateGitHubOwner({ providerUserId, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url, legacyOwnerId });
   db.setGitHubAuth(owner.id, { accessToken: token.access_token, login: githubUser.login, displayName: githubUser.name, avatarUrl: githubUser.avatar_url });
-  providerStatusCache.delete(owner.id);
+  providerStatuses.invalidate(owner.id);
   reply.header("Set-Cookie", [cookie(sessionCookieName, signSession(owner), 60 * 60 * 24 * 30), clearCookie(oauthStateCookieName)]);
   reply.redirect("/");
 });
@@ -139,6 +139,11 @@ app.get(`${apiPrefix}/state`, async (request) => {
   const state = db.getState(await cachedProviderStatus(owner.id), [], owner.id, config.authMode);
   const chatIds = new Set([...state.chats, ...state.archivedChats].map((chat) => chat.id));
   return { ...state, activeChatIds: activeResponses.chatIds().filter((id) => chatIds.has(id)) };
+});
+app.post(`${apiPrefix}/provider/refresh`, async (request) => {
+  const owner = ownerFor(request);
+  const body = z.object({ force: z.boolean().optional().default(false) }).parse(request.body ?? {});
+  return freshProviderStatus(owner.id, body.force);
 });
 app.delete(`${apiPrefix}/data`, async (request) => {
   const owner = ownerFor(request);
@@ -403,25 +408,27 @@ function createConfiguredProvider(gitHubToken?: string) {
 function gitHubTokenForOwner(ownerId: string): string | null { return db.getGitHubToken(ownerId) ?? (config.authMode === "local" ? config.copilotGitHubToken ?? null : null); }
 function providerCredentialKey(token: string | null): string { return createHmac("sha256", config.sessionSecret ?? "local-provider-cache").update(token ?? "").digest("base64url"); }
 async function cachedProviderStatus(ownerId: string): Promise<ProviderStatus> {
-  const now = Date.now();
   const token = gitHubTokenForOwner(ownerId);
   const credentialKey = providerCredentialKey(token);
-  const cached = providerStatusCache.get(ownerId);
-  if (cached?.credentialKey === credentialKey && cached.expiresAt > now) return cached.status;
   if (config.authMode === "github" && !token) return missingGitHubOAuthStatus();
-  refreshProviderStatus(ownerId, token, credentialKey);
-  return cached?.credentialKey === credentialKey ? cached.status : loadingProviderStatus();
+  return providerStatuses.getStaleWhileRefreshing(
+    ownerId,
+    credentialKey,
+    () => createConfiguredProvider(token ?? undefined).status(),
+    loadingProviderStatus,
+    (error) => app.log.error({ err: error, ownerId }, "Provider status refresh failed"),
+  );
 }
-function refreshProviderStatus(ownerId: string, token: string | null, credentialKey: string): void {
-  if (providerStatusInFlight.get(ownerId)?.credentialKey === credentialKey) return;
-  const statusPromise = createConfiguredProvider(token ?? undefined).status().then((status) => {
-    if (providerCredentialKey(gitHubTokenForOwner(ownerId)) === credentialKey) providerStatusCache.set(ownerId, { credentialKey, status, expiresAt: Date.now() + providerStatusTtlMs });
-    return status;
-  }).finally(() => { if (providerStatusInFlight.get(ownerId)?.promise === statusPromise) providerStatusInFlight.delete(ownerId); });
-  providerStatusInFlight.set(ownerId, { credentialKey, promise: statusPromise });
+async function freshProviderStatus(ownerId: string, force: boolean): Promise<ProviderStatus> {
+  const token = gitHubTokenForOwner(ownerId);
+  if (config.authMode === "github" && !token) return missingGitHubOAuthStatus();
+  const credentialKey = providerCredentialKey(token);
+  const status = await providerStatuses.getFresh(ownerId, credentialKey, () => createConfiguredProvider(token ?? undefined).status(), force);
+  if (providerCredentialKey(gitHubTokenForOwner(ownerId)) !== credentialKey) return freshProviderStatus(ownerId, force);
+  return status;
 }
-function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
-function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
+function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: config.copilotModel }; }
+function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: config.copilotModel }; }
 async function removeChatFiles(ownerId: string, chat: Chat): Promise<void> {
   await Promise.all(chatFiles(ownerId, chat).map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); }));
 }

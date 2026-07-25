@@ -372,7 +372,7 @@ describe("chat provider context", () => {
     const content = "large artifact\n".repeat(1000);
     const artifact = db.createArtifact(owner.id, { title: "Large notes", kind: "markdown", content });
 
-    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], defaultModel: "gpt-test" }, [], owner.id, "github");
+    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }, [], owner.id, "github");
 
     expect(state.authMode).toBe("github");
     expect(state.artifacts[0]).toMatchObject({ id: artifact.id, title: "Large notes", contentLength: content.length });
@@ -644,7 +644,7 @@ describe("chat provider context", () => {
     const owner = db.getOwner();
     const chat = db.createChat(owner.id, { title: "Cleanup ordering", projectId: null, workspaceId: null });
     const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Finish" });
-    const provider: CopilotProvider = { id: "test", label: "Test", status: async () => ({ id: "test", label: "Test", available: true, details: "", capabilities: [], models: [] }), async *streamChat() { yield { type: "done" }; } };
+    const provider: CopilotProvider = { id: "test", label: "Test", status: async () => ({ id: "test", label: "Test", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }), async *streamChat() { yield { type: "done" }; } };
     const responses = new ActiveChatResponses();
     let releaseCleanup!: () => void;
     let markCleanupStarted!: () => void;
@@ -795,7 +795,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "sdk",
       label: "SDK",
-      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "tool-call", id: "title-call", toolName: "Tool", input: null };
         yield { type: "tool-result", id: "title-call", toolName: "Tool", status: "succeeded", output: { content: "{\"title\":\"Multiple Choice Question\"}", detailedContent: "{\"title\":\"Multiple Choice Question\"}" } };
@@ -822,7 +822,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "tool-call", id: "large-tool", toolName: "big.search", input: { query: payload } };
         yield { type: "tool-result", id: "large-tool", toolName: "big.search", status: "failed", output: { content: payload }, error: payload };
@@ -853,7 +853,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "delta", text: "Hello" };
         yield { type: "delta", text: "Hello world" };
@@ -877,7 +877,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "delta", text: "very" };
         yield { type: "delta", text: " very" };
@@ -901,7 +901,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent", description: "Inspect context." };
         yield { type: "subagent-reasoning-delta", id: "research-agent", text: "Thinking about sources." };
@@ -932,7 +932,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent", description: "Inspect context." };
         yield { type: "subagent-delta", id: "research-agent", text: large };
@@ -969,7 +969,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         for (let index = 0; index < 8; index += 1) yield { type: "delta", text: `${index}${chunk}` };
         yield { type: "done" };
