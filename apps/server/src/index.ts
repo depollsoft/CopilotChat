@@ -342,8 +342,8 @@ async function freshProviderStatus(ownerId: string, force: boolean): Promise<Pro
   if (providerCredentialKey(gitHubTokenForOwner(ownerId)) !== credentialKey) return freshProviderStatus(ownerId, force);
   return status;
 }
-function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
-function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], defaultModel: config.copilotModel }; }
+function loadingProviderStatus(): ProviderStatus { return { id: "unknown", label: "Loading", available: false, details: "Checking Copilot provider status.", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: config.copilotModel }; }
+function missingGitHubOAuthStatus(): ProviderStatus { return { id: "sdk", label: "GitHub Copilot SDK", available: false, details: "The GitHub OAuth token for this account is missing or expired. Sign in with GitHub again.", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: config.copilotModel }; }
 function validateMessageAttachments(input: SendMessageRequest): MessageAttachment[] {
   const attachments = input.attachments ?? [];
   if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");

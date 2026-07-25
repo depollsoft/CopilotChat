@@ -35,7 +35,7 @@ export class ProviderStatusCache {
   getFresh(ownerId: string, credentialKey: string, load: ProviderStatusLoad, force = false): Promise<ProviderStatus> {
     this.credentials.set(ownerId, credentialKey);
     const cached = this.cache.get(ownerId);
-    if (!force && cached?.credentialKey === credentialKey && cached.expiresAt > this.now() && cached.status.available) return Promise.resolve(cached.status);
+    if (!force && cached?.credentialKey === credentialKey && cached.expiresAt > this.now() && cached.status.modelsAuthoritative) return Promise.resolve(cached.status);
     return this.refresh(ownerId, credentialKey, load);
   }
 

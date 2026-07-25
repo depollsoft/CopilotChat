@@ -2,7 +2,7 @@ import type { ProviderStatus } from "@copilotchat/shared";
 import { describe, expect, it, vi } from "vitest";
 import { ProviderStatusCache } from "./provider-status-cache.js";
 
-function status(model: string, available = true): ProviderStatus {
+function status(model: string, available = true, modelsAuthoritative = available): ProviderStatus {
   return {
     id: "sdk",
     label: "GitHub Copilot SDK",
@@ -10,6 +10,7 @@ function status(model: string, available = true): ProviderStatus {
     details: "ready",
     capabilities: [],
     models: [{ id: model, name: model, supportsReasoningEffort: false, supportedReasoningEfforts: [], supportsLongContext: false }],
+    modelsAuthoritative,
     defaultModel: model,
   };
 }
@@ -46,13 +47,13 @@ describe("ProviderStatusCache", () => {
     expect(load).toHaveBeenCalledTimes(1);
   });
 
-  it("retries cached discovery failures without waiting for the normal TTL", async () => {
+  it("retries non-authoritative discovery without waiting for the normal TTL", async () => {
     const cache = new ProviderStatusCache(100);
     const load = vi.fn()
-      .mockResolvedValueOnce(status("fallback", false))
+      .mockResolvedValueOnce(status("fallback", true, false))
       .mockResolvedValueOnce(status("recovered"));
 
-    await expect(cache.getFresh("owner", "token", load)).resolves.toEqual(status("fallback", false));
+    await expect(cache.getFresh("owner", "token", load)).resolves.toEqual(status("fallback", true, false));
     await expect(cache.getFresh("owner", "token", load)).resolves.toEqual(status("recovered"));
     expect(load).toHaveBeenCalledTimes(2);
   });

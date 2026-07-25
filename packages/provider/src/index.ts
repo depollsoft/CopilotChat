@@ -72,6 +72,7 @@ class SdkCopilotProvider implements CopilotProvider {
         details: "Using @github/copilot-sdk. Model list is loaded from Copilot.",
         capabilities,
         models: mapped,
+        modelsAuthoritative: true,
         defaultModel: mapped.find((model) => model.id === "auto")?.id ?? mapped[0]?.id ?? this.options.model,
       };
     } catch (error) {
@@ -82,6 +83,7 @@ class SdkCopilotProvider implements CopilotProvider {
         details: sdkFailureDetails(error, this.options),
         capabilities,
         models: fallbackModels(this.options.model),
+        modelsAuthoritative: false,
         defaultModel: this.options.model,
       };
     } finally {
@@ -190,7 +192,7 @@ class SdkCopilotProvider implements CopilotProvider {
 class EchoProvider implements CopilotProvider {
   id = "echo"; label = "Local development provider";
   constructor(private readonly model: string) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), defaultModel: this.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), modelsAuthoritative: true, defaultModel: this.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (request.sessionId) yield { type: "session", sessionId: request.sessionId, workspacePath: null, resumed: Boolean(request.resumeSession), infinite: false };
     const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
@@ -315,17 +317,26 @@ class HttpCopilotProvider implements CopilotProvider {
   async status(): Promise<ProviderStatus> {
     const available = Boolean(this.options.apiBaseUrl && this.options.apiToken);
     let models = fallbackModels(this.options.model);
+    let modelsAuthoritative = false;
     if (available) {
       try {
         const response = await withTimeout(fetch(`${this.options.apiBaseUrl!.replace(/\/$/, "")}/models`, { headers: { Authorization: `Bearer ${this.options.apiToken}` } }), 3000);
         if (response.ok) {
           const body = await response.json() as { data?: Array<{ id?: string; name?: string }> };
           const listed = body.data?.map((model) => ({ id: model.id ?? model.name ?? "", name: model.name ?? model.id ?? "", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false })).filter((model) => model.id);
-          if (listed && listed.length > 0) models = listed;
+          if (listed) {
+            models = listed;
+            modelsAuthoritative = true;
+          }
         }
       } catch { /* keep configured model */ }
     }
-    return { id: this.id, label: this.label, available, details: available ? `Using HTTP provider at ${this.options.apiBaseUrl}` : "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN.", capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, defaultModel: models[0]?.id ?? this.options.model };
+    const details = !available
+      ? "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN."
+      : modelsAuthoritative
+        ? `Using HTTP provider at ${this.options.apiBaseUrl}`
+        : `Connected to HTTP provider at ${this.options.apiBaseUrl}, but model discovery failed.`;
+    return { id: this.id, label: this.label, available, details, capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, modelsAuthoritative, defaultModel: models[0]?.id ?? this.options.model };
   }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.apiBaseUrl || !this.options.apiToken) throw new Error("HTTP provider is missing COPILOT_API_BASE_URL or COPILOT_API_TOKEN.");
@@ -341,7 +352,7 @@ class HttpCopilotProvider implements CopilotProvider {
 class CliCopilotProvider implements CopilotProvider {
   id = "cli"; label = "Local CLI bridge";
   constructor(private readonly options: ProviderFactoryOptions) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), defaultModel: this.options.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), modelsAuthoritative: false, defaultModel: this.options.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.cliCommand) throw new Error("CLI provider is missing COPILOT_CLI_COMMAND.");
     const child = spawn(this.options.cliCommand, [], { cwd: request.workingDirectory ?? process.cwd(), shell: true, stdio: ["pipe", "pipe", "pipe"], signal: request.abortSignal });
