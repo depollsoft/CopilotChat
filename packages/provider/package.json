@@ -16,10 +16,11 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -b tsconfig.json",
     "clean": "rm -rf dist",
-    "auth:doctor": "node scripts/auth-doctor.mjs"
+    "auth:doctor": "node scripts/auth-doctor.mjs",
+    "auth:doctor:check": "node scripts/auth-doctor.mjs --check"
   },
   "dependencies": {
     "@copilotchat/shared": "workspace:*",
-    "@github/copilot-sdk": "1.0.5"
+    "@github/copilot-sdk": "1.0.8"
   }
 }

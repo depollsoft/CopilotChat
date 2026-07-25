@@ -60,11 +60,10 @@ class SdkCopilotProvider implements CopilotProvider {
   constructor(private readonly options: ProviderFactoryOptions) {}
   async status(): Promise<ProviderStatus> {
     const capabilities = ["streaming", "markdown", "copilot-tools", "web-search", "mcp", "skills", "workspace-sessions", "infinite-sessions", "permission-guardrails"];
+    const client = new CopilotClient(copilotClientOptions(this.options.gitHubToken, this.options.sdkCliPath));
     try {
-      const client = new CopilotClient(copilotClientOptions(this.options.gitHubToken, this.options.sdkCliPath));
       await withTimeout(client.start(), 10000);
       const models = await withTimeout(client.listModels(), 5000);
-      await client.stop().catch(() => []);
       const mapped = models.map(mapSdkModelInfo);
       return {
         id: this.id,
@@ -73,6 +72,7 @@ class SdkCopilotProvider implements CopilotProvider {
         details: "Using @github/copilot-sdk. Model list is loaded from Copilot.",
         capabilities,
         models: mapped,
+        modelsAuthoritative: true,
         defaultModel: mapped.find((model) => model.id === "auto")?.id ?? mapped[0]?.id ?? this.options.model,
       };
     } catch (error) {
@@ -83,8 +83,11 @@ class SdkCopilotProvider implements CopilotProvider {
         details: sdkFailureDetails(error, this.options),
         capabilities,
         models: fallbackModels(this.options.model),
+        modelsAuthoritative: false,
         defaultModel: this.options.model,
       };
+    } finally {
+      await client.stop().catch(() => []);
     }
   }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
@@ -129,11 +132,12 @@ class SdkCopilotProvider implements CopilotProvider {
       return { truncated: next.truncated };
     };
     session.on((event: SessionEvent) => {
-      const eventType = String(event.type);
-      const agentId = eventAgentId(event);
+      const sdkEvent = event as unknown as SdkSessionEvent;
+      const eventType = sdkEvent.type;
+      const agentId = eventAgentId(sdkEvent);
       if (eventType === "assistant.message_delta") {
         if (!agentId || subagentTextClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(sdkEvent.data, ["deltaContent"]);
         if (text) {
           sawSubagentDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -143,7 +147,7 @@ class SdkCopilotProvider implements CopilotProvider {
       }
       if (eventType === "assistant.reasoning_delta") {
         if (!agentId || subagentReasoningClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(sdkEvent.data, ["deltaContent"]);
         if (text) {
           sawSubagentReasoningDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -152,7 +156,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.message") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(sdkEvent.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -163,7 +167,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.reasoning") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(sdkEvent.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentReasoningDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -172,14 +176,14 @@ class SdkCopilotProvider implements CopilotProvider {
         }
         return;
       }
-      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), input: limitProviderValue(eventToolInput(event.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
-      if (eventType === "tool.execution_complete") { const error = eventToolError(event.data); const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), output: limitProviderValue(eventToolOutput(event.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
-      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(event.data, ["agentDescription"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, toolCallId: readNestedString(event.data, ["toolCallId"]) }); return; }
-      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
-      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(event.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(sdkEvent.data), toolName: eventToolName(sdkEvent.data), input: limitProviderValue(eventToolInput(sdkEvent.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
+      if (eventType === "tool.execution_complete") { const error = eventToolError(sdkEvent.data); const tool = { toolCallId: eventId(sdkEvent.data), toolName: eventToolName(sdkEvent.data), output: limitProviderValue(eventToolOutput(sdkEvent.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
+      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(sdkEvent.data, ["agentDescription"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, toolCallId: readNestedString(sdkEvent.data, ["toolCallId"]) }); return; }
+      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(sdkEvent.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
       if (eventType === "session.plan_changed") { void session.rpc.plan.read().then((plan) => { const items = parseTaskListItems(plan.content ?? ""); if (items.length > 0) queue.push({ type: "task-list", id: "session-plan", title: "Session plan", source: "plan.md", content: plan.content, items }); }).catch(() => undefined); return; }
       if (eventType === "session.idle") { queue.push({ type: "done", usage: { provider: this.id } }); queue.close(); return; }
-      if (eventType === "session.error") queue.fail(new Error(readNestedString(event.data, ["message"]) ?? "Copilot SDK session failed."));
+      if (eventType === "session.error") queue.fail(new Error(readNestedString(sdkEvent.data, ["message"]) ?? "Copilot SDK session failed."));
     });
     void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
     try { yield* queue; } finally { unregisterSteer?.(); await session.disconnect(); await client.stop().catch(() => []); }
@@ -189,7 +193,7 @@ class SdkCopilotProvider implements CopilotProvider {
 class EchoProvider implements CopilotProvider {
   id = "echo"; label = "Local development provider";
   constructor(private readonly model: string) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), defaultModel: this.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), modelsAuthoritative: true, defaultModel: this.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (request.sessionId) yield { type: "session", sessionId: request.sessionId, workspacePath: null, resumed: Boolean(request.resumeSession), infinite: false };
     const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
@@ -316,17 +320,26 @@ class HttpCopilotProvider implements CopilotProvider {
   async status(): Promise<ProviderStatus> {
     const available = Boolean(this.options.apiBaseUrl && this.options.apiToken);
     let models = fallbackModels(this.options.model);
+    let modelsAuthoritative = false;
     if (available) {
       try {
         const response = await withTimeout(fetch(`${this.options.apiBaseUrl!.replace(/\/$/, "")}/models`, { headers: { Authorization: `Bearer ${this.options.apiToken}` } }), 3000);
         if (response.ok) {
           const body = await response.json() as { data?: Array<{ id?: string; name?: string }> };
           const listed = body.data?.map((model) => ({ id: model.id ?? model.name ?? "", name: model.name ?? model.id ?? "", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false })).filter((model) => model.id);
-          if (listed && listed.length > 0) models = listed;
+          if (listed) {
+            models = listed;
+            modelsAuthoritative = true;
+          }
         }
       } catch { /* keep configured model */ }
     }
-    return { id: this.id, label: this.label, available, details: available ? `Using HTTP provider at ${this.options.apiBaseUrl}` : "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN.", capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, defaultModel: models[0]?.id ?? this.options.model };
+    const details = !available
+      ? "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN."
+      : modelsAuthoritative
+        ? `Using HTTP provider at ${this.options.apiBaseUrl}`
+        : `Connected to HTTP provider at ${this.options.apiBaseUrl}, but model discovery failed.`;
+    return { id: this.id, label: this.label, available, details, capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, modelsAuthoritative, defaultModel: models[0]?.id ?? this.options.model };
   }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.apiBaseUrl || !this.options.apiToken) throw new Error("HTTP provider is missing COPILOT_API_BASE_URL or COPILOT_API_TOKEN.");
@@ -342,7 +355,7 @@ class HttpCopilotProvider implements CopilotProvider {
 class CliCopilotProvider implements CopilotProvider {
   id = "cli"; label = "Local CLI bridge";
   constructor(private readonly options: ProviderFactoryOptions) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), defaultModel: this.options.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), modelsAuthoritative: false, defaultModel: this.options.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.cliCommand) throw new Error("CLI provider is missing COPILOT_CLI_COMMAND.");
     const child = spawn(this.options.cliCommand, [], { cwd: request.workingDirectory ?? process.cwd(), shell: true, stdio: ["pipe", "pipe", "pipe"], signal: request.abortSignal });
@@ -661,8 +674,9 @@ function eventToolError(value: unknown): string | null {
   if (isRecord(error) && typeof error.message === "string") return error.message;
   return readFirstString(value, [["errorMessage"], ["error_message"]]);
 }
-function eventAgentId(event: SessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
-function subagentEventId(event: SessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
+type SdkSessionEvent = { type: string; data: unknown; agentId?: string; id: string };
+function eventAgentId(event: SdkSessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
+function subagentEventId(event: SdkSessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function formatToolOutput(value: unknown): string { try { return JSON.stringify(value); } catch { return String(value); } }
 function summarizeInline(value?: string | null): string { const normalized = value?.replace(/\s+/g, " ").trim() ?? ""; return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized; }
@@ -672,12 +686,28 @@ function chunkText(text: string, size: number): string[] { const chunks: string[
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 function sdkFailureDetails(error: unknown, options: ProviderFactoryOptions): string {
-  const message = error instanceof Error ? error.message : String(error);
-  const detectedCli = options.sdkCliPath ? ` Detected Copilot CLI: ${options.sdkCliPath}.` : " No copilot executable was found on PATH.";
+  const message = summarizeSdkFailureMessage(error);
+  const detectedCli = options.sdkCliPath ? ` Detected Copilot CLI: ${options.sdkCliPath}.` : " Using the Copilot CLI bundled with @github/copilot-sdk.";
   const authHint = /auth/i.test(message)
-    ? " No usable Copilot auth was found. Run `copilot login` or `gh auth login` in the same terminal that starts the app, or set `COPILOT_GITHUB_TOKEN`, then restart `pnpm dev`."
+    ? options.gitHubToken
+      ? " The supplied GitHub token was rejected or does not have Copilot access. Verify the token and confirm that the GitHub account has an active Copilot subscription."
+      : " No usable Copilot auth was found. Run `copilot login` or `gh auth login` in the same terminal that starts the app, or set `COPILOT_GITHUB_TOKEN`, then restart `pnpm dev`."
     : "";
   return `Copilot SDK model discovery failed: ${message}.${detectedCli}${authHint}`;
+}
+
+export function summarizeSdkFailureMessage(error: unknown): string {
+  let message = error instanceof Error ? error.message : String(error);
+  const markers = Array.from(message.matchAll(/\^\s*Error:\s*/g));
+  const marker = markers.at(-1);
+  if (marker?.index !== undefined) message = message.slice(marker.index + marker[0].lastIndexOf("Error:"));
+  const stack = message.search(/\s+at\s+(?:async\s+)?(?:[^\s(]+\s+\((?:file:\/\/|\/|node:)[^)]+:\d+:\d+\)|(?:file:\/\/|\/|node:)\S+:\d+:\d+)/);
+  if (stack >= 0) message = message.slice(0, stack);
+  const nodeVersionFooter = message.search(/(?:^|\r?\n)\s*Node\.js v\d+(?:\.\d+){1,2}\s*$/);
+  if (nodeVersionFooter >= 0) message = message.slice(0, nodeVersionFooter);
+  message = message.replace(/\s+/g, " ").trim();
+  const limit = 800;
+  return message.length > limit ? `[truncated] ${message.slice(-limit)}` : message;
 }
 
 export function mapSdkModelInfo(model: ModelInfo): ProviderStatus["models"][number] {

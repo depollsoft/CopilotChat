@@ -4,6 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+if (process.argv.includes('--check')) {
+  const client = new CopilotClient();
+  for (const method of ['start', 'listModels', 'stop']) {
+    if (typeof client[method] !== 'function') throw new TypeError(`CopilotClient.${method} is not available`);
+  }
+  console.log('Copilot SDK auth-doctor contract: OK');
+  process.exit(0);
+}
+
 const tokenEntries = [
   ['COPILOT_GITHUB_TOKEN', process.env.COPILOT_GITHUB_TOKEN],
   ['GITHUB_COPILOT_TOKEN', process.env.GITHUB_COPILOT_TOKEN],

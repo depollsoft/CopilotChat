@@ -3,10 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import type { CopilotProvider } from "@copilotchat/provider";
 import type { ImportPreview, MessageAttachment } from "@copilotchat/shared";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
-import { loadConfig } from "./config.js";
+import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
 import { ImportDraftStore } from "./import-drafts.js";
@@ -14,7 +15,7 @@ import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
 import { ActiveChatResponses } from "./responses.js";
-import { ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
+import { ownerWorkspaceDirectory, ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
 const tempDbs: Array<{ db: AppDatabase; dir: string }> = [];
 function createTestDb(): AppDatabase { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-db-")); const db = new AppDatabase(dir); tempDbs.push({ db, dir }); return db; }
@@ -37,6 +38,40 @@ describe("loadConfig", () => {
     } finally {
       if (previous === undefined) delete process.env.COPILOTCHAT_REQUIRE_CSRF;
       else process.env.COPILOTCHAT_REQUIRE_CSRF = previous;
+    }
+  });
+  it("treats empty optional deployment values as unset", () => {
+    const previousPublicUrl = process.env.COPILOTCHAT_PUBLIC_URL;
+    const tokenVariables = ["COPILOT_GITHUB_TOKEN", "GITHUB_COPILOT_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] as const;
+    const previousTokens = tokenVariables.map((name) => [name, process.env[name]] as const);
+    try {
+      process.env.COPILOTCHAT_PUBLIC_URL = "";
+      for (const name of tokenVariables) process.env[name] = "";
+      expect(loadConfig().publicUrl).toBeUndefined();
+      expect(loadConfig().copilotGitHubToken).toBeUndefined();
+    } finally {
+      if (previousPublicUrl === undefined) delete process.env.COPILOTCHAT_PUBLIC_URL;
+      else process.env.COPILOTCHAT_PUBLIC_URL = previousPublicUrl;
+      for (const [name, value] of previousTokens) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+  it("normalizes and enforces allowed GitHub logins", () => {
+    const previous = process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS;
+    try {
+      process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS = "@Alice, bob, ALICE";
+      const allowed = loadConfig().allowedGitHubLogins;
+      expect(allowed).toEqual(["alice", "bob"]);
+      expect(isGitHubLoginAllowed(allowed, "ALICE")).toBe(true);
+      expect(isGitHubLoginAllowed(allowed, "@bob")).toBe(true);
+      expect(isGitHubLoginAllowed(["@Alice"], "alice")).toBe(true);
+      expect(isGitHubLoginAllowed(allowed, "mallory")).toBe(false);
+      expect(isGitHubLoginAllowed([], "any-user")).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS;
+      else process.env.COPILOTCHAT_ALLOWED_GITHUB_LOGINS = previous;
     }
   });
 
@@ -133,7 +168,7 @@ describe("chat provider context", () => {
 
     expect(db.getChat(owner.id, generalChat.id).providerSessionId).toBeNull();
     expect(db.getChat(owner.id, projectChat.id).providerSessionId).toBeNull();
-    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [] }).memories).toHaveLength(1);
+    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }).memories).toHaveLength(1);
   });
 
   it("uses saved chat model choices when a request does not override them", () => {
@@ -244,8 +279,8 @@ describe("chat provider context", () => {
 
   it("isolates data by GitHub owner login", () => {
     const db = createTestDb();
-    const alice = db.getOrCreateGitHubOwner({ login: "alice", displayName: "Alice", avatarUrl: null });
-    const bob = db.getOrCreateGitHubOwner({ login: "bob", displayName: "Bob", avatarUrl: null });
+    const alice = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice", displayName: "Alice", avatarUrl: null });
+    const bob = db.getOrCreateGitHubOwner({ providerUserId: "1002", login: "bob", displayName: "Bob", avatarUrl: null });
 
     db.createChat(alice.id, { title: "Alice chat", projectId: null, workspaceId: null });
     db.createChat(bob.id, { title: "Bob chat", projectId: null, workspaceId: null });
@@ -256,14 +291,88 @@ describe("chat provider context", () => {
     expect(db.listSkills(bob.id).length).toBeGreaterThan(0);
   });
 
+  it("stores GitHub OAuth tokens per owner", () => {
+    const db = createTestDb();
+    const alice = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice", displayName: "Alice", avatarUrl: null });
+    const bob = db.getOrCreateGitHubOwner({ providerUserId: "1002", login: "bob", displayName: "Bob", avatarUrl: null });
+
+    db.setGitHubAuth(alice.id, { accessToken: "alice-token", login: "alice", displayName: "Alice", avatarUrl: null });
+    db.setGitHubAuth(bob.id, { accessToken: "bob-token", login: "bob", displayName: "Bob", avatarUrl: null });
+
+    expect(db.hasGitHubAuth(alice.id)).toBe(true);
+    expect(db.hasGitHubAuth(bob.id)).toBe(true);
+    expect(db.getGitHubToken(alice.id)).toBe("alice-token");
+    expect(db.getGitHubToken(bob.id)).toBe("bob-token");
+  });
+
+  it("keys GitHub owners by immutable provider ID instead of login", () => {
+    const db = createTestDb();
+    const original = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice", displayName: "Alice", avatarUrl: null });
+    db.createChat(original.id, { title: "Alice chat", projectId: null, workspaceId: null });
+
+    const renamed = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice-renamed", displayName: "Alice", avatarUrl: null });
+    const reclaimer = db.getOrCreateGitHubOwner({ providerUserId: "2002", login: "alice", displayName: "Another Alice", avatarUrl: null });
+
+    expect(renamed.id).toBe(original.id);
+    expect(renamed.login).toBe("alice-renamed");
+    expect(db.listChats(renamed.id).map((chat) => chat.title)).toEqual(["Alice chat"]);
+    expect(reclaimer.id).not.toBe(original.id);
+    expect(db.listChats(reclaimer.id)).toEqual([]);
+  });
+
+  it("only migrates a legacy login-keyed owner when explicitly verified", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-legacy-owner-"));
+    const legacy = new Database(path.join(dir, "copilotchat.sqlite"));
+    legacy.exec(`
+      CREATE TABLE owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE auth_tokens (provider TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES ('github:alice', 'alice', 'Alice', NULL, 'github', '2026-01-01T00:00:00.000Z');
+      INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', 'github:alice', 'legacy-token', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `);
+    legacy.close();
+    const db = new AppDatabase(dir);
+    tempDbs.push({ db, dir });
+    const legacyOwner = db.getLegacyGitHubOwnerByLogin("alice");
+
+    const reclaimer = db.getOrCreateGitHubOwner({ providerUserId: "2002", login: "alice", displayName: "Another Alice", avatarUrl: null });
+    const migrated = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice-renamed", displayName: "Alice", avatarUrl: null, legacyOwnerId: legacyOwner?.id });
+
+    expect(legacyOwner?.id).toBe("github:alice");
+    expect(reclaimer.id).not.toBe(legacyOwner?.id);
+    expect(migrated.id).toBe(legacyOwner?.id);
+    expect(migrated.login).toBe("alice-renamed");
+    expect(db.getGitHubOwnerByProviderId("1001")?.id).toBe(legacyOwner?.id);
+  });
+
+  it("migrates a persistent legacy GitHub token to owner-scoped storage", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-legacy-db-"));
+    const legacy = new Database(path.join(dir, "copilotchat.sqlite"));
+    legacy.exec(`
+      CREATE TABLE owners (id TEXT PRIMARY KEY, login TEXT NOT NULL, display_name TEXT, avatar_url TEXT, auth_provider TEXT NOT NULL, created_at TEXT NOT NULL);
+      CREATE TABLE auth_tokens (provider TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, access_token TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES ('local', 'local', 'Local user', NULL, 'local', '2026-01-01T00:00:00.000Z');
+      INSERT INTO auth_tokens (provider, owner_id, access_token, created_at, updated_at) VALUES ('github', 'local', 'legacy-token', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+    `);
+    legacy.close();
+    const db = new AppDatabase(dir);
+    tempDbs.push({ db, dir });
+    const alice = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice", displayName: "Alice", avatarUrl: null });
+
+    db.setGitHubAuth(alice.id, { accessToken: "alice-token", login: "alice", displayName: "Alice", avatarUrl: null });
+
+    expect(db.getGitHubToken("local")).toBe("legacy-token");
+    expect(db.getGitHubToken(alice.id)).toBe("alice-token");
+  });
+
   it("keeps large artifact content out of app state", () => {
     const db = createTestDb();
     const owner = db.getOwner();
     const content = "large artifact\n".repeat(1000);
     const artifact = db.createArtifact(owner.id, { title: "Large notes", kind: "markdown", content });
 
-    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], defaultModel: "gpt-test" });
+    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }, [], owner.id, "github");
 
+    expect(state.authMode).toBe("github");
     expect(state.artifacts[0]).toMatchObject({ id: artifact.id, title: "Large notes", contentLength: content.length });
     expect(state.artifacts[0]?.contentPreview.length).toBeLessThan(content.length);
     expect(JSON.stringify(state)).not.toContain(content);
@@ -398,7 +507,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "sdk",
       label: "SDK",
-      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "tool-call", id: "title-call", toolName: "Tool", input: null };
         yield { type: "tool-result", id: "title-call", toolName: "Tool", status: "succeeded", output: { content: "{\"title\":\"Multiple Choice Question\"}", detailedContent: "{\"title\":\"Multiple Choice Question\"}" } };
@@ -425,7 +534,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "tool-call", id: "large-tool", toolName: "big.search", input: { query: payload } };
         yield { type: "tool-result", id: "large-tool", toolName: "big.search", status: "failed", output: { content: payload }, error: payload };
@@ -456,7 +565,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "delta", text: "Hello" };
         yield { type: "delta", text: "Hello world" };
@@ -480,7 +589,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "delta", text: "very" };
         yield { type: "delta", text: " very" };
@@ -504,7 +613,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent", description: "Inspect context." };
         yield { type: "subagent-reasoning-delta", id: "research-agent", text: "Thinking about sources." };
@@ -535,7 +644,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent", description: "Inspect context." };
         yield { type: "subagent-delta", id: "research-agent", text: large };
@@ -572,7 +681,7 @@ describe("chat provider context", () => {
     const provider: CopilotProvider = {
       id: "echo",
       label: "Echo",
-      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], defaultModel: "gpt-test" }),
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
       async *streamChat() {
         for (let index = 0; index < 8; index += 1) yield { type: "delta", text: `${index}${chunk}` };
         yield { type: "done" };
@@ -769,12 +878,15 @@ describe("chat provider context", () => {
     const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-workspace-root-"));
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-outside-"));
     try {
-      const aliceRoot = ownerWorkspaceRoot(workspaceRoot, "github:alice");
+      const aliceOwnerId = "github-id:1001";
+      const aliceRoot = ownerWorkspaceRoot(workspaceRoot, aliceOwnerId);
       const aliceRepo = path.join(aliceRoot, "repo");
       fs.mkdirSync(aliceRepo, { recursive: true });
 
-      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: "github:alice", rootPath: aliceRepo, workspaceRoot })).resolves.toBe(fs.realpathSync(aliceRepo));
-      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: "github:alice", rootPath: outside, workspaceRoot })).rejects.toThrow(/configured workspace root/);
+      expect(ownerWorkspaceDirectory(aliceOwnerId)).toBe("github-id-1001");
+      expect(ownerWorkspaceDirectory("github:legacy-login")).toBe("legacy-login");
+      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: aliceOwnerId, rootPath: aliceRepo, workspaceRoot })).resolves.toBe(fs.realpathSync(aliceRepo));
+      await expect(validateRegisteredWorkspaceRoot({ authMode: "github", ownerId: aliceOwnerId, rootPath: outside, workspaceRoot })).rejects.toThrow(/configured workspace root/);
       await expect(validateRegisteredWorkspaceRoot({ authMode: "local", ownerId: "local", rootPath: outside, workspaceRoot })).resolves.toBe(fs.realpathSync(outside));
     } finally {
       fs.rmSync(workspaceRoot, { recursive: true, force: true });
@@ -835,8 +947,8 @@ describe("chat provider context", () => {
 
   it("keeps edit and retry mutations scoped to the chat owner", () => {
     const db = createTestDb();
-    const alice = db.getOrCreateGitHubOwner({ login: "alice", displayName: "Alice", avatarUrl: null });
-    const bob = db.getOrCreateGitHubOwner({ login: "bob", displayName: "Bob", avatarUrl: null });
+    const alice = db.getOrCreateGitHubOwner({ providerUserId: "1001", login: "alice", displayName: "Alice", avatarUrl: null });
+    const bob = db.getOrCreateGitHubOwner({ providerUserId: "1002", login: "bob", displayName: "Bob", avatarUrl: null });
     const bobChat = db.createChat(bob.id, { title: "Bob chat", projectId: null, workspaceId: null });
     const bobUser = db.addMessage({ chatId: bobChat.id, role: "user", content: "Bob secret" });
     const bobAssistant = db.addMessage({ chatId: bobChat.id, role: "assistant", content: "Bob answer", provider: "echo" });

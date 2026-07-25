@@ -1,8 +1,11 @@
 import type { ProviderEvent } from "./index.js";
+import { CopilotClient } from "@github/copilot-sdk";
 import type { ModelInfo } from "@github/copilot-sdk";
 import http from "node:http";
-import { describe, expect, it } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo } from "./index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { createCopilotProvider, mapSdkModelInfo, summarizeSdkFailureMessage } from "./index.js";
+
+afterEach(() => { vi.restoreAllMocks(); });
 
 describe("createCopilotProvider", () => {
   it("uses SDK provider by default", async () => {
@@ -11,7 +14,45 @@ describe("createCopilotProvider", () => {
   }, 20_000);
   it("can use echo provider explicitly", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
-    expect((await provider.status()).id).toBe("echo");
+    const status = await provider.status();
+    expect(status.id).toBe("echo");
+    expect(status.modelsAuthoritative).toBe(true);
+  });
+  it("extracts actionable CLI failures without returning bundled source", () => {
+    const source = "minified-source ".repeat(5000);
+    const message = summarizeSdkFailureMessage(new Error(`CLI server exited with code 1 stderr: ^ Error: decoy ${source} ^\n\nError: Persistence error: I/O error: Permission denied (os error 13) at Object.writeKey (file:///app/app.js:83:684) at async start (file:///app/app.js:100:1) Node.js v22.23.1`));
+
+    expect(message).toBe("Error: Persistence error: I/O error: Permission denied (os error 13)");
+    expect(message).not.toContain("minified-source");
+    expect(message.length).toBeLessThan(200);
+  });
+  it("preserves actionable messages containing the word at", () => {
+    expect(summarizeSdkFailureMessage(new Error("Open the device page at https://github.com/login/device"))).toBe("Open the device page at https://github.com/login/device");
+  });
+  it("only removes a standalone Node version footer", () => {
+    expect(summarizeSdkFailureMessage(new Error("SyntaxError: unsupported syntax\nNode.js v22.23.1"))).toBe("SyntaxError: unsupported syntax");
+    expect(summarizeSdkFailureMessage(new Error("Unsupported Node.js v20; upgrade to v22"))).toBe("Unsupported Node.js v20; upgrade to v22");
+  });
+  it("stops the SDK client when startup fails", async () => {
+    vi.spyOn(CopilotClient.prototype, "start").mockRejectedValueOnce(new Error("startup failed"));
+    const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+
+    const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
+
+    expect(status.available).toBe(false);
+    expect(status.modelsAuthoritative).toBe(false);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+  it("stops the SDK client when model discovery fails", async () => {
+    vi.spyOn(CopilotClient.prototype, "start").mockResolvedValueOnce();
+    vi.spyOn(CopilotClient.prototype, "listModels").mockRejectedValueOnce(new Error("model discovery failed"));
+    const stop = vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValueOnce([]);
+
+    const status = await createCopilotProvider({ provider: "sdk", model: "gpt-test" }).status();
+
+    expect(status.available).toBe(false);
+    expect(status.modelsAuthoritative).toBe(false);
+    expect(stop).toHaveBeenCalledOnce();
   });
   it("passes project context and prior messages through the development provider", async () => {
     const provider = createCopilotProvider({ provider: "echo", model: "gpt-test" });
@@ -210,10 +251,33 @@ describe("createCopilotProvider", () => {
       if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
       const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
 
+      const status = await provider.status();
       const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test" }));
 
+      expect(status.modelsAuthoritative).toBe(true);
+      expect(status.models.map((model) => model.id)).toEqual(["gpt-test"]);
       expect(events).toContainEqual({ type: "delta", text: "ok" });
       expect(events.at(-1)).toEqual({ type: "done" });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+  it("marks HTTP fallback models as non-authoritative when discovery fails", async () => {
+    const server = http.createServer((_request, response) => {
+      response.writeHead(503, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "unavailable" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
+      const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
+
+      const status = await provider.status();
+
+      expect(status.available).toBe(true);
+      expect(status.modelsAuthoritative).toBe(false);
+      expect(status.models.some((model) => model.id === "gpt-test")).toBe(true);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
