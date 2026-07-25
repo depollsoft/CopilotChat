@@ -71,6 +71,7 @@ export const chatSchema = z.object({
   titleManuallySet: z.boolean().default(false),
   archived: z.boolean(),
   favorite: z.boolean().default(false),
+  totalNanoAiu: z.number().nonnegative().default(0),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -256,4 +257,16 @@ export function titleFromContent(content: string): string {
   const compact = content.replace(/\s+/g, " ").trim();
   if (!compact) return "New chat";
   return compact.split(" ").slice(0, 6).join(" ");
+}
+
+export const nanoAiuPerAic = 1_000_000_000;
+
+/** Formats nano-AI units as AI credits (AIC) using the same thresholds as the Copilot CLI footer. */
+export function formatAic(nanoAiu: number): string {
+  const credits = nanoAiu / nanoAiuPerAic;
+  if (!Number.isFinite(credits) || credits <= 0) return "0";
+  if (credits >= 100) return Math.round(credits).toString();
+  if (credits >= 10) return credits.toFixed(1).replace(/\.0$/, "");
+  if (credits < 0.01) return "<0.01";
+  return credits.toFixed(2).replace(/\.?0+$/, "");
 }
