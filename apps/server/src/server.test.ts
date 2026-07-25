@@ -292,6 +292,9 @@ describe("chat provider context", () => {
     db.createToolRun(owner.id, { chatId: chat.id, workspaceId: workspace.id, toolName: "test.tool", input: {} });
     db.saveMcpServer(owner.id, { id: "test-mcp", name: "Test MCP", transport: "stdio", command: "node", args: [], url: null, tools: ["tool"], enabled: true, projectId: project.id });
     db.upsertSkill(owner.id, { id: "custom-skill", name: "Custom", description: "Custom skill", version: "1", instructions: "Use it.", prompts: [], workflow: [], artifactTemplates: [], mcpDependencies: [], toolDependencies: [], activationRules: [], permissions: [] }, false, null);
+    db.updateUserContext(owner.id, { profile: "Sensitive profile", locationLevel: "fine", location: { latitude: 47.60621, longitude: -122.33207, accuracy: 15, capturedAt: "2026-07-25T00:00:00.000Z", precision: "fine" } });
+    db.createMemory(owner.id, { projectId: null, title: "User memory", content: "Sensitive user context", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Project memory", content: "Sensitive project context", enabled: true });
 
     db.clearAllData(owner.id);
 
@@ -304,6 +307,8 @@ describe("chat provider context", () => {
     expect(db.listArtifacts(owner.id)).toEqual([]);
     expect(db.listMcpServers(owner.id)).toEqual([]);
     expect(db.listWorkspaces(owner.id)).toEqual([]);
+    expect(db.getUserContext(owner.id)).toMatchObject({ profile: "", locationLevel: "off", location: null });
+    expect(db.listMemories(owner.id)).toEqual([]);
     const skills = db.listSkills(owner.id);
     expect(skills.some((skill) => skill.id === "custom-skill")).toBe(false);
     expect(skills.length).toBeGreaterThan(0);
@@ -530,6 +535,45 @@ describe("chat provider context", () => {
     const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Use yolo permissions", skillIds: [], permissionMode: "yolo" }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
 
     expect(request.permissionMode).toBe("yolo");
+  });
+
+  it("does not restore a stale provider session after a context mutation cancels the active response", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Context race", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Start with old context" });
+    let markStarted!: () => void;
+    let releaseSession!: () => void;
+    let markClosed!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
+    const provider: CopilotProvider = {
+      id: "sdk",
+      label: "SDK",
+      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        markStarted();
+        try {
+          await sessionGate;
+          yield { type: "session", sessionId: "stale-session", workspacePath: "/tmp/stale", resumed: false, infinite: true };
+          yield { type: "done" };
+        } finally {
+          markClosed();
+        }
+      },
+    };
+    const responses = new ActiveChatResponses();
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Start with old context" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await started;
+
+    expect(responses.cancel(chat.id)).toBe(true);
+    db.updateUserContext(owner.id, { profile: "New context" });
+    releaseSession();
+    await closed;
+
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ providerSessionId: null, providerSessionWorkspacePath: null });
+    expect(db.listMessages(chat.id).some((message) => message.role === "assistant")).toBe(false);
   });
 
   it("hides title-tool activity when the SDK reports it as a generic tool", async () => {

@@ -362,6 +362,7 @@ test("personal context and coarse location are included in chats", async ({ page
   await page.getByRole("button", { name: "Send" }).click();
   let response = page.locator(".msg.assistant .msg-body").last();
   await expect(response).toContainText("Personal context: Profile supplied by the user: I am a staff engineer", { timeout: 15000 });
+  await expect(response).toContainText("Location shared by the user (coarse): 47.6, -122.3");
   await expect(response).not.toContainText("Updated response style");
 
   await page.locator(".sidebar-footer-user").click();
