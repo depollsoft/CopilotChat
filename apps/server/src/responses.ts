@@ -71,7 +71,8 @@ export class ActiveChatResponses {
   private readonly chatOwners = new Map<string, string>();
 
   has(chatId: string): boolean { return this.active.has(chatId); }
-  chatIds(): string[] { return [...this.active.keys()]; }
+  /** Chats whose response is running or still being prepared, so clients keep showing them as live. */
+  chatIds(): string[] { return [...new Set([...this.active.keys(), ...this.preparing])]; }
   reserve(chatId: string): boolean { if (this.active.has(chatId) || this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.preparing.add(chatId); return true; }
   releaseReservation(chatId: string): void { this.preparing.delete(chatId); }
   beginDeletion(chatId: string): boolean { if (this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.deleting.add(chatId); return true; }

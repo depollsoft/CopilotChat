@@ -1463,3 +1463,54 @@ test("chat viewport follows live updates and can jump back to live", async ({ pa
   await expect.poll(distanceFromBottom).toBeLessThan(120);
   await expect(page.getByRole("button", { name: "Jump to live" })).toHaveCount(0);
 });
+
+test("a backgrounded response never streams into the visible chat", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers concurrent chat streaming.");
+  await page.goto("/");
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ALPHAMARKER. ${"Keep streaming this response. ".repeat(750)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toContainText("I am running with the local development provider");
+  const alphaChatId = page.url().split("/").pop() ?? "";
+
+  await page.locator(".sidebar-new").click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  await expect(page.locator(`.sidebar-row[data-chat-id="${alphaChatId}"] .chat-indicator.running`)).toBeVisible();
+  await expect(page.locator(".thread .msg")).toHaveCount(0);
+  await page.waitForTimeout(1500);
+  await expect(page.locator(".thread .msg")).toHaveCount(0);
+
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("BETAMARKER stays alone in this chat.");
+  await page.getByRole("button", { name: "Send" }).click();
+  const betaResponse = page.locator(".msg.assistant .msg-body").last();
+  await expect(betaResponse).toContainText("BETAMARKER stays alone in this chat.");
+  await expect(betaResponse).not.toContainText("Keep streaming this response.");
+  await expect(page.locator(".msg.user")).toHaveCount(1);
+
+  await page.locator(`.sidebar-row[data-chat-id="${alphaChatId}"]`).click();
+  await expect(page.locator(".msg.user").filter({ hasText: "ALPHAMARKER" })).toBeVisible();
+  const alphaResponse = page.locator(".msg.assistant .msg-body").last();
+  await expect(alphaResponse).toContainText("Keep streaming this response.", { timeout: 30000 });
+  await expect(alphaResponse).not.toContainText("BETAMARKER");
+  await expect(page.locator(".msg.user")).toHaveCount(1);
+});
+
+test("guided import starts its chat while another chat is generating", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers guided imports from Preferences.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ${"keep streaming ".repeat(900)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
+  await page.locator(".sidebar-preferences-row").click();
+  const preferences = page.getByRole("dialog", { name: "Preferences" });
+  await expect(preferences.getByText("Import data")).toBeVisible();
+  await preferences.locator('input[type="file"]').setInputFiles({
+    name: "chatgpt.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify([{ id: "busy-import-1", title: "Busy import conversation", current_node: "m1", mapping: { m1: { id: "m1", parent: null, children: [], message: { author: { role: "user" }, content: { content_type: "text", parts: ["Import me"] }, create_time: 1, metadata: {} } } } }])),
+  });
+  await expect(page.getByRole("dialog", { name: "Preferences" })).toHaveCount(0);
+  await expect(page.locator(".msg.user").filter({ hasText: "Import draft ID:" })).toBeVisible({ timeout: 20000 });
+  await expect(page.locator(".msg.user")).toHaveCount(1);
+});
