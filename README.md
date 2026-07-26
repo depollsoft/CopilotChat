@@ -87,7 +87,7 @@ Dependabot checks for `@github/copilot-sdk` updates daily. Its SDK-only pull req
 | `COPILOTCHAT_ALLOWED_ORIGINS` | localhost origins | Comma-separated browser origins allowed to call the API |
 | `COPILOTCHAT_PUBLIC_URL` | request origin | Public base URL for OAuth redirects, e.g. `https://chat.example.com` |
 | `COPILOTCHAT_SESSION_SECRET` | empty | Required when `COPILOTCHAT_AUTH_MODE=github`; signs session cookies |
-| `COPILOT_GITHUB_TOKEN` | empty | Recommended token for Copilot SDK auth in local or non-interactive deployments |
+| `COPILOT_GITHUB_TOKEN` | empty | Recommended token for Copilot SDK auth in local or non-interactive deployments; also enables the `web_search` tool |
 | `GITHUB_COPILOT_TOKEN` | empty | Token injected by some Copilot launcher sessions; also supported |
 | `COPILOTCHAT_COPILOT_CLI_PATH` | auto-detected from PATH | Copilot CLI executable for the SDK to use |
 | `COPILOTCHAT_REQUIRE_CSRF` | `true` | Require `X-CopilotChat-CSRF: 1` for mutating API requests |
@@ -99,6 +99,15 @@ Dependabot checks for `@github/copilot-sdk` updates daily. Its SDK-only pull req
 | `COPILOT_API_TOKEN` | empty | Provider token for HTTP adapter |
 | `COPILOT_MODEL` | `gpt-4.1` | Provider model name |
 | `COPILOT_CLI_COMMAND` | empty | CLI bridge command |
+
+## Web search
+
+Chats can call GitHub's hosted `web_search` tool. The Copilot CLI runtime does not register it on its own, so the server attaches the GitHub-hosted `https://api.githubcopilot.com/mcp/x/web_search` MCP server to every SDK session that has a GitHub token, exposing only the `web_search` tool. `web_fetch` is built into the runtime and is always available.
+
+- GitHub auth mode: enabled automatically from the signed-in user's token.
+- Local auth mode: set `COPILOT_GITHUB_TOKEN` (or `GITHUB_COPILOT_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN`). Copilot CLI logged-in-user auth alone cannot authenticate the remote MCP server.
+
+If the token cannot authenticate, the server is simply reported as needing auth and the rest of the session continues to work. The tool appears in chats as `copilot-web_search`; a user-defined MCP server named `copilot` takes precedence over the built-in one.
 
 ## Scripts
 
@@ -113,7 +122,7 @@ Dependabot checks for `@github/copilot-sdk` updates daily. Its SDK-only pull req
 
 ## Security model
 
-The app is single-user and local-first by default. In GitHub auth mode, browser access requires a GitHub OAuth session, can be restricted with an optional login allowlist, and data is isolated by GitHub login. The API restricts browser origins, caps request body size, and requires a CSRF header for mutating requests. Optional `COPILOTCHAT_API_TOKEN` can be used for bearer-token API access. Workspace commands are parsed without a shell, reject shell metacharacters, require commands to run inside registered folders, block destructive commands, and redact common token patterns. GitHub-mode workspace registration is confined to the signed-in owner's configured workspace-root subfolder. Copilot SDK shell/write/MCP/custom-tool permission requests are denied until explicit in-app approvals exist; URL/read requests are allowed once so web search and local context can work.
+The app is single-user and local-first by default. In GitHub auth mode, browser access requires a GitHub OAuth session, can be restricted with an optional login allowlist, and data is isolated by GitHub login. The API restricts browser origins, caps request body size, and requires a CSRF header for mutating requests. Optional `COPILOTCHAT_API_TOKEN` can be used for bearer-token API access. Workspace commands are parsed without a shell, reject shell metacharacters, require commands to run inside registered folders, block destructive commands, and redact common token patterns. GitHub-mode workspace registration is confined to the signed-in owner's configured workspace-root subfolder. Copilot SDK shell/write/MCP/custom-tool permission requests are denied until explicit in-app approvals exist; URL/read requests are allowed once so web search and local context can work. The built-in `web_search` MCP server sends the owner's GitHub token to GitHub's own `api.githubcopilot.com` endpoint and exposes no other tool.
 
 ## Auth troubleshooting
 

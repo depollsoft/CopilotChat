@@ -120,7 +120,7 @@ class SdkCopilotProvider implements CopilotProvider {
     const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), contextTier: sdkContextTier(request.contextTier), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
     if (request.workingDirectory) sessionOptions.workingDirectory = request.workingDirectory;
     if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
-    const mcpServers = mapMcpServers(request.mcpServers ?? []);
+    const mcpServers = buildSdkMcpServers(request, this.options.gitHubToken);
     if (Object.keys(mcpServers).length > 0) sessionOptions.mcpServers = mcpServers;
     if (request.workingDirectory) await pruneSdkSessionState(request.workingDirectory, request.sessionId);
     let sessionData: { session: CopilotSession; resumed: boolean };
@@ -481,6 +481,15 @@ function buildTitleTool(request: ProviderChatRequest): Tool | null {
       return { title: await request.titleTool!.setTitle(title) };
     },
   };
+}
+export const webSearchMcpServerName = "copilot";
+export const webSearchMcpServerUrl = "https://api.githubcopilot.com/mcp/x/web_search";
+export const webSearchToolName = "web_search";
+export function buildSdkMcpServers(request: ProviderChatRequest, fallbackGitHubToken?: string | null): Record<string, MCPServerConfig> {
+  const servers = mapMcpServers(request.mcpServers ?? []);
+  const gitHubToken = request.gitHubToken ?? fallbackGitHubToken;
+  if (gitHubToken && !servers[webSearchMcpServerName]) servers[webSearchMcpServerName] = { type: "http", url: webSearchMcpServerUrl, tools: [webSearchToolName], headers: { Authorization: `Bearer ${gitHubToken}` } };
+  return servers;
 }
 function mapMcpServers(servers: McpServer[]): Record<string, MCPServerConfig> { const mapped: Record<string, MCPServerConfig> = {}; for (const server of servers.filter((s) => s.enabled && s.tools.length > 0)) { if (server.transport === "stdio") { if (!server.command) throw new Error(`MCP server ${server.name} is missing a command.`); mapped[server.name] = { type: "stdio", command: server.command, args: server.args, tools: server.tools }; } else { if (!server.url) throw new Error(`MCP server ${server.name} is missing a URL.`); mapped[server.name] = { type: server.transport, url: server.url, tools: server.tools }; } } return mapped; }
 function buildPermissionHandler(request: ProviderChatRequest): PermissionHandler {

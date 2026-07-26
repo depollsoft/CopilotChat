@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo, pruneSdkSessionState, readSdkUsageNanoAiu, sdkSessionStatePath, summarizeSdkFailureMessage } from "./index.js";
+import { buildSdkMcpServers, createCopilotProvider, mapSdkModelInfo, pruneSdkSessionState, readSdkUsageNanoAiu, sdkSessionStatePath, summarizeSdkFailureMessage, webSearchMcpServerName, webSearchMcpServerUrl, webSearchToolName } from "./index.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -435,6 +435,36 @@ describe("createCopilotProvider", () => {
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
+  });
+});
+
+describe("buildSdkMcpServers", () => {
+  const baseRequest = { messages: [{ role: "user" as const, content: "hi" }], model: "gpt-test" };
+  it("registers the GitHub web search MCP server when a GitHub token is available", () => {
+    const servers = buildSdkMcpServers({ ...baseRequest, gitHubToken: "gho_token", mcpServers: [] });
+
+    expect(servers[webSearchMcpServerName]).toEqual({ type: "http", url: webSearchMcpServerUrl, tools: [webSearchToolName], headers: { Authorization: "Bearer gho_token" } });
+  });
+  it("falls back to the provider-level GitHub token", () => {
+    const servers = buildSdkMcpServers({ ...baseRequest, mcpServers: [] }, "gho_factory");
+
+    expect(servers[webSearchMcpServerName]).toEqual({ type: "http", url: webSearchMcpServerUrl, tools: [webSearchToolName], headers: { Authorization: "Bearer gho_factory" } });
+  });
+  it("omits web search when no GitHub token is available", () => {
+    expect(buildSdkMcpServers({ ...baseRequest, mcpServers: [] })).toEqual({});
+  });
+  it("keeps user-configured MCP servers and does not overwrite a matching name", () => {
+    const servers = buildSdkMcpServers({
+      ...baseRequest,
+      gitHubToken: "gho_token",
+      mcpServers: [
+        { id: "a", ownerId: "o", name: "Docs", transport: "http", command: null, args: [], url: "https://example.test/mcp", tools: ["lookup"], enabled: true, projectId: null, createdAt: "", updatedAt: "" },
+        { id: "b", ownerId: "o", name: webSearchMcpServerName, transport: "http", command: null, args: [], url: "https://custom.test/mcp", tools: ["web_search"], enabled: true, projectId: null, createdAt: "", updatedAt: "" },
+      ],
+    });
+
+    expect(servers.Docs).toEqual({ type: "http", url: "https://example.test/mcp", tools: ["lookup"] });
+    expect(servers[webSearchMcpServerName]).toEqual({ type: "http", url: "https://custom.test/mcp", tools: ["web_search"] });
   });
 });
 
