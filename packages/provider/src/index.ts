@@ -1,5 +1,4 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest } from "@copilotchat/shared";
@@ -123,6 +122,7 @@ class SdkCopilotProvider implements CopilotProvider {
     if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
     const mcpServers = mapMcpServers(request.mcpServers ?? []);
     if (Object.keys(mcpServers).length > 0) sessionOptions.mcpServers = mcpServers;
+    if (request.workingDirectory) await pruneSdkSessionState(request.workingDirectory, request.sessionId);
     let sessionData: { session: CopilotSession; resumed: boolean };
     try { sessionData = await createOrResumeSdkSession(client, sessionOptions, Boolean(request.resumeSession && request.sessionId)); }
     catch (error) { await client.stop().catch(() => []); throw error; }
@@ -397,9 +397,24 @@ function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, san
 }
 
 const sdkSessionStateRoot = ".copilotchat-session";
+const sdkSessionStateRetention = 8;
 export function sdkSessionStatePath(sessionId?: string | null): string {
-  const scoped = (sessionId ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/\.{2,}/g, ".").replace(/^\.+/, "");
+  const scoped = sdkSessionStateSegment(sessionId);
   return scoped ? `${sdkSessionStateRoot}/${scoped}` : sdkSessionStateRoot;
+}
+function sdkSessionStateSegment(sessionId?: string | null): string { return (sessionId ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/\.{2,}/g, ".").replace(/^\.+/, ""); }
+export async function pruneSdkSessionState(workspaceRoot: string, keepSessionId?: string | null, retention = sdkSessionStateRetention): Promise<string[]> {
+  const root = path.resolve(workspaceRoot, sdkSessionStateRoot);
+  const keep = sdkSessionStateSegment(keepSessionId);
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (directories.length <= retention) return [];
+    const dated = await Promise.all(directories.map(async (name) => ({ name, modifiedAt: await fs.stat(path.join(root, name)).then((stat) => stat.mtimeMs).catch(() => 0) })));
+    const stale = dated.sort((left, right) => right.modifiedAt - left.modifiedAt).slice(retention).filter((entry) => entry.name !== keep);
+    await Promise.all(stale.map((entry) => fs.rm(path.join(root, entry.name), { recursive: true, force: true }).catch(() => undefined)));
+    return stale.map((entry) => entry.name);
+  } catch { return []; }
 }
 
 async function createOrResumeSdkSession(client: CopilotClient, config: SessionConfig, preferResume: boolean): Promise<{ session: CopilotSession; resumed: boolean }> {
@@ -410,17 +425,14 @@ async function createOrResumeSdkSession(client: CopilotClient, config: SessionCo
   }
   try { return { session: await client.createSession(config), resumed: false }; }
   catch (error) {
-    if (!isExistingSessionError(error)) throw error;
-    if (preferResume && sessionId) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
-    if (!sessionId) throw error;
-    return { session: await client.createSession({ ...config, sessionId: freshSdkSessionId(sessionId) }), resumed: false };
+    if (!isExistingSessionError(error) || !sessionId) throw error;
+    return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
   }
 }
 
 function isMissingSessionError(error: unknown): boolean { return /not found|does not exist|no session/i.test(error instanceof Error ? error.message : String(error)); }
-function isLostSessionError(error: unknown): boolean { return /session (?:was |is |has )?(?:not found|gone|expired|closed|deleted)|session (?:does not|doesn't) exist|no such session|unknown session|session no longer/i.test(error instanceof Error ? error.message : String(error)); }
-function freshSdkSessionId(sessionId: string): string { return `${sessionId.replace(/-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i, "")}-${randomUUID()}`; }
-function isExistingSessionError(error: unknown): boolean { return /already exists|exists|duplicate/i.test(error instanceof Error ? error.message : String(error)); }
+function isLostSessionError(error: unknown): boolean { return /session (?:was |is |has )?(?:not found|gone|expired|closed|deleted)|session (?:does not|doesn't) exist|no (?:such |matching |active )?session|unknown session|session no longer/i.test(error instanceof Error ? error.message : String(error)); }
+function isExistingSessionError(error: unknown): boolean { return /session (?:id )?(?:already )?exists|already exists|duplicate session|session (?:id )?(?:is )?(?:already )?(?:in use|taken)/i.test(error instanceof Error ? error.message : String(error)); }
 function materializeMessages(request: ProviderChatRequest): ProviderMessage[] { const system = buildSystemContext(request); return system ? [{ role: "system", content: system }, ...request.messages] : request.messages; }
 function buildCliPrompt(request: ProviderChatRequest): string { return materializeMessages(request).map((message) => `${message.role.toUpperCase()}:\n${message.content}${message.attachments?.length ? `\nAttachments: ${summarizeAttachments(message.attachments)}` : ""}`).join("\n\n"); }
 function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string): string {
@@ -599,7 +611,7 @@ async function nearestExistingParent(start: string): Promise<string> { let curre
 function isPathInside(root: string, target: string): boolean { const relative = path.relative(path.resolve(root), path.resolve(target)); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
 function sandboxError(message: string): Error { const error = new Error(message) as NodeJS.ErrnoException; error.code = "EACCES"; return error; }
 function isEnoent(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"; }
-class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { if (this.error) return Promise.reject(this.error); const value = this.values.shift(); if (value) return Promise.resolve({ value, done: false }); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
+class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { const value = this.values.shift(); if (value !== undefined) return Promise.resolve({ value, done: false }); if (this.error) return Promise.reject(this.error); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
 function getProviderTextState(map: Map<string, ProviderTextState>, id: string): ProviderTextState {
   let state = map.get(id);
   if (!state) {
