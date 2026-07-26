@@ -94,14 +94,27 @@ class SdkCopilotProvider implements CopilotProvider {
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     const fallback = new EchoProvider(this.options.model);
     try {
-      yield* this.streamWithSdk(request);
+      yield* this.streamWithSessionRecovery(request);
     } catch (error) {
       yield { type: "delta", text: `Copilot SDK was unavailable (${(error as Error).message}). Falling back to local development provider.\n\n` };
       yield* fallback.streamChat(request);
     }
   }
+  private async *streamWithSessionRecovery(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
+    let streamedContent = false;
+    try {
+      for await (const event of this.streamWithSdk(request)) {
+        if (event.type !== "session") streamedContent = true;
+        yield event;
+      }
+      return;
+    } catch (error) {
+      if (streamedContent || !request.resumeSession || !request.sessionId || !isLostSessionError(error)) throw error;
+    }
+    yield* this.streamWithSdk({ ...request, resumeSession: false });
+  }
   private async *streamWithSdk(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
-    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory));
+    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory, request.sessionId));
     const queue = new AsyncEventQueue<ProviderEvent>();
     const lastUserMessage = [...request.messages].reverse().find((message) => message.role === "user");
     const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), contextTier: sdkContextTier(request.contextTier), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
@@ -109,6 +122,7 @@ class SdkCopilotProvider implements CopilotProvider {
     if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
     const mcpServers = mapMcpServers(request.mcpServers ?? []);
     if (Object.keys(mcpServers).length > 0) sessionOptions.mcpServers = mcpServers;
+    if (request.workingDirectory) await pruneSdkSessionState(request.workingDirectory, request.sessionId);
     let sessionData: { session: CopilotSession; resumed: boolean };
     try { sessionData = await createOrResumeSdkSession(client, sessionOptions, Boolean(request.resumeSession && request.sessionId)); }
     catch (error) { await client.stop().catch(() => []); throw error; }
@@ -370,16 +384,37 @@ class CliCopilotProvider implements CopilotProvider {
   }
 }
 
-function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null): CopilotClientOptions | undefined {
+function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null, sessionId?: string | null): CopilotClientOptions | undefined {
   if (!gitHubToken && !cliPath && !sandboxRoot) return undefined;
   const options: CopilotClientOptions = {};
   if (cliPath) options.connection = RuntimeConnection.forStdio({ path: cliPath });
-  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: ".copilotchat-session", conventions: process.platform === "win32" ? "windows" : "posix" };
+  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: sdkSessionStatePath(sessionId), conventions: process.platform === "win32" ? "windows" : "posix" };
   if (gitHubToken) {
     options.gitHubToken = gitHubToken;
     options.useLoggedInUser = false;
   }
   return options;
+}
+
+const sdkSessionStateRoot = ".copilotchat-session";
+const sdkSessionStateRetention = 8;
+export function sdkSessionStatePath(sessionId?: string | null): string {
+  const scoped = sdkSessionStateSegment(sessionId);
+  return scoped ? `${sdkSessionStateRoot}/${scoped}` : sdkSessionStateRoot;
+}
+function sdkSessionStateSegment(sessionId?: string | null): string { return (sessionId ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/\.{2,}/g, ".").replace(/^\.+/, ""); }
+export async function pruneSdkSessionState(workspaceRoot: string, keepSessionId?: string | null, retention = sdkSessionStateRetention): Promise<string[]> {
+  const root = path.resolve(workspaceRoot, sdkSessionStateRoot);
+  const keep = sdkSessionStateSegment(keepSessionId);
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (directories.length <= retention) return [];
+    const dated = await Promise.all(directories.map(async (name) => ({ name, modifiedAt: await fs.stat(path.join(root, name)).then((stat) => stat.mtimeMs).catch(() => 0) })));
+    const stale = dated.sort((left, right) => right.modifiedAt - left.modifiedAt).slice(retention).filter((entry) => entry.name !== keep);
+    await Promise.all(stale.map((entry) => fs.rm(path.join(root, entry.name), { recursive: true, force: true }).catch(() => undefined)));
+    return stale.map((entry) => entry.name);
+  } catch { return []; }
 }
 
 async function createOrResumeSdkSession(client: CopilotClient, config: SessionConfig, preferResume: boolean): Promise<{ session: CopilotSession; resumed: boolean }> {
@@ -390,13 +425,14 @@ async function createOrResumeSdkSession(client: CopilotClient, config: SessionCo
   }
   try { return { session: await client.createSession(config), resumed: false }; }
   catch (error) {
-    if (preferResume && sessionId && isExistingSessionError(error)) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
-    throw error;
+    if (!isExistingSessionError(error) || !sessionId) throw error;
+    return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
   }
 }
 
 function isMissingSessionError(error: unknown): boolean { return /not found|does not exist|no session/i.test(error instanceof Error ? error.message : String(error)); }
-function isExistingSessionError(error: unknown): boolean { return /already exists|exists|duplicate/i.test(error instanceof Error ? error.message : String(error)); }
+function isLostSessionError(error: unknown): boolean { return /session (?:was |is |has )?(?:not found|gone|expired|closed|deleted)|session (?:does not|doesn't) exist|no (?:such |matching |active )?session|unknown session|session no longer/i.test(error instanceof Error ? error.message : String(error)); }
+function isExistingSessionError(error: unknown): boolean { return /session (?:id )?(?:already )?exists|already exists|duplicate session|session (?:id )?(?:is )?(?:already )?(?:in use|taken)/i.test(error instanceof Error ? error.message : String(error)); }
 function materializeMessages(request: ProviderChatRequest): ProviderMessage[] { const system = buildSystemContext(request); return system ? [{ role: "system", content: system }, ...request.messages] : request.messages; }
 function buildCliPrompt(request: ProviderChatRequest): string { return materializeMessages(request).map((message) => `${message.role.toUpperCase()}:\n${message.content}${message.attachments?.length ? `\nAttachments: ${summarizeAttachments(message.attachments)}` : ""}`).join("\n\n"); }
 function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string): string {
@@ -575,7 +611,7 @@ async function nearestExistingParent(start: string): Promise<string> { let curre
 function isPathInside(root: string, target: string): boolean { const relative = path.relative(path.resolve(root), path.resolve(target)); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
 function sandboxError(message: string): Error { const error = new Error(message) as NodeJS.ErrnoException; error.code = "EACCES"; return error; }
 function isEnoent(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"; }
-class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { if (this.error) return Promise.reject(this.error); const value = this.values.shift(); if (value) return Promise.resolve({ value, done: false }); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
+class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { const value = this.values.shift(); if (value !== undefined) return Promise.resolve({ value, done: false }); if (this.error) return Promise.reject(this.error); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
 function getProviderTextState(map: Map<string, ProviderTextState>, id: string): ProviderTextState {
   let state = map.get(id);
   if (!state) {
