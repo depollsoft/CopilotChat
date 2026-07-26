@@ -150,6 +150,22 @@ describe("chat provider context", () => {
     expect(request.messages).toEqual([{ role: "user", content: "Updated question", attachments: [{ type: "file", path: "/tmp/new.txt", displayName: "new.txt", size: 3 }] }]);
   });
 
+  it("builds retry context through the prior user message with a fresh session", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    let chat = db.createChat(owner.id, { title: "Retry context", projectId: null, workspaceId: null });
+    const user = db.addMessage({ chatId: chat.id, role: "user", content: "Retry me" });
+    db.addMessage({ chatId: chat.id, role: "assistant", content: "Old answer" });
+    db.addMessage({ chatId: chat.id, role: "user", content: "Later message" });
+    chat = db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "old-session" });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: user.content }, messageCutoffId: user.id, resetProviderSession: true, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.messages.map((message) => message.content)).toEqual(["Retry me"]);
+    expect(request.resumeSession).toBe(false);
+    expect(request.sessionId).not.toBe("old-session");
+  });
+
   it("uses saved chat model choices when a request does not override them", () => {
     const db = createTestDb();
     const owner = db.getOwner();

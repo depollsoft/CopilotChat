@@ -61,17 +61,21 @@ export class UploadedFileStore {
       await pipeline(source, limiter, createWriteStream(temporaryPath, { flags: "wx" }));
       if (received !== input.size) throw new UploadValidationError(`Upload size mismatch: expected ${input.size} bytes but received ${received}.`);
       const uploaded: UploadedFile = { id, ownerId, fileName, mimeType: input.mimeType, size: input.size, sha256: hash.digest("hex"), createdAt: new Date().toISOString() };
-      await fs.rename(temporaryPath, this.dataPath(uploaded.id));
-      const metadataTemporaryPath = `${this.metadataPath(uploaded.id)}.part`;
-      await fs.writeFile(metadataTemporaryPath, JSON.stringify(uploaded), { encoding: "utf8", flag: "wx" });
-      await fs.rename(metadataTemporaryPath, this.metadataPath(uploaded.id));
+      await this.withQuotaLock(async () => {
+        await fs.rename(temporaryPath, this.dataPath(uploaded.id));
+        const metadataTemporaryPath = `${this.metadataPath(uploaded.id)}.part`;
+        await fs.writeFile(metadataTemporaryPath, JSON.stringify(uploaded), { encoding: "utf8", flag: "wx" });
+        await fs.rename(metadataTemporaryPath, this.metadataPath(uploaded.id));
+        releaseReservation?.();
+        releaseReservation = null;
+      });
       return { id: uploaded.id, uploadId: uploaded.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size };
     } catch (error) {
       await Promise.all([fs.rm(`${this.dataPath(id)}.part`, { force: true }), fs.rm(this.dataPath(id), { force: true }), fs.rm(`${this.metadataPath(id)}.part`, { force: true }), fs.rm(this.metadataPath(id), { force: true })]);
       throw error;
     } finally {
       this.activeUploadIds.delete(id);
-      releaseReservation?.();
+      if (releaseReservation) await this.withQuotaLock(async () => { releaseReservation?.(); releaseReservation = null; });
       this.endOwnerOperation(ownerId);
     }
   }

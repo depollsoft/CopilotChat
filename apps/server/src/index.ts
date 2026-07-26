@@ -126,7 +126,7 @@ const githubDeviceStartResponseSchema = z.object({ device_code: z.string(), user
 const githubDevicePollResponseSchema = z.union([z.object({ access_token: z.string(), token_type: z.string(), scope: z.string() }), z.object({ error: z.string(), error_description: z.string().optional() })]);
 const githubUserSchema = z.object({ id: z.number().int().positive(), login: z.string(), name: z.string().nullable(), avatar_url: z.string().nullable() });
 type GitHubUser = z.infer<typeof githubUserSchema>;
-async function prepareChatTurn(ownerId: string, chatId: string, input: InternalSendMessageRequest, existingUserMessage?: ChatMessage): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
+async function prepareChatTurn(ownerId: string, chatId: string, input: InternalSendMessageRequest, existingUserMessage?: ChatMessage, options: { messageCutoffId?: string; resetProviderSession?: boolean } = {}): Promise<{ chat: Chat; userMessage: ChatMessage; providerRequest: ReturnType<typeof buildProviderChatRequest> }> {
   const gitHubToken = gitHubTokenForOwner(ownerId);
   if (config.authMode === "github" && !gitHubToken) throw new Error("GitHub authentication has expired. Sign in with GitHub again.");
   let chat = applyChatTurnScope(db, ownerId, chatId, input);
@@ -136,12 +136,13 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: InternalS
   await relocateChatAttachments({ db, ownerId, chatId: chat.id, workspaceDir, onMissing: (attachment) => app.log.warn({ chatId: chat.id, attachmentId: attachment.id }, "Attachment file is missing; removing its file reference.") });
   const materialized = await materializeMessageAttachments({ uploads: uploadedFiles, ownerId, chatId: chat.id, workspaceDir, maxBytes: config.uploadLimitBytes, uploadClaimId: input.uploadClaimId, attachments: input.attachments });
   const attachments = materialized.attachments;
+  const overrideAttachments = existingUserMessage && input.attachments === undefined ? db.listMessageAttachments(existingUserMessage.id, { includeAttachmentData: true, includeAttachmentFilePaths: true }) : attachments;
   let filesPersisted = materialized.createdFilePaths.length === 0;
   let addedUserMessage: ChatMessage | null = null;
   try {
     if (!input.content.trim() && attachments.length === 0) throw new Error("Message requires text or an attachment.");
     const titleRequired = db.listMessages(chat.id).filter((message) => message.role === "user").length + (existingUserMessage ? 0 : 1) <= 1;
-    const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, pendingUserMessage: existingUserMessage ? undefined : { content: input.content, attachments }, messageOverride: existingUserMessage && input.attachments !== undefined ? { id: existingUserMessage.id, content: input.content, attachments } : undefined, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
+    const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, pendingUserMessage: existingUserMessage ? undefined : { content: input.content, attachments }, messageOverride: existingUserMessage ? { id: existingUserMessage.id, content: input.content, attachments: overrideAttachments } : undefined, messageCutoffId: options.messageCutoffId, resetProviderSession: options.resetProviderSession, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
     attachImportGuidance(ownerId, input, providerRequest);
     providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
     const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
@@ -332,8 +333,10 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/edit`, async (request, 
   try {
     turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
       return withUploadClaim(owner.id, input, async (claimedInput) => {
+        const editableMessage = db.getEditableUserMessage(owner.id, params.chatId, params.messageId);
+        const prepared = await prepareChatTurn(owner.id, params.chatId, claimedInput, editableMessage, { messageCutoffId: editableMessage.id, resetProviderSession: true });
         const userMessage = db.editUserMessageAndTruncate(owner.id, params.chatId, params.messageId, input.content);
-        return prepareChatTurn(owner.id, params.chatId, claimedInput, userMessage);
+        return { ...prepared, chat: db.getChat(owner.id, params.chatId), userMessage };
       });
     });
   } catch (error) {
@@ -355,8 +358,10 @@ app.post(`${apiPrefix}/chats/:chatId/messages/:messageId/retry`, async (request,
   try {
     turn = await withAttachmentCleanup(owner.id, params.chatId, async () => {
       return withUploadClaim(owner.id, { ...input, content: "" }, async (claimedInput) => {
+        const retryUserMessage = db.getUserMessageBeforeAssistant(owner.id, params.chatId, params.messageId);
+        const prepared = await prepareChatTurn(owner.id, params.chatId, { ...claimedInput, content: retryUserMessage.content }, retryUserMessage, { messageCutoffId: retryUserMessage.id, resetProviderSession: true });
         const userMessage = db.retryAssistantMessage(owner.id, params.chatId, params.messageId);
-        return prepareChatTurn(owner.id, params.chatId, { ...claimedInput, content: userMessage.content }, userMessage);
+        return { ...prepared, chat: db.getChat(owner.id, params.chatId), userMessage };
       });
     });
   } catch (error) {
@@ -585,19 +590,17 @@ function abandonUploadClaim(ownerId: string, claimId?: string | null): void {
 }
 async function withAttachmentCleanup<T>(ownerId: string, chatId: string, action: () => Promise<T>): Promise<T> {
   const before = db.listChatAttachmentFiles(ownerId, chatId);
-  try {
-    return await action();
-  } finally {
-    const retained = new Set(db.listChatAttachmentFiles(ownerId, chatId).map((attachment) => attachment.filePath));
-    await Promise.all(before.filter((attachment) => !retained.has(attachment.filePath)).map(async (attachment) => {
-      const filePath = attachment.filePath!;
-      const directory = path.dirname(filePath);
-      if (!isChatAttachmentDirectory(directory, chatId)) return;
-      forgetValidatedAttachmentFiles([filePath]);
-      await fs.promises.rm(filePath, { force: true });
-      await fs.promises.rmdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
-    }));
-  }
+  const result = await action();
+  const retained = new Set(db.listChatAttachmentFiles(ownerId, chatId).map((attachment) => attachment.filePath));
+  await Promise.all(before.filter((attachment) => !retained.has(attachment.filePath)).map(async (attachment) => {
+    const filePath = attachment.filePath!;
+    const directory = path.dirname(filePath);
+    if (!isChatAttachmentDirectory(directory, chatId)) return;
+    forgetValidatedAttachmentFiles([filePath]);
+    await fs.promises.rm(filePath, { force: true });
+    await fs.promises.rmdir(directory).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+  }));
+  return result;
 }
 async function removeTemporaryAttachmentFiles(filePaths: string[]): Promise<void> {
   forgetValidatedAttachmentFiles(filePaths);

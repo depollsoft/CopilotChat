@@ -98,6 +98,7 @@ export class AppDatabase {
     run();
     return mapMessage(this.db.prepare("SELECT * FROM messages WHERE id = ?").get(messageId) as Row);
   }
+  getEditableUserMessage(ownerId: string, chatId: string, messageId: string): ChatMessage { this.getChat(ownerId, chatId); const message = this.listMessages(chatId).find((item) => item.id === messageId); if (!message) throw new Error("Message not found."); if (message.role !== "user") throw new Error("Only user messages can be edited."); return message; }
   retryAssistantMessage(ownerId: string, chatId: string, messageId: string): ChatMessage {
     this.getChat(ownerId, chatId);
     const messages = this.listMessages(chatId); const index = messages.findIndex((message) => message.id === messageId); if (index < 0) throw new Error("Message not found."); const message = messages[index]; if (!message || message.role !== "assistant") throw new Error("Only assistant messages can be retried."); const userMessage = [...messages.slice(0, index)].reverse().find((m) => m.role === "user"); if (!userMessage) throw new Error("No user message found before assistant response."); const removedIds = messages.slice(index).map((m) => m.id); const now = iso();
@@ -109,6 +110,7 @@ export class AppDatabase {
     run();
     return userMessage;
   }
+  getUserMessageBeforeAssistant(ownerId: string, chatId: string, messageId: string): ChatMessage { this.getChat(ownerId, chatId); const messages = this.listMessages(chatId); const index = messages.findIndex((message) => message.id === messageId); if (index < 0) throw new Error("Message not found."); if (messages[index]?.role !== "assistant") throw new Error("Only assistant messages can be retried."); const userMessage = [...messages.slice(0, index)].reverse().find((message) => message.role === "user"); if (!userMessage) throw new Error("No user message found before assistant response."); return userMessage; }
 
   listArtifacts(ownerId: string): Artifact[] { return (this.db.prepare("SELECT * FROM artifacts WHERE owner_id = ? ORDER BY updated_at DESC").all(ownerId) as Row[]).map(mapArtifact); }
   listArtifactSummaries(ownerId: string): ArtifactSummary[] { return (this.db.prepare("SELECT id, owner_id, project_id, chat_id, message_id, file_path, title, kind, language, version, created_at, updated_at, substr(content, 1, 1600) AS content_preview, length(content) AS content_length FROM artifacts WHERE owner_id = ? ORDER BY updated_at DESC").all(ownerId) as Row[]).map(mapArtifactSummary); }

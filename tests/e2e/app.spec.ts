@@ -481,6 +481,52 @@ test("failed turn preparation does not persist messages or consume uploads", asy
   expect(discard.ok()).toBe(true);
 });
 
+test("failed retry preparation preserves conversation history", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers retry rollback.");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Retry rollback" } });
+  const chat = await chatResponse.json() as { id: string };
+  const firstTurn = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "Keep this history." }, timeout: 30_000 });
+  expect(firstTurn.ok()).toBe(true);
+  const before = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; role: string }>;
+  const assistant = before.find((message) => message.role === "assistant")!;
+  const workspaceRoot = testInfo.outputPath("failed-retry-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed retry", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  await page.request.patch(`/api/chats/${chat.id}`, { headers: csrfHeaders, data: { workspaceId: workspace.id } });
+
+  const retry = await page.request.post(`/api/chats/${chat.id}/messages/${assistant.id}/retry`, { headers: csrfHeaders, data: {} });
+
+  expect(retry.status()).toBe(500);
+  const after = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string }>;
+  expect(after.map((message) => message.id)).toEqual(before.map((message) => message.id));
+});
+
+test("failed edit preparation preserves conversation history", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers edit rollback.");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Edit rollback" } });
+  const chat = await chatResponse.json() as { id: string };
+  const firstTurn = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "Keep original edit history." }, timeout: 30_000 });
+  expect(firstTurn.ok()).toBe(true);
+  const before = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; role: string; content: string }>;
+  const user = before.find((message) => message.role === "user")!;
+  const workspaceRoot = testInfo.outputPath("failed-edit-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed edit", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  await page.request.patch(`/api/chats/${chat.id}`, { headers: csrfHeaders, data: { workspaceId: workspace.id } });
+
+  const edit = await page.request.post(`/api/chats/${chat.id}/messages/${user.id}/edit`, { headers: csrfHeaders, data: { content: "This edit must roll back." } });
+
+  expect(edit.status()).toBe(500);
+  const after = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; content: string }>;
+  expect(after.map(({ id, content }) => ({ id, content }))).toEqual(before.map(({ id, content }) => ({ id, content })));
+});
+
 test("composer retains successful files and discards each upload once", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer upload errors.");
   await page.route("**/api/uploads?*", async (route) => {

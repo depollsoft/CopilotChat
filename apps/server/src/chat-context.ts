@@ -14,15 +14,18 @@ export function applyChatTurnScope(db: AppDatabase, ownerId: string, chatId: str
   return db.updateChat(ownerId, chat.id, { projectId, workspaceId });
 }
 
-export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: string; chat: Chat; message: SendMessageRequest; pendingUserMessage?: { content: string; attachments: MessageAttachment[] }; messageOverride?: { id: string; content: string; attachments: MessageAttachment[] }; defaultModel: string; gitHubToken: string | null; context: ChatContextOptions; titleTool?: ProviderTitleTool }): ProviderChatRequest {
+export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: string; chat: Chat; message: SendMessageRequest; pendingUserMessage?: { content: string; attachments: MessageAttachment[] }; messageOverride?: { id: string; content: string; attachments: MessageAttachment[] }; messageCutoffId?: string; resetProviderSession?: boolean; defaultModel: string; gitHubToken: string | null; context: ChatContextOptions; titleTool?: ProviderTitleTool }): ProviderChatRequest {
   const project = input.chat.projectId ? input.db.getProject(input.ownerId, input.chat.projectId) : null;
-  const messages: ProviderMessage[] = input.db.listMessages(input.chat.id, { includeAttachmentData: true, includeAttachmentFilePaths: true }).map((message) => message.id === input.messageOverride?.id ? { role: message.role, content: input.messageOverride.content, attachments: providerAttachments(input.messageOverride.attachments) } : { role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) });
+  const persistedMessages = input.db.listMessages(input.chat.id, { includeAttachmentData: true, includeAttachmentFilePaths: true });
+  const cutoffIndex = input.messageCutoffId ? persistedMessages.findIndex((message) => message.id === input.messageCutoffId) : -1;
+  const selectedMessages = cutoffIndex >= 0 ? persistedMessages.slice(0, cutoffIndex + 1) : persistedMessages;
+  const messages: ProviderMessage[] = selectedMessages.map((message) => message.id === input.messageOverride?.id ? { role: message.role, content: input.messageOverride.content, attachments: providerAttachments(input.messageOverride.attachments) } : { role: message.role, content: message.content, attachments: readProviderAttachments(message.metadata) });
   if (input.pendingUserMessage) messages.push({ role: "user", content: input.pendingUserMessage.content, attachments: providerAttachments(input.pendingUserMessage.attachments) });
   const workingDirectory = chatWorkingDirectory(input.db, input.ownerId, input.chat, input.context.isolatedWorkspaceRoot);
   return {
     messages,
-    sessionId: input.chat.providerSessionId ?? newProviderSessionId(input.ownerId, input.chat.id),
-    resumeSession: Boolean(input.chat.providerSessionId),
+    sessionId: input.resetProviderSession ? newProviderSessionId(input.ownerId, input.chat.id) : input.chat.providerSessionId ?? newProviderSessionId(input.ownerId, input.chat.id),
+    resumeSession: input.resetProviderSession ? false : Boolean(input.chat.providerSessionId),
     model: input.message.model ?? input.chat.model ?? project?.defaultModel ?? input.defaultModel,
     reasoningEffort: input.message.reasoningEffort ?? input.chat.reasoningEffort ?? undefined,
     contextTier: input.message.contextTier ?? input.chat.contextTier ?? undefined,

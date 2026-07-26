@@ -281,7 +281,29 @@ function validateZipEntryCount(bytes: Uint8Array, entryLimit: number): void {
     const centralDirectorySize = buffer.readUInt32LE(offset + 12);
     const centralDirectoryOffset = buffer.readUInt32LE(offset + 16);
     if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== entries || centralDirectoryOffset + centralDirectorySize !== offset) continue;
-    if (entries === 0xffff || entries > entryLimit) throw new Error(`Import archive contains too many files (${entries === 0xffff ? "ZIP64" : entries}).`);
+    if (entries === 0xffff) throw new Error("Import archive contains too many files (ZIP64).");
+    let cursor = centralDirectoryOffset;
+    let actualEntries = 0;
+    while (cursor < offset) {
+      if (cursor + 4 > offset) throw new Error("Import archive has an invalid central directory.");
+      const signature = buffer.readUInt32LE(cursor);
+      if (signature === 0x02014b50) {
+        if (cursor + 46 > offset) throw new Error("Import archive has a truncated central directory entry.");
+        const recordLength = 46 + buffer.readUInt16LE(cursor + 28) + buffer.readUInt16LE(cursor + 30) + buffer.readUInt16LE(cursor + 32);
+        if (cursor + recordLength > offset) throw new Error("Import archive has an invalid central directory entry.");
+        actualEntries += 1;
+        if (actualEntries > entryLimit) throw new Error(`Import archive contains too many files (${actualEntries}).`);
+        cursor += recordLength;
+        continue;
+      }
+      if (signature === 0x05054b50) {
+        if (cursor + 6 > offset) throw new Error("Import archive has a truncated central directory signature.");
+        cursor += 6 + buffer.readUInt16LE(cursor + 4);
+        continue;
+      }
+      throw new Error("Import archive has an invalid central directory record.");
+    }
+    if (cursor !== offset || actualEntries !== entries) throw new Error("Import archive entry count does not match its central directory.");
     return;
   }
   throw new Error("Import archive is missing a valid end-of-central-directory record.");
