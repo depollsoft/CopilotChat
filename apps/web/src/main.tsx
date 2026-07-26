@@ -7,7 +7,8 @@ import remarkGfm from "remark-gfm";
 import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
 import { formatAic } from "@copilotchat/shared";
 import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
-import { ChatStreamRegistry } from "./chat-streams.js";
+import { ChatStreamRegistry, pruneLocalRunningChats } from "./chat-streams.js";
+import type { LocalRunningChats } from "./chat-streams.js";
 import { externalLinkProps } from "./links.js";
 import "./styles.css";
 
@@ -85,7 +86,7 @@ function App(): React.ReactElement {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => localStorage.getItem(PERMISSION_MODE_KEY) === "yolo" ? "yolo" : "ask");
   const [textScale, setTextScale] = useState(() => readTextScale());
   const [seenChatUpdates, setSeenChatUpdates] = useState<Record<string, string>>(() => readSeenChatUpdates());
-  const [localRunningChatIds, setLocalRunningChatIds] = useState<string[]>([]);
+  const [localRunningChats, setLocalRunningChats] = useState<LocalRunningChats>({});
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ id: string; content: string } | null>(null);
@@ -108,6 +109,7 @@ function App(): React.ReactElement {
   const [modelsRefreshing, setModelsRefreshing] = useState(false);
   const chatStreamsRef = useRef(new ChatStreamRegistry());
   const runningChatIdsRef = useRef<Set<string>>(new Set());
+  const stateSnapshotStartedAtRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const liveScrollRef = useRef(true);
   const chatScrollStatesRef = useRef<Record<string, ChatScrollState>>({});
@@ -131,7 +133,7 @@ function App(): React.ReactElement {
   const activeProject = useMemo(() => projects.find((p) => p.id === (selectedChat?.projectId ?? activeProjectId)) ?? null, [projects, activeProjectId, selectedChat?.projectId]);
   const activeWorkspace = useMemo(() => (state?.workspaces ?? []).find((w) => w.id === (selectedChat?.workspaceId ?? activeWorkspaceId)) ?? null, [state?.workspaces, selectedChat?.workspaceId, activeWorkspaceId]);
   const selectedSkills = useMemo(() => skills.filter((s) => selectedSkillIds.includes(s.id)), [skills, selectedSkillIds]);
-  const runningChatIdsArray = useMemo(() => Array.from(new Set([...(state?.activeChatIds ?? []), ...localRunningChatIds])), [state?.activeChatIds, localRunningChatIds]);
+  const runningChatIdsArray = useMemo(() => Array.from(new Set([...(state?.activeChatIds ?? []), ...Object.keys(localRunningChats)])), [state?.activeChatIds, localRunningChats]);
   const runningChatIds = useMemo(() => new Set(runningChatIdsArray), [runningChatIdsArray]);
   const runningChatKey = runningChatIdsArray.join("|");
   const unreadChatIds = useMemo(() => new Set(chats.filter((chat) => chat.id !== selectedChatId && Boolean(seenChatUpdates[chat.id]) && chat.updatedAt > seenChatUpdates[chat.id]!).map((chat) => chat.id)), [chats, selectedChatId, seenChatUpdates]);
@@ -173,8 +175,9 @@ function App(): React.ReactElement {
   useEffect(() => {
     const previous = runningChatIdsRef.current;
     runningChatIdsRef.current = runningChatIds;
-    for (const chatId of previous) if (!runningChatIds.has(chatId) && chatId !== selectedChatIdRef.current) notify("CopilotChat", "Response ready");
-  }, [runningChatIds]);
+    const known = new Set(allChats.map((chat) => chat.id));
+    for (const chatId of previous) if (!runningChatIds.has(chatId) && chatId !== selectedChatIdRef.current && known.has(chatId)) notify("CopilotChat", "Response ready");
+  }, [runningChatIds, allChats]);
   useEffect(() => { selectedChatIdRef.current = selectedChatId; appPathRef.current = appPathForSelection(selectedChatId, selectedChat?.projectId ?? activeProjectId); syncAppUrl(appPathRef.current); }, [selectedChatId, selectedChat?.projectId, activeProjectId]);
   useEffect(() => { stopResponseRef.current = () => { void stopActiveResponse(); }; });
   useEffect(() => installBackGuard({ drawerRef, sidebarOpenRef, busyRef, stopResponseRef, currentPath: () => appPathRef.current, closeDrawer: () => setDrawer(null), closeSidebar: () => setSidebarOpen(false), toast: setToast }), []);
@@ -247,7 +250,7 @@ function App(): React.ReactElement {
     pendingChatScrollRef.current = { chatId: selectedChatId, state: saved };
     liveScrollRef.current = saved?.atLive ?? true;
   }, [selectedChatId, activeProjectId]);
-  useEffect(() => { if (!state) return; const active = new Set(state.activeChatIds); setLocalRunningChatIds((current) => current.filter((id) => active.has(id) || (busy && id === selectedChatId))); }, [state?.activeChatIds, busy, selectedChatId]);
+  useEffect(() => { if (!state) return; setLocalRunningChats((current) => pruneLocalRunningChats(current, state.activeChatIds, stateSnapshotStartedAtRef.current, busy ? selectedChatId : null)); }, [state?.activeChatIds, busy, selectedChatId]);
   useEffect(() => { if (!runningChatKey) return; const id = window.setInterval(() => void refreshState(), 1200); return () => window.clearInterval(id); }, [runningChatKey, apiToken]);
   useEffect(() => { if (provider.id !== "unknown") return; const id = window.setInterval(() => void refreshState(), 1000); return () => window.clearInterval(id); }, [provider.id, apiToken]);
   useLayoutEffect(() => {
@@ -260,7 +263,7 @@ function App(): React.ReactElement {
     }
     if (liveScrollRef.current) scrollToLive("auto");
   }, [selectedChatId, messages, streamingText, streamingActivities, pendingTurns, pendingInteractions, busy]);
-  async function refreshState(): Promise<void> { try { const next = await api<AppState>("/api/state", {}, apiToken); setLoginRequired(false); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); clearStreamingView(); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); setError((current) => current && isNetworkError(current) ? null : current); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); setError(message); } }
+  async function refreshState(): Promise<void> { const requestedAt = Date.now(); try { const next = await api<AppState>("/api/state", {}, apiToken); stateSnapshotStartedAtRef.current = Math.max(stateSnapshotStartedAtRef.current, requestedAt); setLoginRequired(false); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); clearStreamingView(); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); setError((current) => current && isNetworkError(current) ? null : current); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); setError(message); } }
   async function refreshModels(force = false): Promise<void> {
     const now = Date.now();
     if (!force && now - modelRefreshAttemptRef.current < MODEL_REFRESH_COOLDOWN_MS) return;
@@ -300,8 +303,8 @@ function App(): React.ReactElement {
   function changeReasoningEffort(effort: ReasoningEffort): void { setReasoningEffort(effort); if (selectedChatIdRef.current) void api<Chat>(`/api/chats/${selectedChatIdRef.current}`, { method: "PATCH", body: { reasoningEffort: effort } }, apiToken).then(() => refreshState()).catch((e) => setError(toErr(e))); }
   function changeContextTier(tier: ContextTier): void { setContextTier(tier); if (selectedChatIdRef.current) void api<Chat>(`/api/chats/${selectedChatIdRef.current}`, { method: "PATCH", body: { contextTier: tier } }, apiToken).then(() => refreshState()).catch((e) => setError(toErr(e))); }
   function changePermissionMode(mode: PermissionMode): void { setPermissionMode(mode); const chatId = selectedChatIdRef.current; if (chatId && busyRef.current) void api<{ active: boolean }>(`/api/chats/${chatId}/active-response`, { method: "PATCH", body: { permissionMode: mode } }, apiToken).catch((e) => setError(toErr(e))); }
-  async function sendMessage(content: string, options: { chat?: Chat; skillIds?: string[]; attachments?: MessageAttachment[] } = {}, onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const attachments = options.attachments ?? []; if ((!trimmed && attachments.length === 0) || busy) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); try { let chat = options.chat ?? selectedChat; const useChatSettings = Boolean(options.chat) || !chat; if (!chat) chat = await createChat(activeProjectId, activeWorkspaceId, { cleanup: false, refresh: false }); const controller = new AbortController(); const accepted = () => { setDraft(""); void api<ChatMessage[]>(`/api/chats/${chat.id}/messages`, {}, apiToken).then((next) => { if (selectedChatIdRef.current === chat.id) setMessages(next); }).catch((error) => setError(toErr(error))); onAccepted?.(); }; await streamChatResponse(chat.id, `/api/chats/${chat.id}/messages`, turnBody(trimmed, chat, options.skillIds, attachments, useChatSettings ? chat : undefined), controller, "POST", true, false, accepted); } catch (error) { setBusy(false); setError(toErr(error)); throw error; } }
-  async function sendWhileBusy(mode: "steer" | "queue", content: string, attachments: MessageAttachment[] = [], onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const chat = selectedChat; if ((!trimmed && attachments.length === 0) || !chat || !busy) return; const pending = await api<PendingTurn>(`/api/chats/${chat.id}/active-response/input`, { method: "POST", body: { ...turnBody(trimmed, chat, selectedSkillIds, attachments), mode } }, apiToken); onAccepted?.(); setDraft(""); setPendingTurns((current) => upsertPendingTurn(current, pending)); }
+  async function sendMessage(content: string, options: { chat?: Chat; skillIds?: string[]; attachments?: MessageAttachment[] } = {}, onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const attachments = options.attachments ?? []; if ((!trimmed && attachments.length === 0) || (options.chat ? chatStreamsRef.current.has(options.chat.id) : busy)) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); try { let chat = options.chat ?? selectedChat; const useChatSettings = Boolean(options.chat) || !chat; if (!chat) chat = await createChat(activeProjectId, activeWorkspaceId, { cleanup: false, refresh: false }); const controller = new AbortController(); const accepted = () => { setDraft(""); void api<ChatMessage[]>(`/api/chats/${chat.id}/messages`, {}, apiToken).then((next) => { if (selectedChatIdRef.current === chat.id) setMessages(next); }).catch((error) => setError(toErr(error))); onAccepted?.(); }; await streamChatResponse(chat.id, `/api/chats/${chat.id}/messages`, turnBody(trimmed, chat, options.skillIds, attachments, useChatSettings ? chat : undefined), controller, "POST", false, accepted); } catch (error) { setBusy(false); setError(toErr(error)); throw error; } }
+  async function sendWhileBusy(mode: "steer" | "queue", content: string, attachments: MessageAttachment[] = [], onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const chat = selectedChat; if ((!trimmed && attachments.length === 0) || !chat || !busy) return; const pending = await api<PendingTurn>(`/api/chats/${chat.id}/active-response/input`, { method: "POST", body: { ...turnBody(trimmed, chat, selectedSkillIds, attachments), mode } }, apiToken); onAccepted?.(); setDraft(""); if (isVisibleChat(chat.id)) setPendingTurns((current) => upsertPendingTurn(current, pending)); }
   async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> {
@@ -315,7 +318,7 @@ function App(): React.ReactElement {
         setLiveUsage((current) => current.turnNanoAiu > 0 ? current : { ...current, turnNanoAiu: latestResponseNanoAiu(loaded) });
         setError((current) => current && isNetworkError(current) ? null : current);
         if (chatStreamsRef.current.has(chatId)) return;
-        await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", false, true);
+        await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", true);
         return;
       } catch (e) {
         if ((e as Error).name === "AbortError" || controller.signal.aborted) return;
@@ -348,24 +351,24 @@ function App(): React.ReactElement {
     const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
     if (isVisibleChat(chatId)) setMessages(loaded);
   }
-  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", notifyWhenDone = true, rethrowNetworkErrors = false, onAccepted?: () => void): Promise<void> {
+  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", rethrowNetworkErrors = false, onAccepted?: () => void): Promise<void> {
     chatStreamsRef.current.begin(chatId, controller);
     addRunningChat(chatId);
     let completed = false;
-    let accepted = false;
+    let idle = false;
     try {
-      for await (const event of streamSse(url, body, controller.signal, apiToken, method)) {
-        if (!accepted) { accepted = true; onAccepted?.(); }
-        const done = await handleStreamEvent(chatId, event);
-        if (done) { completed = true; break; }
+      for await (const event of streamSse(url, body, controller.signal, apiToken, method, onAccepted)) {
+        const outcome = await handleStreamEvent(chatId, event);
+        if (outcome !== "continue") { completed = true; idle = outcome === "idle"; break; }
       }
       if (rethrowNetworkErrors && !completed && !controller.signal.aborted) throw new Error("Network error: the response stream ended before completion.");
+      if (!chatStreamsRef.current.isLive(chatId, controller)) return;
       if (isVisibleChat(chatId)) clearStreamingView();
       await syncChatMessages(chatId);
       await refreshState();
-      if (notifyWhenDone) notify("CopilotChat", "Response ready");
+      if (!idle) notify("CopilotChat", "Response ready");
     } catch (e) {
-      if ((e as Error).name !== "AbortError") {
+      if ((e as Error).name !== "AbortError" && chatStreamsRef.current.isLive(chatId, controller)) {
         removeRunningChat(chatId);
         const message = toErr(e);
         if (rethrowNetworkErrors && isNetworkError(message)) throw e;
@@ -373,15 +376,16 @@ function App(): React.ReactElement {
         else setToast("A response failed in another chat");
       }
     } finally {
-      if (completed || !controller.signal.aborted) removeRunningChat(chatId);
-      chatStreamsRef.current.end(chatId, controller);
-      if (isVisibleChat(chatId)) setBusy(false);
+      const wasLiveStream = chatStreamsRef.current.end(chatId, controller);
+      if (wasLiveStream && (completed || !controller.signal.aborted)) removeRunningChat(chatId);
+      if (wasLiveStream && !controller.signal.aborted && isVisibleChat(chatId)) setBusy(false);
     }
   }
-  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> {
+  /** "idle" reports a stream that found no response running, so it is not a completion worth announcing. */
+  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<"continue" | "done" | "idle"> {
     const visible = isVisibleChat(chatId);
     if (event.event === "snapshot") {
-      if (!visible) return false;
+      if (!visible) return "continue";
       const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown; usage?: unknown };
       setBusy(true);
       setStreamingText(data.text ?? "");
@@ -389,29 +393,29 @@ function App(): React.ReactElement {
       setPendingInteractions(readInteractions(data.interactions));
       setPendingTurns(readPendingTurns(data.pendingTurns));
       setLiveUsage(readChatUsage(data.usage));
-      return false;
+      return "continue";
     }
-    if (event.event === "usage") { if (visible) setLiveUsage(readChatUsage(event.data)); return false; }
-    if (event.event === "pending") { if (visible) { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); } return false; }
+    if (event.event === "usage") { if (visible) setLiveUsage(readChatUsage(event.data)); return "continue"; }
+    if (event.event === "pending") { if (visible) { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); } return "continue"; }
     if (event.event === "message") {
       await syncChatMessages(chatId);
       if (isVisibleChat(chatId)) { setStreamingText(""); setStreamingActivities([]); }
-      return false;
+      return "continue";
     }
-    if (event.event === "interaction") { if (visible) { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); } return false; }
-    if (event.event === "activity") { if (visible) { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); } return false; }
-    if (event.event === "delta") { if (visible) { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); } return false; }
-    if (event.event === "artifact") { void refreshState(); if (visible) setToast("Artifact created"); return false; }
+    if (event.event === "interaction") { if (visible) { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); } return "continue"; }
+    if (event.event === "activity") { if (visible) { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); } return "continue"; }
+    if (event.event === "delta") { if (visible) { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); } return "continue"; }
+    if (event.event === "artifact") { void refreshState(); if (visible) setToast("Artifact created"); return "continue"; }
     if (event.event === "error") throw new Error((event.data as { message?: string }).message ?? "Message failed");
     if (event.event === "done") {
       const data = event.data as { active?: boolean; cancelled?: boolean } | undefined;
-      if (data?.active === false) return true;
+      if (data?.active === false) return "idle";
       if (data?.cancelled && visible) setToast("Response stopped");
       if (isVisibleChat(chatId)) { setPendingInteractions([]); setPendingTurns([]); }
       await syncChatMessages(chatId);
-      return true;
+      return "done";
     }
-    return false;
+    return "continue";
   }
   async function resolveInteraction(interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }): Promise<void> { const chatId = selectedChatIdRef.current; if (!chatId) return; setPendingInteractions((current) => current.filter((item) => item.id !== interaction.id)); await api<void>(`/api/chats/${chatId}/interactions/${interaction.id}`, { method: "POST", body: resolution, raw: true }, apiToken); }
   async function stopActiveResponse(): Promise<void> {
@@ -421,7 +425,7 @@ function App(): React.ReactElement {
       if (chatId) {
         await api<void>(`/api/chats/${chatId}/active-response`, { method: "DELETE", raw: true }, apiToken);
         removeRunningChat(chatId);
-        if (isVisibleChat(chatId)) setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
+        await syncChatMessages(chatId);
       }
     } catch (e) {
       setError(toErr(e));
@@ -451,7 +455,7 @@ function App(): React.ReactElement {
       const deleted = new Set(result.deletedChatIds);
       setState((current) => current ? { ...current, chats: current.chats.filter((chat) => !deleted.has(chat.id)), archivedChats: current.archivedChats.filter((chat) => !deleted.has(chat.id)) } : current);
       setSeenChatUpdates((current) => { const next = { ...current }; for (const id of deleted) delete next[id]; return writeSeenChatUpdates(next); });
-      setLocalRunningChatIds((current) => current.filter((id) => !deleted.has(id)));
+      setLocalRunningChats((current) => { const next = { ...current }; for (const id of deleted) delete next[id]; return next; });
       if (selectedChatIdRef.current && deleted.has(selectedChatIdRef.current)) setSelectedChatId(null);
     } catch (e) {
       setError(toErr(e));
@@ -470,7 +474,7 @@ function App(): React.ReactElement {
       setDraft("");
       setMessages([]);
       clearStreamingView();
-      setLocalRunningChatIds([]);
+      setLocalRunningChats({});
       setSeenChatUpdates(writeSeenChatUpdates({}));
       setBusy(false);
       setError(null);
@@ -499,8 +503,8 @@ function App(): React.ReactElement {
       setError(message);
     }
   }
-  function addRunningChat(chatId: string): void { setLocalRunningChatIds((current) => current.includes(chatId) ? current : [...current, chatId]); }
-  function removeRunningChat(chatId: string): void { setLocalRunningChatIds((current) => current.filter((id) => id !== chatId)); }
+  function addRunningChat(chatId: string): void { setLocalRunningChats((current) => current[chatId] ? current : { ...current, [chatId]: Date.now() }); }
+  function removeRunningChat(chatId: string): void { setLocalRunningChats((current) => current[chatId] ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== chatId)) : current); }
   function selectChat(id: string): void { saveCurrentChatScroll(); selectedChatIdRef.current = id; void cleanupAbandonedEmptyChats(id); markChatSeen(id); setSelectedChatId(id); setError(null); }
   function selectProject(id: string | null): void { saveCurrentChatScroll(); selectedChatIdRef.current = null; void cleanupAbandonedEmptyChats(null); setActiveProjectId(id); setSelectedChatId(null); setMessages([]); clearStreamingView(); setError(null); }
   function activateLiveScroll(): void { liveScrollRef.current = true; setShowJumpToLive(false); }
@@ -1238,7 +1242,7 @@ function routeSegment(path: string, prefix: string): string | null { const segme
 function appPathForSelection(chatId: string | null, projectId: string | null): string { if (chatId) return `${CHAT_ROUTE_PREFIX}${encodeURIComponent(chatId)}`; return projectId ? `${PROJECT_ROUTE_PREFIX}${encodeURIComponent(projectId)}` : "/"; }
 function syncAppUrl(path: string): void { if (location.pathname === path) return; history.replaceState({ copilotChatBackGuard: true }, "", path); }
 async function api<T>(url:string,init:{method?:string;body?:unknown;raw?:boolean}={},token=localStorage.getItem(API_TOKEN_KEY)??""):Promise<T>{const method=init.method??"GET";const headers:Record<string,string>={};if(init.body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:init.body!==undefined?JSON.stringify(init.body):undefined});if(!res.ok)throw new Error(httpErrorMessage(res.status,await res.text()));return init.raw?undefined as T:await res.json() as T;}
-async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST"):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new Error(httpErrorMessage(res.status,await res.text()));const reader=res.body.getReader();const dec=new TextDecoder();let buf="";while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}
+async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",onAccepted?:()=>void):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new Error(httpErrorMessage(res.status,await res.text()));onAccepted?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}
 function parseSse(chunk:string):SseEvent|null{const lines=chunk.split("\n");const event=lines.find(l=>l.startsWith("event:"))?.slice(6).trim();const data=lines.find(l=>l.startsWith("data:"))?.slice(5).trim();return event&&data?{event,data:JSON.parse(data) as unknown}:null;}
 function readTheme(): Theme { const saved = localStorage.getItem("copilotchat.theme"); return saved === "system" || saved === "light" || saved === "dark" ? saved : "system"; }
 function readSystemTheme(): ResolvedTheme { return window.matchMedia(SYSTEM_THEME_QUERY).matches ? "dark" : "light"; }
