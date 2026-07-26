@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest } from "@copilotchat/shared";
@@ -94,11 +95,24 @@ class SdkCopilotProvider implements CopilotProvider {
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     const fallback = new EchoProvider(this.options.model);
     try {
-      yield* this.streamWithSdk(request);
+      yield* this.streamWithSessionRecovery(request);
     } catch (error) {
       yield { type: "delta", text: `Copilot SDK was unavailable (${(error as Error).message}). Falling back to local development provider.\n\n` };
       yield* fallback.streamChat(request);
     }
+  }
+  private async *streamWithSessionRecovery(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
+    let streamedContent = false;
+    try {
+      for await (const event of this.streamWithSdk(request)) {
+        if (event.type !== "session") streamedContent = true;
+        yield event;
+      }
+      return;
+    } catch (error) {
+      if (streamedContent || !request.resumeSession || !request.sessionId || !isLostSessionError(error)) throw error;
+    }
+    yield* this.streamWithSdk({ ...request, resumeSession: false });
   }
   private async *streamWithSdk(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory));
@@ -390,12 +404,16 @@ async function createOrResumeSdkSession(client: CopilotClient, config: SessionCo
   }
   try { return { session: await client.createSession(config), resumed: false }; }
   catch (error) {
-    if (preferResume && sessionId && isExistingSessionError(error)) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
-    throw error;
+    if (!isExistingSessionError(error)) throw error;
+    if (preferResume && sessionId) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
+    if (!sessionId) throw error;
+    return { session: await client.createSession({ ...config, sessionId: freshSdkSessionId(sessionId) }), resumed: false };
   }
 }
 
 function isMissingSessionError(error: unknown): boolean { return /not found|does not exist|no session/i.test(error instanceof Error ? error.message : String(error)); }
+function isLostSessionError(error: unknown): boolean { return /session (?:was |is |has )?(?:not found|gone|expired|closed|deleted)|session (?:does not|doesn't) exist|no such session|unknown session|session no longer/i.test(error instanceof Error ? error.message : String(error)); }
+function freshSdkSessionId(sessionId: string): string { return `${sessionId.replace(/-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i, "")}-${randomUUID()}`; }
 function isExistingSessionError(error: unknown): boolean { return /already exists|exists|duplicate/i.test(error instanceof Error ? error.message : String(error)); }
 function materializeMessages(request: ProviderChatRequest): ProviderMessage[] { const system = buildSystemContext(request); return system ? [{ role: "system", content: system }, ...request.messages] : request.messages; }
 function buildCliPrompt(request: ProviderChatRequest): string { return materializeMessages(request).map((message) => `${message.role.toUpperCase()}:\n${message.content}${message.attachments?.length ? `\nAttachments: ${summarizeAttachments(message.attachments)}` : ""}`).join("\n\n"); }

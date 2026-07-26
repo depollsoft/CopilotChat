@@ -1,6 +1,6 @@
 import type { ProviderEvent } from "./index.js";
 import { CopilotClient } from "@github/copilot-sdk";
-import type { ModelInfo } from "@github/copilot-sdk";
+import type { CopilotSession, ModelInfo, SessionEvent } from "@github/copilot-sdk";
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCopilotProvider, mapSdkModelInfo, readSdkUsageNanoAiu, summarizeSdkFailureMessage } from "./index.js";
@@ -254,7 +254,75 @@ describe("createCopilotProvider", () => {
     expect(events.filter((event) => event.type === "delta").map((event) => event.text).join("")).toContain("Copilot SDK was unavailable");
     expect(events.filter((event) => event.type === "usage")).toEqual([]);
   }, 20_000);
-  it("skips malformed HTTP provider stream chunks without aborting", async () => {    const server = http.createServer((request, response) => {
+  it("recovers with a new SDK session when the resumed session no longer exists", async () => {
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValue([]);
+    const resume = vi.spyOn(CopilotClient.prototype, "resumeSession").mockImplementation((sessionId: string) => Promise.resolve(fakeSdkSession(sessionId, () => Promise.reject(new Error(`Request session.send failed with message: Session not found for sessionId: ${sessionId}`)))));
+    const create = vi.spyOn(CopilotClient.prototype, "createSession").mockImplementation((config) => Promise.resolve(fakeSdkSession(String(config.sessionId), (emit) => {
+      emit({ type: "assistant.message", data: { content: "fresh answer" } });
+      emit({ type: "session.idle", data: {} });
+      return Promise.resolve();
+    })));
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test" });
+
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], sessionId: "copilotchat-stale", resumeSession: true, model: "gpt-test" }));
+    const text = events.filter((event) => event.type === "delta").map((event) => event.text).join("");
+
+    expect(resume).toHaveBeenCalledOnce();
+    expect(create).toHaveBeenCalledOnce();
+    expect(text).toBe("fresh answer");
+    expect(events.filter((event) => event.type === "session").at(-1)).toMatchObject({ sessionId: "copilotchat-stale", resumed: false });
+  });
+  it("creates a replacement session id when the recovery session id is already taken", async () => {
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValue([]);
+    vi.spyOn(CopilotClient.prototype, "resumeSession").mockImplementation((sessionId: string) => Promise.resolve(fakeSdkSession(sessionId, () => Promise.reject(new Error("Request session.send failed with message: Session not found")))));
+    const create = vi.spyOn(CopilotClient.prototype, "createSession").mockImplementation((config) => {
+      if (config.sessionId === "copilotchat-chat-b37dabfc-4444-4ee5-8d38-824cce18c13e") return Promise.reject(new Error("Session already exists"));
+      return Promise.resolve(fakeSdkSession(String(config.sessionId), (emit) => {
+        emit({ type: "assistant.message", data: { content: "fresh answer" } });
+        emit({ type: "session.idle", data: {} });
+        return Promise.resolve();
+      }));
+    });
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test" });
+
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], sessionId: "copilotchat-chat-b37dabfc-4444-4ee5-8d38-824cce18c13e", resumeSession: true, model: "gpt-test" }));
+    const session = events.filter((event) => event.type === "session").at(-1);
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(session).toMatchObject({ resumed: false });
+    expect(session?.type === "session" ? session.sessionId : "").toMatch(/^copilotchat-chat-[0-9a-f-]{36}$/);
+    expect(session?.type === "session" ? session.sessionId : "").not.toBe("copilotchat-chat-b37dabfc-4444-4ee5-8d38-824cce18c13e");
+  });
+  it("does not restart a turn that already streamed content", async () => {
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValue([]);
+    vi.spyOn(CopilotClient.prototype, "resumeSession").mockImplementation((sessionId: string) => Promise.resolve(fakeSdkSession(sessionId, (emit) => {
+      emit({ type: "assistant.message", data: { content: "partial answer" } });
+      return Promise.reject(new Error("Request session.send failed with message: Session not found for sessionId: copilotchat-stale"));
+    })));
+    const create = vi.spyOn(CopilotClient.prototype, "createSession").mockResolvedValue(fakeSdkSession("unused", () => Promise.resolve()));
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test" });
+
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], sessionId: "copilotchat-stale", resumeSession: true, model: "gpt-test" }));
+    const text = events.filter((event) => event.type === "delta").map((event) => event.text).join("");
+
+    expect(create).not.toHaveBeenCalled();
+    expect(text).toContain("partial answer");
+    expect(text).toContain("Falling back to local development provider.");
+  });
+  it("keeps falling back to the development provider for non-session SDK failures", async () => {
+    vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValue([]);
+    vi.spyOn(CopilotClient.prototype, "resumeSession").mockImplementation((sessionId: string) => Promise.resolve(fakeSdkSession(sessionId, () => Promise.reject(new Error("Request session.send failed with message: model not found")))));
+    const create = vi.spyOn(CopilotClient.prototype, "createSession").mockResolvedValue(fakeSdkSession("unused", () => Promise.resolve()));
+    const provider = createCopilotProvider({ provider: "sdk", model: "gpt-test" });
+
+    const events = await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], sessionId: "copilotchat-stale", resumeSession: true, model: "gpt-test" }));
+    const text = events.filter((event) => event.type === "delta").map((event) => event.text).join("");
+
+    expect(create).not.toHaveBeenCalled();
+    expect(text).toContain("Falling back to local development provider.");
+  });
+  it("skips malformed HTTP provider stream chunks without aborting", async () => {
+    const server = http.createServer((request, response) => {
       if (request.url === "/chat/completions") {
         response.writeHead(200, { "Content-Type": "text/event-stream" });
         response.end("data: {not-json}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n");
@@ -303,3 +371,14 @@ describe("createCopilotProvider", () => {
 });
 
 async function collect(events: AsyncIterable<ProviderEvent>): Promise<ProviderEvent[]> { const result: ProviderEvent[] = []; for await (const event of events) result.push(event); return result; }
+
+function fakeSdkSession(sessionId: string, send: (emit: (event: { type: string; data?: unknown }) => void) => Promise<void>): CopilotSession {
+  let handler: ((event: SessionEvent) => void) | null = null;
+  return {
+    sessionId,
+    workspacePath: "/tmp/fake-session",
+    on: (listener: (event: SessionEvent) => void) => { handler = listener; return () => { handler = null; }; },
+    send: () => send((event) => handler?.(event as SessionEvent)),
+    disconnect: () => Promise.resolve(),
+  } as unknown as CopilotSession;
+}
