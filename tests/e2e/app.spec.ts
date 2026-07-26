@@ -416,6 +416,49 @@ test("personal context and coarse location are included in chats", async ({ page
   await expect(response).not.toContainText("47.6, -122.3");
 });
 
+test("stale memory pages cannot cross scopes", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectAResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope A", description: "", instructions: "", memory: "" } });
+  const projectBResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope B", description: "", instructions: "", memory: "" } });
+  const projectA = await projectAResponse.json() as { id: string };
+  const projectB = await projectBResponse.json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: "Delayed A memory", content: "Must never appear in scope B.", enabled: true } });
+  for (let index = 1; index <= 20; index += 1) await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: `Recent A memory ${index}`, content: `A ${index}`, enabled: true } });
+  await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Only B memory", content: "Belongs to scope B.", enabled: true } });
+  let releasePage!: () => void;
+  let markRequested!: () => void;
+  let markFinished!: () => void;
+  const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+  const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  const pageFinished = new Promise<void>((resolve) => { markFinished = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20") {
+      markRequested();
+      await pageGate;
+      await route.continue();
+      markFinished();
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(projectA.id);
+  await expect(drawer.getByText("Recent A memory 20")).toBeVisible();
+  await drawer.getByRole("button", { name: /Load more/ }).click();
+  await pageRequested;
+  await drawer.getByLabel("Memory scope").selectOption(projectB.id);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
+  releasePage();
+  await pageFinished;
+  await expect(drawer.getByText("Delayed A memory")).toHaveCount(0);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
+});
+
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers sidebar cleanup.");
   await page.goto("/");

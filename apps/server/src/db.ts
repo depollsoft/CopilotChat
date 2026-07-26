@@ -81,51 +81,57 @@ export class AppDatabase {
     return { items, total, nextOffset: next < total ? next : null };
   }
   getMemoryStats(ownerId: string): MemoryStats {
-    const countRows = this.db.prepare("SELECT project_id, COUNT(*) AS total, SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled FROM memories WHERE owner_id = ? GROUP BY project_id").all(ownerId) as Row[];
-    const contextRows = this.db.prepare(`SELECT * FROM (
-      SELECT memories.*, ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC, id ASC) AS memory_rank
-      FROM memories
-      WHERE owner_id = ? AND enabled = 1
-    ) WHERE memory_rank <= ? ORDER BY project_id, updated_at DESC, id ASC`).all(ownerId, memoryContextEntryBudget) as Row[];
-    const memoriesByScope = new Map<string, Memory[]>();
-    for (const row of contextRows) {
-      const key = nullableString(row.project_id) ?? "user";
-      const memories = memoriesByScope.get(key) ?? [];
-      memories.push(mapMemory(row));
-      memoriesByScope.set(key, memories);
-    }
+    this.ensureMemoryStats(ownerId, null);
+    const rows = this.db.prepare("SELECT * FROM memory_scope_stats WHERE owner_id = ?").all(ownerId) as Row[];
     const empty = { total: 0, enabled: 0, contextLength: 0 };
     const result: MemoryStats = { user: empty, projects: {} };
-    for (const row of countRows) {
+    for (const row of rows) {
       const projectId = nullableString(row.project_id);
-      const total = Number(row.total ?? 0);
-      const enabled = Number(row.enabled ?? 0);
-      const memories = memoriesByScope.get(projectId ?? "user") ?? [];
-      const contextLength = formatMemoryContext(projectId ? "Project memories:" : "User memories:", memories, enabled).length;
-      const stats = { total, enabled, contextLength };
+      const stats = { total: Number(row.total ?? 0), enabled: Number(row.enabled ?? 0), contextLength: Number(row.context_length ?? 0) };
       if (projectId) result.projects[projectId] = stats;
       else result.user = stats;
     }
     return result;
+  }
+  enabledMemoriesForContext(ownerId: string, projectId: string | null): { memories: Memory[]; total: number } {
+    if (projectId) this.getProject(ownerId, projectId);
+    const scope = projectId ? "project_id = ?" : "project_id IS NULL";
+    const params = projectId ? [ownerId, projectId] : [ownerId];
+    const count = this.db.prepare(`SELECT COUNT(*) AS total FROM memories WHERE owner_id = ? AND ${scope} AND enabled = 1`).get(...params) as Row;
+    const rows = this.db.prepare(`SELECT * FROM memories WHERE owner_id = ? AND ${scope} AND enabled = 1 ORDER BY updated_at DESC, id ASC LIMIT ?`).all(...params, memoryContextEntryBudget) as Row[];
+    return { memories: rows.map(mapMemory), total: Number(count.total ?? 0) };
   }
   createMemory(ownerId: string, input: CreateMemoryRequest): Memory {
     const projectId = input.projectId ?? null;
     if (projectId) this.getProject(ownerId, projectId);
     const now = iso();
     const id = randomUUID();
-    this.db.prepare("INSERT INTO memories (id, owner_id, project_id, title, content, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, ownerId, projectId, input.title, input.content, input.enabled ? 1 : 0, now, now);
-    this.clearMemoryProviderSessions(ownerId, projectId);
+    this.db.transaction(() => {
+      this.db.prepare("INSERT INTO memories (id, owner_id, project_id, title, content, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, ownerId, projectId, input.title, input.content, input.enabled ? 1 : 0, now, now);
+      this.refreshMemoryStats(ownerId, projectId);
+      this.clearMemoryProviderSessions(ownerId, projectId);
+    })();
     return this.getMemory(ownerId, id);
   }
   getMemory(ownerId: string, id: string): Memory { const row = this.db.prepare("SELECT * FROM memories WHERE owner_id = ? AND id = ?").get(ownerId, id) as Row | undefined; if (!row) throw new Error("Memory not found."); return mapMemory(row); }
   updateMemory(ownerId: string, id: string, input: UpdateMemoryRequest): Memory {
     const current = this.getMemory(ownerId, id);
     const now = iso();
-    this.db.prepare("UPDATE memories SET title = ?, content = ?, enabled = ?, updated_at = ? WHERE owner_id = ? AND id = ?").run(input.title ?? current.title, input.content ?? current.content, input.enabled === undefined ? (current.enabled ? 1 : 0) : input.enabled ? 1 : 0, now, ownerId, id);
-    this.clearMemoryProviderSessions(ownerId, current.projectId);
+    this.db.transaction(() => {
+      this.db.prepare("UPDATE memories SET title = ?, content = ?, enabled = ?, updated_at = ? WHERE owner_id = ? AND id = ?").run(input.title ?? current.title, input.content ?? current.content, input.enabled === undefined ? (current.enabled ? 1 : 0) : input.enabled ? 1 : 0, now, ownerId, id);
+      this.refreshMemoryStats(ownerId, current.projectId);
+      this.clearMemoryProviderSessions(ownerId, current.projectId);
+    })();
     return this.getMemory(ownerId, id);
   }
-  deleteMemory(ownerId: string, id: string): void { const current = this.getMemory(ownerId, id); this.db.prepare("DELETE FROM memories WHERE owner_id = ? AND id = ?").run(ownerId, id); this.clearMemoryProviderSessions(ownerId, current.projectId); }
+  deleteMemory(ownerId: string, id: string): void {
+    const current = this.getMemory(ownerId, id);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM memories WHERE owner_id = ? AND id = ?").run(ownerId, id);
+      this.refreshMemoryStats(ownerId, current.projectId);
+      this.clearMemoryProviderSessions(ownerId, current.projectId);
+    })();
+  }
 
   listProjects(ownerId: string): Project[] { return (this.db.prepare("SELECT * FROM projects WHERE owner_id = ? ORDER BY favorite DESC, updated_at DESC").all(ownerId) as Row[]).map(mapProject); }
   createProject(ownerId: string, input: CreateProjectRequest): Project { const now = iso(); const id = randomUUID(); this.db.prepare("INSERT INTO projects (id, owner_id, name, description, instructions, memory, default_model, favorite, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)").run(id, ownerId, input.name, input.description ?? null, input.instructions ?? null, input.memory ?? null, input.defaultModel ?? null, now, now); return this.getProject(ownerId, id); }
@@ -235,6 +241,7 @@ export class AppDatabase {
       this.db.prepare("DELETE FROM tool_runs WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM artifacts WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM memories WHERE owner_id = ?").run(ownerId);
+      this.db.prepare("DELETE FROM memory_scope_stats WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM user_contexts WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM project_chat_references WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM chats WHERE owner_id = ?").run(ownerId);
@@ -244,6 +251,7 @@ export class AppDatabase {
       this.db.prepare("DELETE FROM workspaces WHERE owner_id = ?").run(ownerId);
       this.db.prepare("DELETE FROM skills WHERE owner_id = ?").run(ownerId);
       this.ensureUserContext(ownerId, iso());
+      this.refreshMemoryStats(ownerId, null);
       for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null);
     });
     run();
@@ -256,6 +264,7 @@ export class AppDatabase {
     CREATE TABLE IF NOT EXISTS user_contexts (owner_id TEXT PRIMARY KEY REFERENCES owners(id) ON DELETE CASCADE, profile TEXT NOT NULL DEFAULT '', location_level TEXT NOT NULL DEFAULT 'off', latitude REAL, longitude REAL, accuracy REAL, location_captured_at TEXT, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, description TEXT, instructions TEXT, memory TEXT, default_model TEXT, favorite INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL, content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS memory_scope_stats (owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, scope_key TEXT NOT NULL, project_id TEXT REFERENCES projects(id) ON DELETE CASCADE, total INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 0, context_length INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (owner_id, scope_key));
     CREATE TABLE IF NOT EXISTS project_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, title TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS project_chat_references (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, source_chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE, source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, title TEXT NOT NULL, excerpt TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS workspaces (id TEXT PRIMARY KEY, owner_id TEXT NOT NULL REFERENCES owners(id) ON DELETE CASCADE, name TEXT NOT NULL, root_path TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
@@ -288,9 +297,35 @@ export class AppDatabase {
   }
   private migrateLegacyPinsToFavorites(): void { for (const table of ["projects", "chats"]) { const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[]; if (rows.some((row) => row.name === "pinned")) this.db.prepare(`UPDATE ${table} SET favorite = 1 WHERE pinned = 1`).run(); } }
   private ensureUserContext(ownerId: string, updatedAt: string): void { this.db.prepare("INSERT OR IGNORE INTO user_contexts (owner_id, profile, location_level, updated_at) VALUES (?, '', 'off', ?)").run(ownerId, updatedAt); }
-  private seed(): void { const existing = this.db.prepare("SELECT id FROM owners LIMIT 1").get() as Row | undefined; const now = iso(); const ownerId = typeof existing?.id === "string" ? existing.id : "local"; if (!existing) this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, 'local', 'Local user', NULL, 'local', ?)").run(ownerId, now); this.ensureUserContext(ownerId, now); for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null); }
+  private ensureMemoryStats(ownerId: string, projectId: string | null): void {
+    const row = this.db.prepare("SELECT 1 FROM memory_scope_stats WHERE owner_id = ? AND scope_key = ?").get(ownerId, memoryScopeKey(projectId)) as Row | undefined;
+    if (!row) this.refreshMemoryStats(ownerId, projectId);
+  }
+  private refreshMemoryStats(ownerId: string, projectId: string | null): void {
+    const { memories, total: enabled } = this.enabledMemoriesForContext(ownerId, projectId);
+    const scope = projectId ? "project_id = ?" : "project_id IS NULL";
+    const params = projectId ? [ownerId, projectId] : [ownerId];
+    const count = this.db.prepare(`SELECT COUNT(*) AS total FROM memories WHERE owner_id = ? AND ${scope}`).get(...params) as Row;
+    const contextLength = formatMemoryContext(projectId ? "Project memories:" : "User memories:", memories, enabled).length;
+    this.db.prepare(`INSERT INTO memory_scope_stats (owner_id, scope_key, project_id, total, enabled, context_length, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(owner_id, scope_key) DO UPDATE SET total = excluded.total, enabled = excluded.enabled, context_length = excluded.context_length, updated_at = excluded.updated_at`)
+      .run(ownerId, memoryScopeKey(projectId), projectId, Number(count.total ?? 0), enabled, contextLength, iso());
+  }
+  private rebuildMemoryStats(): void {
+    this.db.prepare("DELETE FROM memory_scope_stats").run();
+    const owners = this.db.prepare("SELECT id FROM owners").all() as Row[];
+    for (const owner of owners) {
+      const ownerId = String(owner.id);
+      this.refreshMemoryStats(ownerId, null);
+      const projects = this.db.prepare("SELECT DISTINCT project_id FROM memories WHERE owner_id = ? AND project_id IS NOT NULL").all(ownerId) as Row[];
+      for (const project of projects) this.refreshMemoryStats(ownerId, String(project.project_id));
+    }
+  }
+  private seed(): void { const existing = this.db.prepare("SELECT id FROM owners LIMIT 1").get() as Row | undefined; const now = iso(); const ownerId = typeof existing?.id === "string" ? existing.id : "local"; if (!existing) this.db.prepare("INSERT INTO owners (id, login, display_name, avatar_url, auth_provider, created_at) VALUES (?, 'local', 'Local user', NULL, 'local', ?)").run(ownerId, now); this.ensureUserContext(ownerId, now); this.rebuildMemoryStats(); for (const skill of builtInSkills) this.upsertSkill(ownerId, skill, true, null); }
 }
 function iso(): string { return new Date().toISOString(); }
+function memoryScopeKey(projectId: string | null): string { return projectId ? `project:${projectId}` : "user"; }
 function skillRowId(ownerId: string, manifestId: string): string { return ownerId === "local" ? manifestId : `${ownerId}:${manifestId}`; }
 function mapOwner(row: Row): Owner { return { id: String(row.id), login: String(row.login), displayName: nullableString(row.display_name), avatarUrl: nullableString(row.avatar_url), authProvider: row.auth_provider === "github" ? "github" : "local" }; }
 function mapUserContext(row: Row): UserContext {

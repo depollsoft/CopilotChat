@@ -152,7 +152,8 @@ describe("chat provider context", () => {
   it("bounds enabled memory context and reports omitted content", () => {
     const db = createTestDb();
     const owner = db.getOwner();
-    for (let index = 0; index < 4; index += 1) db.createMemory(owner.id, { projectId: null, title: `Large memory ${index}`, content: `${index}`.repeat(8_000), enabled: true });
+    db.createMemory(owner.id, { projectId: null, title: "Paused oversized memory", content: "paused-marker".repeat(2_000), enabled: false });
+    for (let index = 0; index < 105; index += 1) db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}`.repeat(200), enabled: true });
     const chat = db.createChat(owner.id, { title: "Bounded context", projectId: null, workspaceId: null });
     db.addMessage({ chatId: chat.id, role: "user", content: "Use bounded context" });
 
@@ -160,7 +161,8 @@ describe("chat provider context", () => {
 
     expect(request.userContext?.length).toBeLessThanOrEqual(16_000);
     expect(request.userContext).toContain("Memory context limited to 16000 characters");
-    expect(request.userContext).toMatch(/memory truncated|memories omitted/);
+    expect(request.userContext).toContain("memories omitted");
+    expect(request.userContext).not.toContain("paused-marker");
   });
 
   it("invalidates provider sessions when user or scoped memory context changes", () => {
@@ -421,9 +423,9 @@ describe("chat provider context", () => {
     const db = createTestDb();
     const owner = db.getOwner();
     const content = "sensitive memory ".repeat(1000);
-    for (let index = 0; index < 3; index += 1) db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}:${content}`, enabled: index !== 1 });
+    const created = Array.from({ length: 3 }, (_, index) => db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}:${content}`, enabled: index !== 1 }));
 
-    const state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    let state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
     const firstPage = db.listMemoriesPage(owner.id, null, 0, 2);
     const secondPage = db.listMemoriesPage(owner.id, null, firstPage.nextOffset ?? 0, 2);
 
@@ -435,6 +437,13 @@ describe("chat provider context", () => {
     expect(firstPage.items[0]?.content).toContain("sensitive memory");
     expect(secondPage).toMatchObject({ total: 3, nextOffset: null });
     expect(secondPage.items).toHaveLength(1);
+
+    db.updateMemory(owner.id, created[0]!.id, { enabled: false });
+    state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    expect(state.memoryStats.user).toMatchObject({ total: 3, enabled: 1 });
+    db.deleteMemory(owner.id, created[1]!.id);
+    state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    expect(state.memoryStats.user).toMatchObject({ total: 2, enabled: 1 });
   });
 
   it("persists favorite project and chat flags", () => {

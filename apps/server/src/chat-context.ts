@@ -54,13 +54,13 @@ export function isolatedChatWorkspace(root: string, chatId: string): string {
 
 function buildProjectContext(db: AppDatabase, ownerId: string, projectId: string): string | null {
   const project = db.getProject(ownerId, projectId);
-  const memories = db.listMemories(ownerId, projectId).filter((memory) => memory.enabled);
+  const memories = db.enabledMemoriesForContext(ownerId, projectId);
   const references = db.listProjectReferences(ownerId, projectId);
   const chatReferences = db.listProjectChatReferences(ownerId, projectId);
   return [
     project.instructions ? `Project instructions:\n${project.instructions}` : "",
     project.memory ? `Shared project memory:\n${project.memory}` : "",
-    formatMemoryContext("Project memories:", memories),
+    formatMemoryContext("Project memories:", memories.memories, memories.total),
     references.length > 0 ? ["Project reference materials:", ...references.map((reference) => `## ${reference.title}\n${reference.content}`)].join("\n\n") : "",
     chatReferences.length > 0 ? ["Referenced prior chat content:", ...chatReferences.map((reference) => `- ${reference.title}: ${reference.excerpt}`)].join("\n") : "",
   ].filter(Boolean).join("\n\n") || null;
@@ -68,10 +68,10 @@ function buildProjectContext(db: AppDatabase, ownerId: string, projectId: string
 
 function buildUserContext(db: AppDatabase, ownerId: string): string | null {
   const context = db.getUserContext(ownerId);
-  const memories = db.listMemories(ownerId, null).filter((memory) => memory.enabled);
+  const memories = db.enabledMemoriesForContext(ownerId, null);
   return [
     context.profile ? `Profile supplied by the user:\n${context.profile}` : "",
-    formatMemoryContext("User memories:", memories),
+    formatMemoryContext("User memories:", memories.memories, memories.total),
     context.location ? `Location shared by the user (${context.location.precision}): ${context.location.latitude}, ${context.location.longitude}; accuracy about ${Math.round(context.location.accuracy)} meters; captured ${context.location.capturedAt}.` : "",
   ].filter(Boolean).join("\n\n") || null;
 }
