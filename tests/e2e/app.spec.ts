@@ -872,6 +872,35 @@ test("composer retains staged uploads when message acceptance fails", async ({ p
   await expect(page.getByRole("alert")).toBeVisible();
 });
 
+test("composer disables attachment removal while message submission is pending", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers attachment submission races.");
+  let releaseSubmission!: () => void;
+  let markSubmissionStarted!: () => void;
+  const submissionBlocked = new Promise<void>((resolve) => { releaseSubmission = resolve; });
+  const submissionStarted = new Promise<void>((resolve) => { markSubmissionStarted = resolve; });
+  await page.route("**/api/chats/*/messages", async (route) => {
+    if (route.request().method() === "POST") {
+      markSubmissionStarted();
+      await submissionBlocked;
+      await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Message rejected" }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "pending-submit.txt", mimeType: "text/plain", buffer: Buffer.from("keep staged") });
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Hold this submission.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await submissionStarted;
+
+  const remove = page.getByRole("button", { name: "Remove pending-submit.txt" });
+  await expect(remove).toBeDisabled();
+  releaseSubmission();
+  await expect(remove).toBeEnabled();
+  await remove.click();
+});
+
 test("composer disables submission while selected files are uploading", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers pending uploads.");
   let releaseUpload!: () => void;
