@@ -29,7 +29,7 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.getByRole("button", { name: "Save changes" }).click();
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
-  await page.getByRole("button", { name: "Manage" }).click();
+  await page.getByRole("button", { name: "Manage", exact: true }).click();
   await page.getByRole("button", { name: "New skill" }).click();
   await page.getByLabel("Skill name").fill(`Skill ${testInfo.project.name}`);
   await page.getByLabel("Short description").fill("E2E skill");
@@ -292,9 +292,18 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.locator(".project-summary-card.editable").filter({ hasText: "Custom instructions" }).click();
   await page.getByRole("dialog", { name: "Edit custom instructions" }).getByLabel("Project context editor").fill("Landing instructions.");
   await page.getByRole("button", { name: "Save changes" }).click();
-  await page.locator(".project-summary-card.editable").filter({ hasText: "Memory" }).click();
-  await page.getByRole("dialog", { name: "Edit memory" }).getByLabel("Project context editor").fill("Landing memory.");
-  await page.getByRole("button", { name: "Save changes" }).click();
+  await page.locator(".project-summary-card.editable").filter({ hasText: "Memories" }).click();
+  const contextDrawer = page.getByRole("dialog", { name: "Personal context" });
+  await expect(contextDrawer.getByLabel("Memory scope")).toHaveValue(/.+/);
+  await contextDrawer.getByLabel("Shared project note").fill("Landing memory.");
+  await contextDrawer.getByLabel("Title").fill("Landing decision");
+  await contextDrawer.getByLabel("What should CopilotChat remember?").fill("Prefer the landing deployment plan.");
+  await contextDrawer.getByRole("button", { name: "Save project note" }).click();
+  await expect(contextDrawer.getByLabel("Title")).toHaveValue("Landing decision");
+  await expect(contextDrawer.getByLabel("What should CopilotChat remember?")).toHaveValue("Prefer the landing deployment plan.");
+  await contextDrawer.getByRole("button", { name: "Add memory" }).click();
+  await expect(contextDrawer.getByText("Landing decision")).toBeVisible();
+  await contextDrawer.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Add reference" }).click();
   await page.getByRole("dialog", { name: "Add reference material" }).getByLabel("Reference title").fill("Landing reference");
   await page.getByRole("dialog", { name: "Add reference material" }).getByLabel("Project context editor").fill("Landing reference material.");
@@ -305,6 +314,8 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "gpt-5-mini" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Project context: Project instructions: Landing instructions." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Shared project memory: Landing memory." }).last()).toBeVisible();
+  await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Landing decision" }).last()).toBeVisible();
   await page.getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menu", { name: "Header actions menu" }).getByRole("button", { name: "Star chat" }).click();
   await page.getByRole("button", { name: "More actions" }).click();
@@ -318,6 +329,134 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.locator(".sidebar-row").filter({ hasText: "General" }).click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByText(/Back at it/i)).toBeVisible();
+});
+
+test("personal context and coarse location are included in chats", async ({ page, context }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers personal context management.");
+  await context.grantPermissions(["geolocation"]);
+  await context.setGeolocation({ latitude: 47.60621, longitude: -122.33207 });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  const profile = "I am a staff engineer who prefers concise TypeScript examples.";
+  await drawer.getByLabel("About you").fill(profile);
+  const coarseLocation = drawer.getByRole("radio", { name: /^Coarse/ });
+  await coarseLocation.click();
+  await expect(coarseLocation).toHaveAttribute("aria-checked", "true");
+  await drawer.getByRole("button", { name: "Save current location" }).click();
+  await expect(drawer.getByLabel("About you")).toHaveValue(profile);
+  const fineLocation = drawer.getByRole("radio", { name: /^Fine/ });
+  await fineLocation.click();
+  await drawer.getByRole("button", { name: "Save profile" }).click();
+  await expect(fineLocation).toHaveAttribute("aria-checked", "true");
+  await coarseLocation.click();
+  await expect(drawer.locator(".location-summary")).toContainText("47.6, -122.3");
+  await drawer.getByLabel("Title").fill("Response style");
+  await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
+  await drawer.getByRole("button", { name: "Add memory" }).click();
+  let memoryCard = drawer.locator(".memory-card").filter({ hasText: "Response style" });
+  const serializedState = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/state")).json()));
+  expect(serializedState).not.toContain("Lead with the recommendation.");
+  await memoryCard.getByRole("button", { name: "Edit" }).click();
+  const memoryEditor = drawer.locator(".memory-card.memory-editor");
+  await memoryEditor.getByLabel("Title").fill("Updated response style");
+  await memoryEditor.getByLabel("Memory").fill("Lead with the edited recommendation.");
+  await memoryEditor.getByRole("button", { name: "Save changes" }).click();
+  memoryCard = drawer.locator(".memory-card").filter({ hasText: "Updated response style" });
+  await expect(memoryCard).toContainText("Lead with the edited recommendation.");
+  await memoryCard.getByRole("button", { name: "Pause" }).click();
+  await expect(memoryCard.getByText("Paused", { exact: true })).toBeVisible();
+  await drawer.getByRole("button", { name: "Close" }).click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check paused personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  let response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("Personal context: Profile supplied by the user: I am a staff engineer", { timeout: 15000 });
+  await expect(response).toContainText("Location shared by the user (coarse): 47.6, -122.3");
+  await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Include" }).click();
+  await expect(memoryCard.getByText("Included", { exact: true })).toBeVisible();
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check included personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("Updated response style", { timeout: 15000 });
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Delete", exact: true }).click();
+  await memoryCard.getByRole("button", { name: "Confirm delete" }).click();
+  await expect(page.getByRole("dialog", { name: "Personal context" }).getByText("Updated response style")).toHaveCount(0);
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check deleted personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check deleted personal context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
+  await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  const locationDrawer = page.getByRole("dialog", { name: "Personal context" });
+  const offLocation = locationDrawer.getByRole("radio", { name: /^Off/ });
+  await offLocation.click();
+  await locationDrawer.getByRole("button", { name: "Turn off location" }).click();
+  await expect(locationDrawer.locator(".location-summary")).toContainText("No location saved.");
+  await expect(offLocation).toHaveAttribute("aria-checked", "true");
+  await locationDrawer.getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check disabled location context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check disabled location context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
+  await expect(response).not.toContainText("Location shared by the user");
+  await expect(response).not.toContainText("47.6, -122.3");
+});
+
+test("stale memory pages cannot cross scopes", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectAResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope A", description: "", instructions: "", memory: "" } });
+  const projectBResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope B", description: "", instructions: "", memory: "" } });
+  const projectA = await projectAResponse.json() as { id: string };
+  const projectB = await projectBResponse.json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: "Delayed A memory", content: "Must never appear in scope B.", enabled: true } });
+  for (let index = 1; index <= 20; index += 1) await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: `Recent A memory ${index}`, content: `A ${index}`, enabled: true } });
+  await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Only B memory", content: "Belongs to scope B.", enabled: true } });
+  let releasePage!: () => void;
+  let markRequested!: () => void;
+  let markFinished!: () => void;
+  const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+  const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  const pageFinished = new Promise<void>((resolve) => { markFinished = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20") {
+      markRequested();
+      await pageGate;
+      await route.continue();
+      markFinished();
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(projectA.id);
+  await expect(drawer.getByText("Recent A memory 20")).toBeVisible();
+  await drawer.getByRole("button", { name: /Load more/ }).click();
+  await pageRequested;
+  await drawer.getByLabel("Memory scope").selectOption(projectB.id);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
+  releasePage();
+  await pageFinished;
+  await expect(drawer.getByText("Delayed A memory")).toHaveCount(0);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
 });
 
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {

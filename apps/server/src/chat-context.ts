@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ProviderChatRequest, ProviderMessage, ProviderTitleTool } from "@copilotchat/provider";
 import type { Chat, SendMessageRequest } from "@copilotchat/shared";
-import { messageAttachmentSchema } from "@copilotchat/shared";
+import { formatMemoryContext, messageAttachmentSchema } from "@copilotchat/shared";
 import { buildConversationTools } from "./conversation-tools.js";
 import type { AppDatabase } from "./db.js";
 
@@ -27,6 +27,7 @@ export function buildProviderChatRequest(input: { db: AppDatabase; ownerId: stri
     reasoningEffort: input.message.reasoningEffort ?? input.chat.reasoningEffort ?? undefined,
     contextTier: input.message.contextTier ?? input.chat.contextTier ?? undefined,
     permissionMode: input.message.permissionMode ?? "ask",
+    userContext: buildUserContext(input.db, input.ownerId),
     projectContext: project ? buildProjectContext(input.db, input.ownerId, project.id) : null,
     skills: input.db.enabledSkillManifests(input.ownerId, input.message.skillIds, input.chat.projectId, input.message.content),
     mcpServers: input.db.enabledMcpServers(input.ownerId, input.chat.projectId).filter((server) => input.context.allowStdioMcp || server.transport !== "stdio"),
@@ -53,12 +54,24 @@ export function isolatedChatWorkspace(root: string, chatId: string): string {
 
 function buildProjectContext(db: AppDatabase, ownerId: string, projectId: string): string | null {
   const project = db.getProject(ownerId, projectId);
+  const memories = db.enabledMemoriesForContext(ownerId, projectId);
   const references = db.listProjectReferences(ownerId, projectId);
   const chatReferences = db.listProjectChatReferences(ownerId, projectId);
   return [
     project.instructions ? `Project instructions:\n${project.instructions}` : "",
     project.memory ? `Shared project memory:\n${project.memory}` : "",
+    formatMemoryContext("Project memories:", memories.memories, memories.total),
     references.length > 0 ? ["Project reference materials:", ...references.map((reference) => `## ${reference.title}\n${reference.content}`)].join("\n\n") : "",
     chatReferences.length > 0 ? ["Referenced prior chat content:", ...chatReferences.map((reference) => `- ${reference.title}: ${reference.excerpt}`)].join("\n") : "",
+  ].filter(Boolean).join("\n\n") || null;
+}
+
+function buildUserContext(db: AppDatabase, ownerId: string): string | null {
+  const context = db.getUserContext(ownerId);
+  const memories = db.enabledMemoriesForContext(ownerId, null);
+  return [
+    context.profile ? `Profile supplied by the user:\n${context.profile}` : "",
+    formatMemoryContext("User memories:", memories.memories, memories.total),
+    context.location ? `Location shared by the user (${context.location.precision}): ${context.location.latitude}, ${context.location.longitude}; accuracy about ${Math.round(context.location.accuracy)} meters; captured ${context.location.capturedAt}.` : "",
   ].filter(Boolean).join("\n\n") || null;
 }

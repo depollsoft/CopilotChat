@@ -20,6 +20,25 @@ export const ownerSchema = z.object({
 });
 export type Owner = z.infer<typeof ownerSchema>;
 
+export const locationLevelSchema = z.enum(["off", "coarse", "fine"]);
+export type LocationLevel = z.infer<typeof locationLevelSchema>;
+export const userLocationSchema = z.object({
+  latitude: z.number().min(-90).max(90),
+  longitude: z.number().min(-180).max(180),
+  accuracy: z.number().nonnegative(),
+  capturedAt: z.string().datetime(),
+  precision: z.enum(["coarse", "fine"]),
+});
+export type UserLocation = z.infer<typeof userLocationSchema>;
+export const userContextSchema = z.object({
+  ownerId: z.string(),
+  profile: z.string(),
+  locationLevel: locationLevelSchema,
+  location: userLocationSchema.nullable(),
+  updatedAt: z.string(),
+});
+export type UserContext = z.infer<typeof userContextSchema>;
+
 export const projectSchema = z.object({
   id: z.string(),
   ownerId: z.string(),
@@ -56,6 +75,66 @@ export const projectChatReferenceSchema = z.object({
   createdAt: z.string(),
 });
 export type ProjectChatReference = z.infer<typeof projectChatReferenceSchema>;
+
+export const memorySchema = z.object({
+  id: z.string(),
+  ownerId: z.string(),
+  projectId: z.string().nullable(),
+  title: z.string(),
+  content: z.string(),
+  enabled: z.boolean(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Memory = z.infer<typeof memorySchema>;
+export const memoryContextCharacterBudget = 16_000;
+export const memoryContextEntryBudget = 100;
+const memoryContextNoticeReserve = 220;
+const memoryTruncationNotice = "\n[Memory truncated to fit the context budget.]";
+
+export function formatMemoryContext(heading: string, memories: Memory[], totalMemoryCount = memories.length): string {
+  if (memories.length === 0) return "";
+  const ordered = [...memories].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt) || left.id.localeCompare(right.id)).slice(0, memoryContextEntryBudget);
+  const blocks: string[] = [];
+  const contentLimit = memoryContextCharacterBudget - memoryContextNoticeReserve;
+  let used = heading.length;
+  let omitted = Math.max(0, totalMemoryCount - ordered.length);
+  let truncated = 0;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const memory = ordered[index]!;
+    const prefix = `## ${memory.title}\n`;
+    const separatorLength = 2;
+    const available = contentLimit - used - separatorLength;
+    const block = `${prefix}${memory.content}`;
+    if (block.length <= available) {
+      blocks.push(block);
+      used += separatorLength + block.length;
+      continue;
+    }
+    const contentLength = available - prefix.length - memoryTruncationNotice.length;
+    if (contentLength > 0) {
+      blocks.push(`${prefix}${memory.content.slice(0, contentLength)}${memoryTruncationNotice}`);
+      truncated = 1;
+      omitted += ordered.length - index - 1;
+    } else {
+      omitted += ordered.length - index;
+    }
+    break;
+  }
+  const limitations = [
+    truncated ? "1 memory truncated" : "",
+    omitted ? `${omitted} ${omitted === 1 ? "memory" : "memories"} omitted` : "",
+  ].filter(Boolean);
+  const notice = limitations.length > 0 ? `[Memory context limited to ${memoryContextCharacterBudget} characters; ${limitations.join("; ")}.]` : "";
+  return [heading, ...blocks, notice].filter(Boolean).join("\n\n");
+}
+
+export const memoryScopeStatsSchema = z.object({ total: z.number().int().nonnegative(), enabled: z.number().int().nonnegative(), contextLength: z.number().int().nonnegative() });
+export type MemoryScopeStats = z.infer<typeof memoryScopeStatsSchema>;
+export const memoryStatsSchema = z.object({ user: memoryScopeStatsSchema, projects: z.record(z.string(), memoryScopeStatsSchema) });
+export type MemoryStats = z.infer<typeof memoryStatsSchema>;
+export const memoryPageSchema = z.object({ items: z.array(memorySchema), total: z.number().int().nonnegative(), nextOffset: z.number().int().nonnegative().nullable() });
+export type MemoryPage = z.infer<typeof memoryPageSchema>;
 
 export const chatSchema = z.object({
   id: z.string(),
@@ -201,7 +280,7 @@ export type ProviderModel = z.infer<typeof providerModelSchema>;
 export const providerStatusSchema = z.object({ id: z.string(), label: z.string(), available: z.boolean(), details: z.string(), capabilities: z.array(z.string()).default([]), models: z.array(providerModelSchema).default([]), modelsAuthoritative: z.boolean().default(false), defaultModel: z.string().optional() });
 export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 
-export const appStateSchema = z.object({ owner: ownerSchema, authMode: z.enum(["local", "github"]).default("local"), projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
+export const appStateSchema = z.object({ owner: ownerSchema, authMode: z.enum(["local", "github"]).default("local"), userContext: userContextSchema, memoryStats: memoryStatsSchema, projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
 export type AppState = z.infer<typeof appStateSchema>;
 
 export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
@@ -214,6 +293,25 @@ export const createProjectRequestSchema = z.object({ name: z.string().min(1), de
 export type CreateProjectRequest = z.infer<typeof createProjectRequestSchema>;
 export const updateProjectRequestSchema = z.object({ name: z.string().min(1).optional(), description: z.string().optional().nullable(), instructions: z.string().optional().nullable(), memory: z.string().optional().nullable(), defaultModel: z.string().optional().nullable(), favorite: z.boolean().optional() });
 export type UpdateProjectRequest = z.infer<typeof updateProjectRequestSchema>;
+export const updateUserContextRequestSchema = z.object({
+  profile: z.string().max(20_000).optional(),
+  locationLevel: locationLevelSchema.optional(),
+  location: userLocationSchema.nullable().optional(),
+});
+export type UpdateUserContextRequest = z.infer<typeof updateUserContextRequestSchema>;
+export const createMemoryRequestSchema = z.object({
+  projectId: z.string().min(1).nullable().optional(),
+  title: z.string().trim().min(1).max(120),
+  content: z.string().trim().min(1).max(20_000),
+  enabled: z.boolean().optional().default(true),
+});
+export type CreateMemoryRequest = z.infer<typeof createMemoryRequestSchema>;
+export const updateMemoryRequestSchema = z.object({
+  title: z.string().trim().min(1).max(120).optional(),
+  content: z.string().trim().min(1).max(20_000).optional(),
+  enabled: z.boolean().optional(),
+});
+export type UpdateMemoryRequest = z.infer<typeof updateMemoryRequestSchema>;
 export const createProjectReferenceRequestSchema = z.object({ projectId: z.string().min(1), title: z.string().min(1), content: z.string().min(1) });
 export type CreateProjectReferenceRequest = z.infer<typeof createProjectReferenceRequestSchema>;
 export const updateProjectReferenceRequestSchema = z.object({ title: z.string().min(1).optional(), content: z.string().min(1).optional() });

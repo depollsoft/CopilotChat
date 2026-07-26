@@ -4,15 +4,15 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, McpServer, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, Workspace } from "@copilotchat/shared";
+import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
 import { formatAic } from "@copilotchat/shared";
-import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload } from "./icons.js";
+import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
 import { externalLinkProps } from "./links.js";
 import "./styles.css";
 
 type Theme = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
-type Tab = "preferences" | "skills" | "tools" | "code";
+type Tab = "preferences" | "context" | "skills" | "tools" | "code";
 type SseEvent = { event: string; data: unknown };
 const API_TOKEN_KEY = "copilotchat.apiToken";
 const MODEL_KEY = "copilotchat.model";
@@ -46,7 +46,7 @@ type PendingTurn = { id: string; mode: "steer" | "queue"; content: string; statu
 type ChatUsage = { turnNanoAiu: number; chatNanoAiu: number };
 type UsageStatus = ChatUsage & { reported: boolean };
 const emptyChatUsage: ChatUsage = { turnNanoAiu: 0, chatNanoAiu: 0 };
-type ProjectEditorState = { kind: "memory" | "instructions"; title: string; value: string; placeholder: string } | { kind: "reference"; title: string; referenceId?: string; referenceTitle: string; value: string };
+type ProjectEditorState = { kind: "instructions"; title: string; value: string; placeholder: string } | { kind: "reference"; title: string; referenceId?: string; referenceTitle: string; value: string };
 type AppDialog = { kind: "text"; title: string; message?: string; label: string; initialValue?: string; placeholder?: string; confirmLabel: string; onConfirm: (value: string) => void | Promise<void> } | { kind: "confirm"; title: string; message: string; confirmLabel: string; danger?: boolean; requireText?: string; onConfirm: () => void | Promise<void> };
 type AppRoute = { kind: "home" } | { kind: "chat"; chatId: string } | { kind: "project"; projectId: string };
 type SlashCommand = { command: string; title: string; description: string; body: string };
@@ -55,12 +55,14 @@ type ChatScrollState = { top: number; atLive: boolean };
 type MessageProps = { message: ChatMessage; streaming?: boolean; activities?: AssistantActivity[]; editing?: boolean; editValue?: string; canEdit?: boolean; canRetry?: boolean; onEditStart?: (message: ChatMessage) => void; onEditChange?: (content: string) => void; onEditCancel?: () => void; onEditSave?: (message: ChatMessage, content: string) => void; onRetry?: (message: ChatMessage) => void };
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "preferences", label: "Preferences", icon: <IconSettings width={14} height={14} /> },
+  { id: "context", label: "Personal context", icon: <IconUser width={14} height={14} /> },
   { id: "skills", label: "Skills", icon: <IconSparkle width={14} height={14} /> },
   { id: "tools", label: "Tools", icon: <IconPlug width={14} height={14} /> },
   { id: "code", label: "Code", icon: <IconTerminal width={14} height={14} /> },
 ];
 const DRAWER_DESCRIPTIONS: Record<Tab, string> = {
   preferences: "Account, appearance, imports, notifications, and local data.",
+  context: "Control what CopilotChat knows about you and remembers across conversations.",
   skills: "Choose reusable behaviors for the next turn.",
   tools: "Connect external tools and keep their permissions visible.",
   code: "Attach local folders for cowork tasks.",
@@ -138,7 +140,8 @@ function App(): React.ReactElement {
   const selectedModelInfo = providerModels.find((model) => model.id === selectedModel) ?? providerModels.find((model) => model.id === providerDefaultModel) ?? providerModels[0];
   const effortChoices = reasoningEffortChoices(selectedModelInfo);
   const supportsLongContext = Boolean(selectedModelInfo?.supportsLongContext);
-  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, selectedModelInfo, contextTier]);
+  const memoryContextLength = (state?.memoryStats.user.contextLength ?? 0) + (activeProject ? state?.memoryStats.projects[activeProject.id]?.contextLength ?? 0 : 0);
+  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile ?? "", state?.userContext.location ?? null, memoryContextLength, selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile, state?.userContext.location, memoryContextLength, selectedModelInfo, contextTier]);
   const usageStatus = useMemo<UsageStatus>(() => { const chatNanoAiu = Math.max(liveUsage.chatNanoAiu, selectedChat?.totalNanoAiu ?? 0); return { chatNanoAiu, turnNanoAiu: liveUsage.turnNanoAiu, reported: chatNanoAiu > 0 }; }, [liveUsage, selectedChat?.totalNanoAiu]);
   useEffect(() => {
     const query = window.matchMedia(SYSTEM_THEME_QUERY);
@@ -405,7 +408,7 @@ function App(): React.ReactElement {
     }
   }
   async function clearAllData(): Promise<void> {
-    setDialog({ kind: "confirm", title: "Clear local app data?", message: "This deletes chats, projects, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.", confirmLabel: "Clear all data", danger: true, requireText: "CLEAR", onConfirm: async () => {
+    setDialog({ kind: "confirm", title: "Clear local app data?", message: "This deletes chats, projects, profile context, saved locations, memories, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.", confirmLabel: "Clear all data", danger: true, requireText: "CLEAR", onConfirm: async () => {
       abortRef.current?.abort();
       await api<void>("/api/data", { method: "DELETE", raw: true }, apiToken);
       selectedChatIdRef.current = null;
@@ -462,7 +465,7 @@ function App(): React.ReactElement {
       {state && !provider.available ? <SetupBanner details={provider.details} onOpenSettings={() => setDrawer("preferences")} /> : null}
       <div ref={scrollRef} className="scroll" onScroll={handleThreadScroll}>
         {activeProject && !selectedChat && state
-          ? <ProjectHome project={activeProject} state={state} models={provider.models} modelsAuthoritative={modelsAuthoritative} chats={chats.filter((chat) => chat.projectId === activeProject.id)} onSelectChat={selectChat} onNewChat={() => void createChat(activeProject.id, activeWorkspaceId)} refresh={refreshState} showToast={setToast} />
+          ? <ProjectHome project={activeProject} state={state} models={provider.models} modelsAuthoritative={modelsAuthoritative} chats={chats.filter((chat) => chat.projectId === activeProject.id)} onSelectChat={selectChat} onNewChat={() => void createChat(activeProject.id, activeWorkspaceId)} onOpenContext={() => setDrawer("context")} refresh={refreshState} showToast={setToast} />
           : messages.length === 0 && !streamingText && streamingActivities.length === 0 && pendingTurns.length === 0 && pendingInteractions.length === 0
             ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); composerRef.current?.focus(); }} />
             : <div className="thread">{renderThreadMessages()}<PendingTurns turns={pendingTurns}/>{streamingText || streamingActivities.length > 0 ? <Message streaming activities={streamingActivities} message={{ id: "streaming", chatId: selectedChatId ?? "", role: "assistant", content: streamingText, provider: provider.id, metadata: {}, createdAt: new Date().toISOString() }} /> : null}{busy && !streamingText && streamingActivities.length === 0 ? <Thinking /> : null}<InteractionDock interactions={pendingInteractions} onResolve={(interaction, resolution) => void resolveInteraction(interaction, resolution)} /></div>}
@@ -483,7 +486,7 @@ const Sidebar = React.memo(function Sidebar(p: SidebarProps) {
   const menuRef = useDismissablePopup<HTMLDivElement>(Boolean(menuId), () => setMenuId(null));
   const grouped = groupChatsByDate(p.chats.filter((c) => c.title.toLowerCase().includes(p.searchQuery.toLowerCase())));
   function runMenuAction(action: () => void): void { setMenuId(null); action(); }
-  return <aside className={`sidebar${p.open ? " open" : ""}`}><button className="sidebar-brand" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-brand-mark"><IconCopilot width={22} height={22}/></span><span className="sidebar-brand-text"><strong>CopilotChat</strong><small>{p.providerLabel}</small></span></button><button className="sidebar-new" onClick={p.onNewChat}>New chat <IconPlus width={16}/></button><div className="sidebar-search"><IconSearch/><input aria-label="Search chats" value={p.searchQuery} placeholder="Search chats" onChange={(e) => p.onSearch(e.target.value)} /></div><div className="sidebar-scroll"><div className="sidebar-section-label">Projects</div><button className={`sidebar-row${p.activeProjectId === null ? " active" : ""}`} onClick={() => p.onSelectProject(null)}><span className="sidebar-row-title">General chats</span></button>{sortFavoritesFirst(p.projects).map((project) => <SidebarProjectRow key={project.id} project={project} active={p.activeProjectId === project.id} menuOpen={menuId === `project:${project.id}`} menuRef={menuId === `project:${project.id}` ? menuRef : undefined} onMenu={() => setMenuId(menuId === `project:${project.id}` ? null : `project:${project.id}`)} onSelect={() => p.onSelectProject(project.id)} onToggleFavorite={() => runMenuAction(() => p.onToggleProjectFavorite(project))} onRename={() => runMenuAction(() => p.onRenameProject(project))} onDelete={() => runMenuAction(() => p.onDeleteProject(project))} />)}<button className="sidebar-row manage-projects-row" onClick={p.onNewProject}><span className="sidebar-row-title muted">New project…</span></button>{grouped.length === 0 ? <div className="sidebar-empty">No conversations yet.</div> : grouped.map((g) => <React.Fragment key={g.label}><div className="sidebar-section-label">{g.label}</div>{g.chats.map((chat) => { const running = p.runningChatIds.has(chat.id); const unread = p.unreadChatIds.has(chat.id); return <div key={chat.id} data-chat-id={chat.id} className={`sidebar-row${chat.id === p.selectedChatId ? " active" : ""}${running ? " running" : ""}${unread ? " unread" : ""}`} role="button" tabIndex={0} aria-label={`${chat.title}${running ? " generating" : unread ? " new content" : ""}`} onClick={() => p.onSelectChat(chat.id)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelectChat(chat.id); } }}><span className="sidebar-row-title"><SidebarFlags favorite={chat.favorite}/>{chat.title}</span><span className="sidebar-row-meta">{running ? <span className="chat-indicator running" title="Response in progress" aria-label="Response in progress">Live</span> : unread ? <span className="chat-indicator unread" title="New content" aria-label="New content">New</span> : null}</span><div ref={menuId === `chat:${chat.id}` ? menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Chat actions" className="sidebar-row-menu" aria-expanded={menuId === `chat:${chat.id}`} onClick={() => setMenuId(menuId === `chat:${chat.id}` ? null : `chat:${chat.id}`)}><IconMore width={16}/></button>{menuId === `chat:${chat.id}` ? <div className="menu" role="menu" aria-label="Chat actions menu"><button onClick={() => runMenuAction(() => p.onToggleChatFavorite(chat))}>{chat.favorite ? "Unstar" : "Star"}</button><button onClick={() => runMenuAction(() => p.onRenameChat(chat))}>Rename</button><button onClick={() => runMenuAction(() => p.onArchiveChat(chat))}>Archive</button><button className="danger" onClick={() => runMenuAction(() => p.onDeleteChat(chat))}>Delete</button></div> : null}</div></div>; })}</React.Fragment>)}</div><div className="sidebar-footer"><button className="sidebar-row sidebar-preferences-row" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-row-title"><IconSettings width={16}/>Preferences</span></button><button className="sidebar-footer-user" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-footer-avatar">{p.owner.slice(0,2).toUpperCase()}</span><span className="sidebar-footer-text"><strong>{p.owner}</strong><small>Account</small></span></button></div></aside>;
+  return <aside className={`sidebar${p.open ? " open" : ""}`}><button className="sidebar-brand" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-brand-mark"><IconCopilot width={22} height={22}/></span><span className="sidebar-brand-text"><strong>CopilotChat</strong><small>{p.providerLabel}</small></span></button><button className="sidebar-new" onClick={p.onNewChat}>New chat <IconPlus width={16}/></button><div className="sidebar-search"><IconSearch/><input aria-label="Search chats" value={p.searchQuery} placeholder="Search chats" onChange={(e) => p.onSearch(e.target.value)} /></div><div className="sidebar-scroll"><div className="sidebar-section-label">Projects</div><button className={`sidebar-row${p.activeProjectId === null ? " active" : ""}`} onClick={() => p.onSelectProject(null)}><span className="sidebar-row-title">General chats</span></button>{sortFavoritesFirst(p.projects).map((project) => <SidebarProjectRow key={project.id} project={project} active={p.activeProjectId === project.id} menuOpen={menuId === `project:${project.id}`} menuRef={menuId === `project:${project.id}` ? menuRef : undefined} onMenu={() => setMenuId(menuId === `project:${project.id}` ? null : `project:${project.id}`)} onSelect={() => p.onSelectProject(project.id)} onToggleFavorite={() => runMenuAction(() => p.onToggleProjectFavorite(project))} onRename={() => runMenuAction(() => p.onRenameProject(project))} onDelete={() => runMenuAction(() => p.onDeleteProject(project))} />)}<button className="sidebar-row manage-projects-row" onClick={p.onNewProject}><span className="sidebar-row-title muted">New project…</span></button>{grouped.length === 0 ? <div className="sidebar-empty">No conversations yet.</div> : grouped.map((g) => <React.Fragment key={g.label}><div className="sidebar-section-label">{g.label}</div>{g.chats.map((chat) => { const running = p.runningChatIds.has(chat.id); const unread = p.unreadChatIds.has(chat.id); return <div key={chat.id} data-chat-id={chat.id} className={`sidebar-row${chat.id === p.selectedChatId ? " active" : ""}${running ? " running" : ""}${unread ? " unread" : ""}`} role="button" tabIndex={0} aria-label={`${chat.title}${running ? " generating" : unread ? " new content" : ""}`} onClick={() => p.onSelectChat(chat.id)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelectChat(chat.id); } }}><span className="sidebar-row-title"><SidebarFlags favorite={chat.favorite}/>{chat.title}</span><span className="sidebar-row-meta">{running ? <span className="chat-indicator running" title="Response in progress" aria-label="Response in progress">Live</span> : unread ? <span className="chat-indicator unread" title="New content" aria-label="New content">New</span> : null}</span><div ref={menuId === `chat:${chat.id}` ? menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Chat actions" className="sidebar-row-menu" aria-expanded={menuId === `chat:${chat.id}`} onClick={() => setMenuId(menuId === `chat:${chat.id}` ? null : `chat:${chat.id}`)}><IconMore width={16}/></button>{menuId === `chat:${chat.id}` ? <div className="menu" role="menu" aria-label="Chat actions menu"><button onClick={() => runMenuAction(() => p.onToggleChatFavorite(chat))}>{chat.favorite ? "Unstar" : "Star"}</button><button onClick={() => runMenuAction(() => p.onRenameChat(chat))}>Rename</button><button onClick={() => runMenuAction(() => p.onArchiveChat(chat))}>Archive</button><button className="danger" onClick={() => runMenuAction(() => p.onDeleteChat(chat))}>Delete</button></div> : null}</div></div>; })}</React.Fragment>)}</div><div className="sidebar-footer"><button className="sidebar-row sidebar-preferences-row" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-row-title"><IconSettings width={16}/>Preferences</span></button><button className="sidebar-footer-user" onClick={() => p.onOpenDrawer("context")}><span className="sidebar-footer-avatar">{p.owner.slice(0,2).toUpperCase()}</span><span className="sidebar-footer-text"><strong>{p.owner}</strong><small>Personal context</small></span></button></div></aside>;
 }, areSidebarPropsEqual);
 function areSidebarPropsEqual(previous: SidebarProps, next: SidebarProps): boolean {
   return previous.open === next.open &&
@@ -575,12 +578,12 @@ function ShortcutsDialog(p: { onClose: () => void }) { return <><div className="
 function ConfirmButton(p: { className?: string; label: string; confirmLabel?: string; disabled?: boolean; onConfirm: () => void | Promise<void> }) { const [confirming, setConfirming] = useState(false); const [working, setWorking] = useState(false); async function click(): Promise<void> { if (p.disabled || working) return; if (!confirming) { setConfirming(true); window.setTimeout(() => setConfirming(false), 3000); return; } setWorking(true); try { await p.onConfirm(); } finally { setWorking(false); setConfirming(false); } } return <button type="button" className={p.className ?? "btn btn-sm btn-danger"} disabled={p.disabled || working} onClick={() => void click()}>{working ? "Working…" : confirming ? p.confirmLabel ?? "Confirm" : p.label}</button>; }
 function FormField(p: { label: string; hint?: string; children: React.ReactElement<{ id?: string; "aria-describedby"?: string }> }) { const id = useMemo(() => `field-${slugify(p.label)}-${Math.random().toString(36).slice(2, 7)}`, [p.label]); const hintId = `${id}-hint`; return <label className="form-field" htmlFor={id}><span>{p.label}</span>{React.cloneElement(p.children, { id, "aria-describedby": p.hint ? hintId : undefined })}{p.hint ? <small id={hintId}>{p.hint}</small> : null}</label>; }
 function Welcome(p: { userName: string; project: Project | null; onPrompt: (v: string) => void }) { const name = cleanName(p.userName); return <div className="welcome"><div className="welcome-inner"><div className="welcome-mark"><IconCopilot width={46} height={46}/></div><h1>{p.project ? `Ready in ${p.project.name}` : name ? `Back at it, ${name}` : "Back at it"}</h1><p className="welcome-sub">{p.project ? "Project instructions will be included with every turn in this conversation." : "Start a focused chat, connect tools, or work against a local folder."}</p><div className="welcome-grid">{STARTERS.map(([title, body, prompt]) => <button className="welcome-card" key={title} onClick={() => p.onPrompt(prompt)}><strong>{title}</strong><span>{body}</span><em>Start</em></button>)}</div></div></div>; }
-function ProjectHome(p: { project: Project; state: AppState; models: ProviderStatus["models"]; modelsAuthoritative: boolean; chats: Chat[]; onSelectChat: (id: string) => void; onNewChat: () => void; refresh: () => Promise<void>; showToast: (s: string) => void }) {
+function ProjectHome(p: { project: Project; state: AppState; models: ProviderStatus["models"]; modelsAuthoritative: boolean; chats: Chat[]; onSelectChat: (id: string) => void; onNewChat: () => void; onOpenContext: () => void; refresh: () => Promise<void>; showToast: (s: string) => void }) {
   const [editor, setEditor] = useState<ProjectEditorState | null>(null);
+  const projectMemories = p.state.memoryStats.projects[p.project.id] ?? { total: 0, enabled: 0, contextLength: 0 };
   const references = p.state.projectReferences.filter((reference) => reference.projectId === p.project.id);
   const chatReferences = p.state.projectChatReferences.filter((reference) => reference.projectId === p.project.id);
   async function saveEditor(next: ProjectEditorState): Promise<void> {
-    if (next.kind === "memory") await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { memory: next.value } });
     if (next.kind === "instructions") await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { instructions: next.value } });
     if (next.kind === "reference") {
       if (next.referenceId) await api<ProjectReference>(`/api/project-references/${next.referenceId}`, { method: "PATCH", body: { title: next.referenceTitle, content: next.value } });
@@ -591,7 +594,7 @@ function ProjectHome(p: { project: Project; state: AppState; models: ProviderSta
     await p.refresh();
   }
   async function saveDefaultModel(defaultModel: string): Promise<void> { await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { defaultModel: defaultModel || null } }); p.showToast(defaultModel ? "Project default model saved" : "Project default model cleared"); await p.refresh(); }
-  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} modelsAuthoritative={p.modelsAuthoritative} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={() => setEditor({ kind: "memory", title: "Edit memory", value: p.project.memory ?? "", placeholder: "Facts and decisions every chat in this project should remember." })}><div className="card-h"><strong>Memory</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.memory, "No shared memory yet.")}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
+  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} modelsAuthoritative={p.modelsAuthoritative} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={p.onOpenContext}><div className="card-h"><strong>Memories</strong><span className="btn btn-sm">Manage</span></div><p>{projectMemories.total > 0 ? `${projectMemories.enabled} active of ${projectMemories.total} saved memories.${p.project.memory ? " A shared project note is also included." : ""}` : p.project.memory ? "A shared project note is included. Add individual memories to keep facts easier to browse." : "No project memories yet."}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
 }
 function ProjectDefaultModelCard(p: { project: Project; models: ProviderStatus["models"]; modelsAuthoritative: boolean; onChange: (model: string) => void }) {
   const configuredModel = p.project.defaultModel;
@@ -610,7 +613,7 @@ function ProjectEditorModal(p: { editor: ProjectEditorState; onClose: () => void
   const [referenceTitle, setReferenceTitle] = useState(p.editor.kind === "reference" ? p.editor.referenceTitle : "");
   useEffect(() => { setValue(p.editor.value); setReferenceTitle(p.editor.kind === "reference" ? p.editor.referenceTitle : ""); }, [p.editor]);
   function save(): void { if (p.editor.kind === "reference") p.onSave({ ...p.editor, referenceTitle, value }); else p.onSave({ ...p.editor, value }); }
-  return <><div className="modal-scrim" onClick={p.onClose}/><section className="editor-modal" role="dialog" aria-label={p.editor.title}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "memory" ? "Memory" : p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></section></>;
+  return <><div className="modal-scrim" onClick={p.onClose}/><section className="editor-modal" role="dialog" aria-label={p.editor.title}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></section></>;
 }
 const Markdown = React.memo(function Markdown(p: { children: string }) { const parts = useMemo(() => splitMarkdownTaskLists(p.children), [p.children]); if (parts.length === 1 && parts[0]?.kind === "markdown") return <MarkdownText>{p.children}</MarkdownText>; return <>{parts.map((part, index) => part.kind === "tasks" ? <TaskListCard key={index} items={part.items} /> : <MarkdownText key={index}>{part.content}</MarkdownText>)}</>; });
 const MarkdownText = React.memo(function MarkdownText(p: { children: string }) { return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={markdownComponents}>{p.children}</ReactMarkdown>; });
@@ -893,7 +896,210 @@ function ComposerPickerContent(p: { picker: ComposerPicker; busy: boolean; proje
   return <><strong>Tool permissions</strong><p>Controls how this chat handles tool approval requests.</p><div className="settings-note"><p><strong>Auto-approve is powerful.</strong> Use it only for trusted chats and workspaces; shell and write permissions can change local files.</p></div><div className="segmented-control vertical"><button type="button" aria-label="Ask before each tool use" className={p.permissionMode === "ask" ? "on" : ""} onClick={() => p.onPermissionMode("ask")}><strong>Ask each time</strong><span>Review every tool request inline.</span></button><button type="button" aria-label="Auto-approve tool requests" className={p.permissionMode === "yolo" ? "on danger-mode" : ""} onClick={() => p.onPermissionMode("yolo")}><strong>Auto-approve tools</strong><span>Allow upcoming tool requests without another prompt.</span></button></div></>;
 }
 function Drawer(p: { active: Tab; onChangeTab: (t: Tab) => void; onClose: () => void; children: React.ReactNode }) { const activeTab = TABS.find((t) => t.id === p.active); function key(e: React.KeyboardEvent<HTMLButtonElement>, i: number) { if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return; e.preventDefault(); const n = (i + (e.key === "ArrowRight" ? 1 : -1) + TABS.length) % TABS.length; const tab = TABS[n]; if (!tab) return; p.onChangeTab(tab.id); window.requestAnimationFrame(() => e.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[n]?.focus()); } return <><div className="scrim" onClick={p.onClose}/><aside className="drawer" role="dialog" aria-modal="true" aria-label={activeTab?.label}><div className="drawer-head"><div><h2>{activeTab?.label}</h2><p>{DRAWER_DESCRIPTIONS[p.active]}</p></div><button className="icon-button" aria-label="Close" onClick={p.onClose}><IconClose/></button></div><div className="drawer-tabs" role="tablist">{TABS.map((tab,i) => <button key={tab.id} role="tab" aria-selected={tab.id===p.active} tabIndex={tab.id===p.active?0:-1} className={`drawer-tab${tab.id===p.active?" active":""}`} onClick={() => p.onChangeTab(tab.id)} onKeyDown={(e)=>key(e,i)}>{tab.icon}<span>{tab.label}</span></button>)}</div><div className="drawer-body">{p.children}</div></aside></>; }
-function DrawerContent(p: { tab: Tab; state: AppState; theme: Theme; setTheme: (t: Theme) => void; textScale: number; setTextScale: (scale: number) => void; apiToken: string; setApiToken: (t: string) => void; selectedSkillIds: string[]; setSelectedSkillIds: (ids: string[]) => void; activeProjectId: string | null; onSelectProject: (id: string | null) => void; activeWorkspaceId: string | null; setActiveWorkspaceId: (id: string | null) => void; refresh: () => Promise<void>; showToast: (s: string) => void; clearAllData: () => Promise<void>; onStartGuidedImport: (file: File) => Promise<void> }) { if (p.tab === "skills") return <SkillsPanel {...p}/>; if (p.tab === "tools") return <McpPanel servers={p.state.mcpServers} refresh={p.refresh} showToast={p.showToast}/>; if (p.tab === "code") return <WorkspacesPanel workspaces={p.state.workspaces} activeWorkspaceId={p.activeWorkspaceId} setActiveWorkspaceId={p.setActiveWorkspaceId} refresh={p.refresh} showToast={p.showToast}/>; return <PreferencesPanel provider={p.state.provider} authMode={p.state.authMode} owner={p.state.owner.login} archivedChats={p.state.archivedChats} theme={p.theme} setTheme={p.setTheme} textScale={p.textScale} setTextScale={p.setTextScale} apiToken={p.apiToken} setApiToken={p.setApiToken} refresh={p.refresh} showToast={p.showToast} clearAllData={p.clearAllData} onStartGuidedImport={p.onStartGuidedImport}/>; }
+function DrawerContent(p: { tab: Tab; state: AppState; theme: Theme; setTheme: (t: Theme) => void; textScale: number; setTextScale: (scale: number) => void; apiToken: string; setApiToken: (t: string) => void; selectedSkillIds: string[]; setSelectedSkillIds: (ids: string[]) => void; activeProjectId: string | null; onSelectProject: (id: string | null) => void; activeWorkspaceId: string | null; setActiveWorkspaceId: (id: string | null) => void; refresh: () => Promise<void>; showToast: (s: string) => void; clearAllData: () => Promise<void>; onStartGuidedImport: (file: File) => Promise<void> }) {
+  if (p.tab === "context") return <ContextPanel state={p.state} activeProjectId={p.activeProjectId} refresh={p.refresh} showToast={p.showToast}/>;
+  if (p.tab === "skills") return <SkillsPanel {...p}/>;
+  if (p.tab === "tools") return <McpPanel servers={p.state.mcpServers} refresh={p.refresh} showToast={p.showToast}/>;
+  if (p.tab === "code") return <WorkspacesPanel workspaces={p.state.workspaces} activeWorkspaceId={p.activeWorkspaceId} setActiveWorkspaceId={p.setActiveWorkspaceId} refresh={p.refresh} showToast={p.showToast}/>;
+  return <PreferencesPanel provider={p.state.provider} authMode={p.state.authMode} owner={p.state.owner.login} archivedChats={p.state.archivedChats} theme={p.theme} setTheme={p.setTheme} textScale={p.textScale} setTextScale={p.setTextScale} apiToken={p.apiToken} setApiToken={p.setApiToken} refresh={p.refresh} showToast={p.showToast} clearAllData={p.clearAllData} onStartGuidedImport={p.onStartGuidedImport}/>;
+}
+function ContextPanel(p: { state: AppState; activeProjectId: string | null; refresh: () => Promise<void>; showToast: (message: string) => void }) {
+  const [profile, setProfile] = useState(p.state.userContext.profile);
+  const [locationLevel, setLocationLevel] = useState<LocationLevel>(p.state.userContext.locationLevel);
+  const [scope, setScope] = useState(p.activeProjectId ?? "user");
+  const [projectNote, setProjectNote] = useState("");
+  const [newTitle, setNewTitle] = useState("");
+  const [newContent, setNewContent] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editContent, setEditContent] = useState("");
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [memoryTotal, setMemoryTotal] = useState(0);
+  const [nextMemoryOffset, setNextMemoryOffset] = useState<number | null>(null);
+  const [memoriesLoading, setMemoriesLoading] = useState(false);
+  const [working, setWorking] = useState<string | null>(null);
+  const [panelError, setPanelError] = useState<string | null>(null);
+  const selectedProject = scope === "user" ? null : p.state.projects.find((project) => project.id === scope) ?? null;
+  const memoryScopeKey = selectedProject?.id ?? "user";
+  const memoryScopeRef = useRef(memoryScopeKey);
+  memoryScopeRef.current = memoryScopeKey;
+  const currentLocation = p.state.userContext.location;
+  useEffect(() => { setProfile(p.state.userContext.profile); }, [p.state.userContext.profile]);
+  useEffect(() => { setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.locationLevel]);
+  useEffect(() => {
+    if (p.activeProjectId && p.state.projects.some((project) => project.id === p.activeProjectId)) setScope(p.activeProjectId);
+  }, [p.activeProjectId]);
+  useEffect(() => {
+    setEditingId(null);
+    setNewTitle("");
+    setNewContent("");
+  }, [selectedProject?.id]);
+  useEffect(() => { setProjectNote(selectedProject?.memory ?? ""); }, [selectedProject?.id, selectedProject?.memory]);
+  useEffect(() => {
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    let cancelled = false;
+    setMemories([]);
+    setMemoryTotal(0);
+    setNextMemoryOffset(null);
+    setMemoriesLoading(true);
+    setPanelError(null);
+    void api<MemoryPage>(memoryPageUrl(requestedProjectId, 0)).then((page) => {
+      if (cancelled || memoryScopeRef.current !== requestedScope) return;
+      setMemories(page.items);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    }).catch((error) => {
+      if (!cancelled && memoryScopeRef.current === requestedScope) setPanelError(toErr(error));
+    }).finally(() => {
+      if (!cancelled && memoryScopeRef.current === requestedScope) setMemoriesLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [selectedProject?.id]);
+  async function reloadMemories(): Promise<void> {
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, 0));
+    if (memoryScopeRef.current !== requestedScope) return;
+    setMemories(page.items);
+    setMemoryTotal(page.total);
+    setNextMemoryOffset(page.nextOffset);
+  }
+  async function loadMoreMemories(): Promise<void> {
+    if (nextMemoryOffset === null || memoriesLoading) return;
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    const requestedOffset = nextMemoryOffset;
+    setMemoriesLoading(true);
+    setPanelError(null);
+    try {
+      const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, requestedOffset));
+      if (memoryScopeRef.current !== requestedScope) return;
+      setMemories((current) => [...current, ...page.items.filter((item) => !current.some((existing) => existing.id === item.id))]);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    } catch (error) {
+      if (memoryScopeRef.current === requestedScope) setPanelError(toErr(error));
+    } finally {
+      if (memoryScopeRef.current === requestedScope) setMemoriesLoading(false);
+    }
+  }
+  async function perform(key: string, task: () => Promise<void>, message?: string): Promise<void> {
+    setWorking(key);
+    setPanelError(null);
+    try {
+      await task();
+      await p.refresh();
+      if (message) p.showToast(message);
+    } catch (error) {
+      setPanelError(toErr(error));
+    } finally {
+      setWorking(null);
+    }
+  }
+  async function saveProfile(): Promise<void> {
+    await perform("profile", async () => { await api("/api/user-context", { method: "PATCH", body: { profile } }); }, "Profile context saved");
+  }
+  async function saveLocation(): Promise<void> {
+    await perform("location", async () => {
+      const location = locationLevel === "off" ? null : await requestBrowserLocation(locationLevel);
+      await api("/api/user-context", { method: "PATCH", body: { locationLevel, location } });
+    }, locationLevel === "off" ? "Location sharing turned off" : `${locationLevel === "coarse" ? "Coarse" : "Fine"} location updated`);
+  }
+  async function saveProjectNote(): Promise<void> {
+    if (!selectedProject) return;
+    await perform("project-note", async () => { await api(`/api/projects/${selectedProject.id}`, { method: "PATCH", body: { memory: projectNote } }); }, "Shared project note saved");
+  }
+  async function createMemory(): Promise<void> {
+    if (!newTitle.trim() || !newContent.trim()) return;
+    await perform("new-memory", async () => {
+      await api<Memory>("/api/memories", { method: "POST", body: { projectId: selectedProject?.id ?? null, title: newTitle, content: newContent, enabled: true } });
+      setNewTitle("");
+      setNewContent("");
+      await reloadMemories();
+    }, "Memory saved");
+  }
+  function startEditing(memory: Memory): void { setEditingId(memory.id); setEditTitle(memory.title); setEditContent(memory.content); }
+  async function saveMemory(memory: Memory): Promise<void> {
+    if (!editTitle.trim() || !editContent.trim()) return;
+    await perform(`edit-${memory.id}`, async () => {
+      await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { title: editTitle, content: editContent } });
+      setEditingId(null);
+      await reloadMemories();
+    }, "Memory updated");
+  }
+  async function toggleMemory(memory: Memory): Promise<void> {
+    await perform(`toggle-${memory.id}`, async () => { await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { enabled: !memory.enabled } }); await reloadMemories(); }, memory.enabled ? "Memory paused" : "Memory included");
+  }
+  async function deleteMemory(memory: Memory): Promise<void> {
+    await perform(`delete-${memory.id}`, async () => { await api(`/api/memories/${memory.id}`, { method: "DELETE", raw: true }); await reloadMemories(); }, "Memory deleted");
+  }
+  return <div className="settings-panel context-settings">
+    <div className="settings-note context-privacy-note"><strong>You stay in control.</strong><p>Only saved profile text, enabled memories, and the location precision you choose are added to future chats. Fine location can be sensitive; turn it off whenever it is not needed.</p></div>
+    {panelError ? <p className="field-error" role="alert">{panelError}</p> : null}
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Profile</strong><span>Background that helps responses fit you without repeating it in every chat.</span></div></div>
+      <form className="settings-card context-profile-form" onSubmit={(event) => { event.preventDefault(); void saveProfile(); }}>
+        <FormField label="About you" hint="Add details such as your role, communication preferences, accessibility needs, units, or recurring goals.">
+          <textarea rows={6} maxLength={20_000} placeholder="I am a staff engineer. Prefer concise answers, metric units, and TypeScript examples." value={profile} onChange={(event) => setProfile(event.currentTarget.value)}/>
+        </FormField>
+        <div className="settings-actions"><button className="btn btn-primary" disabled={working === "profile" || profile === p.state.userContext.profile}>{working === "profile" ? "Saving…" : "Save profile"}</button></div>
+      </form>
+    </section>
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Location</strong><span>Share no location, an approximate area, or browser-reported fine coordinates.</span></div></div>
+      <div className="settings-card location-card">
+        <div className="segmented-control vertical location-level-control" role="radiogroup" aria-label="Location precision">
+          <button type="button" role="radio" aria-checked={locationLevel === "off"} className={locationLevel === "off" ? "on" : ""} onClick={() => setLocationLevel("off")}><strong>Off</strong><span>No location is stored or included.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "coarse"} className={locationLevel === "coarse" ? "on" : ""} onClick={() => setLocationLevel("coarse")}><strong>Coarse</strong><span>Rounded to roughly a city or region, about 10 km.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "fine"} className={locationLevel === "fine" ? "on" : ""} onClick={() => setLocationLevel("fine")}><strong>Fine</strong><span>Uses browser-reported coordinates and accuracy.</span></button>
+        </div>
+        <div className="location-summary">
+          <div><strong>Saved location</strong><span>{currentLocation ? locationSummary(currentLocation) : "No location saved."}</span></div>
+          <span className={`tag${p.state.userContext.locationLevel === "off" ? "" : " success"}`}>{locationLevelLabel(p.state.userContext.locationLevel)}</span>
+        </div>
+        <div className="settings-actions"><button type="button" className="btn btn-primary" disabled={working === "location"} onClick={() => void saveLocation()}>{working === "location" ? "Requesting location…" : locationLevel === "off" ? "Turn off location" : "Save current location"}</button></div>
+      </div>
+    </section>
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Memories</strong><span>Browse and edit durable facts for every chat or one project.</span></div><span className="tag">{memoryTotal}</span></div>
+      <div className="settings-card memory-scope-card">
+        <FormField label="Memory scope" hint={selectedProject ? `Only chats in ${selectedProject.name} receive these memories.` : "User memories are available in general and project chats."}>
+          <select value={scope} onChange={(event) => setScope(event.currentTarget.value)}>
+            <option value="user">Your user profile</option>
+            {p.state.projects.map((project) => <option key={project.id} value={project.id}>Project: {project.name}</option>)}
+          </select>
+        </FormField>
+      </div>
+      {selectedProject ? <form className="settings-card project-note-form" onSubmit={(event) => { event.preventDefault(); void saveProjectNote(); }}>
+        <FormField label="Shared project note" hint="This existing freeform note is included alongside individual project memories.">
+          <textarea rows={4} placeholder="A broad shared note for this project." value={projectNote} onChange={(event) => setProjectNote(event.currentTarget.value)}/>
+        </FormField>
+        <div className="settings-actions"><button className="btn" disabled={working === "project-note" || projectNote === (selectedProject.memory ?? "")}>{working === "project-note" ? "Saving…" : "Save project note"}</button></div>
+      </form> : null}
+      <form className="settings-card memory-editor" onSubmit={(event) => { event.preventDefault(); void createMemory(); }}>
+        <div className="card-h"><strong>New {selectedProject ? "project" : "user"} memory</strong><span className="tag">{selectedProject ? selectedProject.name : "All chats"}</span></div>
+        <FormField label="Title"><input maxLength={120} placeholder="Preferred response style" value={newTitle} onChange={(event) => setNewTitle(event.currentTarget.value)}/></FormField>
+        <FormField label="What should CopilotChat remember?"><textarea rows={4} maxLength={20_000} placeholder="Prefer a short recommendation first, followed by tradeoffs." value={newContent} onChange={(event) => setNewContent(event.currentTarget.value)}/></FormField>
+        <div className="settings-actions"><button className="btn btn-primary" disabled={working === "new-memory" || !newTitle.trim() || !newContent.trim()}>{working === "new-memory" ? "Saving…" : "Add memory"}</button></div>
+      </form>
+      <div className="memory-list">
+        {memoriesLoading && memories.length === 0 ? <div className="settings-note"><strong>Loading memories…</strong><p>Fetching this scope only while the context manager is open.</p></div> : memories.length === 0 ? <div className="settings-note"><strong>No memories in this scope</strong><p>Add a durable preference, decision, or fact above. You can pause it without deleting it later.</p></div> : memories.map((memory) => editingId === memory.id
+          ? <form key={memory.id} className="memory-card memory-editor" onSubmit={(event) => { event.preventDefault(); void saveMemory(memory); }}>
+              <FormField label="Title"><input maxLength={120} value={editTitle} onChange={(event) => setEditTitle(event.currentTarget.value)}/></FormField>
+              <FormField label="Memory"><textarea rows={5} maxLength={20_000} value={editContent} onChange={(event) => setEditContent(event.currentTarget.value)}/></FormField>
+              <div className="card-actions"><button type="button" className="btn" onClick={() => setEditingId(null)}>Cancel</button><button className="btn btn-primary" disabled={working === `edit-${memory.id}` || !editTitle.trim() || !editContent.trim()}>{working === `edit-${memory.id}` ? "Saving…" : "Save changes"}</button></div>
+            </form>
+          : <article key={memory.id} className={`memory-card${memory.enabled ? "" : " paused"}`}>
+              <div className="memory-card-head"><div><strong>{memory.title}</strong><span>{formatProjectDate(memory.updatedAt)}</span></div><span className={`tag${memory.enabled ? " success" : " warning"}`}>{memory.enabled ? "Included" : "Paused"}</span></div>
+              <p>{memory.content}</p>
+              <div className="card-actions"><button className="btn btn-sm" onClick={() => startEditing(memory)}><IconEdit width={14}/>Edit</button><button className="btn btn-sm" disabled={working === `toggle-${memory.id}`} onClick={() => void toggleMemory(memory)}>{memory.enabled ? "Pause" : "Include"}</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" disabled={working === `delete-${memory.id}`} onConfirm={() => deleteMemory(memory)}/></div>
+            </article>)}
+      </div>
+      {nextMemoryOffset !== null ? <div className="settings-actions"><button type="button" className="btn" disabled={memoriesLoading} onClick={() => void loadMoreMemories()}>{memoriesLoading ? "Loading…" : `Load more (${memories.length} of ${memoryTotal})`}</button></div> : null}
+    </section>
+  </div>;
+}
 function ProjectChatReferences(p:{project:Project;state:AppState;refresh:()=>Promise<void>;showToast:(s:string)=>void}) {
   const [query,setQuery]=useState(""),[results,setResults]=useState<ProjectChatSearchResult[]>([]);
   const refs=p.state.projectChatReferences.filter((reference)=>reference.projectId===p.project.id);
@@ -914,7 +1120,7 @@ function ImportsPanel(p:{onStartGuidedImport:(file:File)=>Promise<void>}){const[
 function PreferencesPanel(p:{provider:ProviderStatus;authMode:AppState["authMode"];owner:string;archivedChats:Chat[];theme:Theme;setTheme:(t:Theme)=>void;textScale:number;setTextScale:(scale:number)=>void;apiToken:string;setApiToken:(t:string)=>void;refresh:()=>Promise<void>;showToast:(s:string)=>void;clearAllData:()=>Promise<void>;onStartGuidedImport:(file:File)=>Promise<void>}) {
   const [token,setToken]=useState(p.apiToken);
   const textPercent = Math.round(p.textScale * 100);
-  return <div className="settings-panel"><AuthSetupCard provider={p.provider} authMode={p.authMode}/><section className="settings-section"><div className="settings-section-title"><div><strong>Preferences</strong><span>Personal app behavior and display choices.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Theme</strong><span>Choose a color scheme or follow your system setting.</span></div><div className="segmented-control"><button className={p.theme==="system"?"on":""} onClick={()=>p.setTheme("system")}>System</button><button className={p.theme==="light"?"on":""} onClick={()=>p.setTheme("light")}>Light</button><button className={p.theme==="dark"?"on":""} onClick={()=>p.setTheme("dark")}>Dark</button></div></div></div><div className="settings-card"><label className="text-scale-control"><span>Text size <strong>{textPercent}%</strong></span><input aria-label="Text size" type="range" min="85" max="120" step="5" value={textPercent} onChange={(e)=>p.setTextScale(clampTextScale(Number(e.currentTarget.value) / 100))}/></label><div className="settings-actions"><button className="btn btn-sm" onClick={()=>p.setTextScale(DEFAULT_TEXT_SCALE)}>Reset text size</button></div></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Account & provider</strong><span>Authentication and provider-level connection state.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Signed in as {p.owner}</strong><span>{p.provider.details}</span></div><span className={`tag${p.provider.available?" success":" warning"}`}>{p.provider.id}</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>API token</strong><span>Optional token used for remote installs and authenticated API calls.</span></div><button className="btn btn-sm" onClick={()=>{p.setApiToken(token);p.showToast("API token saved");}}>Save</button></div><FormField label="API token"><input placeholder="Optional token for remote installs" value={token} onChange={e=>setToken(e.target.value)}/></FormField></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Import data</strong><span>Bring in conversations and project context from other assistants.</span></div></div><ImportsPanel onStartGuidedImport={p.onStartGuidedImport}/></section><section className="settings-section"><div className="settings-section-title"><div><strong>Local app data</strong><span>Device-level browser permissions and chat history maintenance.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Notifications</strong><span>Allow local browser notifications for long-running work.</span></div><button className="btn btn-sm" onClick={()=>void Notification.requestPermission().then(s=>p.showToast(`Notifications: ${s}`))}><IconBell width={14}/>Enable</button></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Archived chats</strong><span>Restore or permanently delete archived conversations.</span></div><span className="tag">{p.archivedChats.length}</span></div>{p.archivedChats.length===0?<p className="section-help">No archived chats.</p>:<div className="archive-list">{p.archivedChats.map(c=><div className="archive-row" key={c.id}><strong>{c.title}</strong><div className="card-actions"><button className="btn btn-sm" onClick={async()=>{await api<Chat>(`/api/chats/${c.id}`,{method:"PATCH",body:{archived:false}},p.apiToken); await p.refresh();}}>Restore</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" onConfirm={async()=>{await api<void>(`/api/chats/${c.id}`,{method:"DELETE",raw:true},p.apiToken); await p.refresh();}}/></div></div>)}</div>}</div><div className="settings-card danger-zone"><div className="settings-row"><div className="settings-row-main"><strong>Clear all local data</strong><span>Deletes chats, projects, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.</span></div><button className="btn btn-sm btn-danger" onClick={()=>void p.clearAllData()}>Clear all data</button></div></div></section></div>;
+  return <div className="settings-panel"><AuthSetupCard provider={p.provider} authMode={p.authMode}/><section className="settings-section"><div className="settings-section-title"><div><strong>Preferences</strong><span>Personal app behavior and display choices.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Theme</strong><span>Choose a color scheme or follow your system setting.</span></div><div className="segmented-control"><button className={p.theme==="system"?"on":""} onClick={()=>p.setTheme("system")}>System</button><button className={p.theme==="light"?"on":""} onClick={()=>p.setTheme("light")}>Light</button><button className={p.theme==="dark"?"on":""} onClick={()=>p.setTheme("dark")}>Dark</button></div></div></div><div className="settings-card"><label className="text-scale-control"><span>Text size <strong>{textPercent}%</strong></span><input aria-label="Text size" type="range" min="85" max="120" step="5" value={textPercent} onChange={(e)=>p.setTextScale(clampTextScale(Number(e.currentTarget.value) / 100))}/></label><div className="settings-actions"><button className="btn btn-sm" onClick={()=>p.setTextScale(DEFAULT_TEXT_SCALE)}>Reset text size</button></div></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Account & provider</strong><span>Authentication and provider-level connection state.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Signed in as {p.owner}</strong><span>{p.provider.details}</span></div><span className={`tag${p.provider.available?" success":" warning"}`}>{p.provider.id}</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>API token</strong><span>Optional token used for remote installs and authenticated API calls.</span></div><button className="btn btn-sm" onClick={()=>{p.setApiToken(token);p.showToast("API token saved");}}>Save</button></div><FormField label="API token"><input placeholder="Optional token for remote installs" value={token} onChange={e=>setToken(e.target.value)}/></FormField></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Import data</strong><span>Bring in conversations and project context from other assistants.</span></div></div><ImportsPanel onStartGuidedImport={p.onStartGuidedImport}/></section><section className="settings-section"><div className="settings-section-title"><div><strong>Local app data</strong><span>Device-level browser permissions and chat history maintenance.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Notifications</strong><span>Allow local browser notifications for long-running work.</span></div><button className="btn btn-sm" onClick={()=>void Notification.requestPermission().then(s=>p.showToast(`Notifications: ${s}`))}><IconBell width={14}/>Enable</button></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Archived chats</strong><span>Restore or permanently delete archived conversations.</span></div><span className="tag">{p.archivedChats.length}</span></div>{p.archivedChats.length===0?<p className="section-help">No archived chats.</p>:<div className="archive-list">{p.archivedChats.map(c=><div className="archive-row" key={c.id}><strong>{c.title}</strong><div className="card-actions"><button className="btn btn-sm" onClick={async()=>{await api<Chat>(`/api/chats/${c.id}`,{method:"PATCH",body:{archived:false}},p.apiToken); await p.refresh();}}>Restore</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" onConfirm={async()=>{await api<void>(`/api/chats/${c.id}`,{method:"DELETE",raw:true},p.apiToken); await p.refresh();}}/></div></div>)}</div>}</div><div className="settings-card danger-zone"><div className="settings-row"><div className="settings-row-main"><strong>Clear all local data</strong><span>Deletes chats, projects, profile context, saved locations, memories, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.</span></div><button className="btn btn-sm btn-danger" onClick={()=>void p.clearAllData()}>Clear all data</button></div></div></section></div>;
 }
 function AuthSetupCard(p:{provider:ProviderStatus;authMode:AppState["authMode"]}){const command="copilot login\n# or\ngh auth login\n# then restart the dev server\npnpm dev"; const infinite=p.provider.capabilities.includes("infinite-sessions"); const localSetup=p.authMode==="local"; const githubReauth=p.authMode==="github"&&p.provider.id==="sdk"; const discovery=p.provider.modelsAuthoritative; const detail=!p.provider.available?p.provider.details||"No Copilot provider is available yet.":discovery?`Dynamic model discovery is working${infinite?", and SDK infinite chats are enabled.":"."}`:p.provider.id==="cli"?"The CLI bridge does not expose dynamic model discovery, so CopilotChat uses configured model choices.":"The provider is connected, but its current model list is a configured fallback. Refresh models to retry discovery."; return <div className={`card auth-card${p.provider.available?" ready":" warning"}`}><div className="card-h"><strong>{p.provider.available?"Copilot is connected":"Connect Copilot"}</strong><span className={`tag${p.provider.available&&discovery?" success":" warning"}`}>{p.provider.available?discovery?"ready":"fallback models":"setup needed"}</span></div><p className="section-help">{detail}</p>{!p.provider.available&&localSetup?<pre className="command-block"><code>{command}</code></pre>:null}{!p.provider.available&&githubReauth?<div className="settings-actions"><a className="btn btn-primary" href="/api/auth/github/login">Sign in again</a></div>:null}</div>;}
 function Toast(p:{text:string;onDone:()=>void}){useEffect(()=>{const id=setTimeout(p.onDone,2200);return()=>clearTimeout(id);},[p]);return <div className="toast">{p.text}</div>;}
@@ -1097,7 +1303,32 @@ function useDismissablePopup<T extends HTMLElement>(active: boolean, onDismiss: 
 function resizeComposerTextarea(textarea: HTMLTextAreaElement | null): void { if (!textarea) return; textarea.style.height = "0px"; textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 44), 180)}px`; }
 function isAtLiveEdge(element: HTMLElement): boolean { return element.scrollHeight - element.scrollTop - element.clientHeight <= LIVE_SCROLL_THRESHOLD; }
 function cleanName(s:string){const t=s.trim();return !t||t.toLowerCase()==="local"||t.toLowerCase()==="local user"?"":t.split(/\s+/)[0]??"";}
-function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],model:ProviderModel|null,tier:ContextTier):ContextStatus{const contextText=[...messages.map(m=>m.content),streamingText,draft,project?.instructions??"",workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil(contextText.length/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
+function memoryPageUrl(projectId: string | null, offset: number): string { const query = new URLSearchParams({ offset: String(offset), limit: "20" }); if (projectId) query.set("projectId", projectId); return `/api/memories?${query.toString()}`; }
+function requestBrowserLocation(level: Exclude<LocationLevel, "off">): Promise<UserLocation> {
+  if (!navigator.geolocation) return Promise.reject(new Error("Location is not available in this browser."));
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition((position) => {
+      const digits = level === "coarse" ? 1 : 5;
+      resolve({
+        latitude: Number(position.coords.latitude.toFixed(digits)),
+        longitude: Number(position.coords.longitude.toFixed(digits)),
+        accuracy: level === "coarse" ? Math.max(10_000, position.coords.accuracy) : position.coords.accuracy,
+        capturedAt: new Date(position.timestamp || Date.now()).toISOString(),
+        precision: level,
+      });
+    }, (error) => {
+      const message = error.code === error.PERMISSION_DENIED ? "Location permission was denied." : error.code === error.TIMEOUT ? "Location lookup timed out." : "The browser could not determine your location.";
+      reject(new Error(message));
+    }, { enableHighAccuracy: level === "fine", timeout: 15_000, maximumAge: 5 * 60_000 });
+  });
+}
+function locationLevelLabel(level: LocationLevel): string { return level === "coarse" ? "Coarse" : level === "fine" ? "Fine" : "Off"; }
+function locationSummary(location: UserLocation): string {
+  const digits = location.precision === "coarse" ? 1 : 5;
+  const accuracy = location.accuracy >= 1000 ? `${trimNumber(location.accuracy / 1000)} km` : `${Math.round(location.accuracy)} m`;
+  return `${location.latitude.toFixed(digits)}, ${location.longitude.toFixed(digits)} · about ${accuracy} · ${formatProjectDate(location.capturedAt)}`;
+}
+function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],profile:string,location:UserLocation|null,memoryContextLength:number,model:ProviderModel|null,tier:ContextTier):ContextStatus{const contextText=[...messages.map(m=>m.content),streamingText,draft,profile,location?`${location.latitude},${location.longitude}`:"",project?.instructions??"",project?.memory??"",workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil((contextText.length+memoryContextLength)/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
 function formatTokens(value:number):string{if(value>=1000000)return`${trimNumber(value/1000000)}M`;if(value>=1000)return`${trimNumber(value/1000)}k`;return String(value);}
 function trimNumber(value:number):string{return value>=10?String(Math.round(value)):value.toFixed(1).replace(/\.0$/,"");}
 function formatPercent(value:number):string{return value>0&&value<1?"<1%":`${trimNumber(Math.min(100,value))}%`;}

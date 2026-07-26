@@ -69,6 +69,7 @@ describe("createCopilotProvider", () => {
       resumeSession: true,
       model: "gpt-test",
       contextTier: "long_context",
+      userContext: "The user prefers concise recommendations.",
       projectContext: "Use the project voice.",
       skills: [],
       mcpServers: [],
@@ -78,8 +79,43 @@ describe("createCopilotProvider", () => {
     expect(text).toContain("Messages in context: 3.");
     expect(text).toContain("Provider session: copilotchat-test (resume).");
     expect(text).toContain("Previous context: user: First question | assistant: First answer");
+    expect(text).toContain("Personal context: The user prefers concise recommendations.");
     expect(text).toContain("Project context: Use the project voice.");
     expect(text).toContain("Context size: long_context.");
+  });
+  it("injects personal context into HTTP provider system messages", async () => {
+    type HttpChatBody = { messages?: Array<{ role?: string; content?: string }> };
+    let captureBody!: (body: HttpChatBody) => void;
+    const capturedBodyPromise = new Promise<HttpChatBody>((resolve) => { captureBody = resolve; });
+    const server = http.createServer((request, response) => {
+      if (request.url !== "/chat/completions") {
+        response.writeHead(404).end();
+        return;
+      }
+      let rawBody = "";
+      request.setEncoding("utf8");
+      request.on("data", (chunk: string) => { rawBody += chunk; });
+      request.on("end", () => {
+        captureBody(JSON.parse(rawBody) as HttpChatBody);
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.end("data: [DONE]\n\n");
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
+      const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
+
+      await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test", userContext: "The user prefers concise recommendations." }));
+
+      const capturedBody = await capturedBodyPromise;
+      const systemMessage = capturedBody.messages?.find((message) => message.role === "system");
+      expect(systemMessage?.content).toContain("Personal context shared by the user:");
+      expect(systemMessage?.content).toContain("The user prefers concise recommendations.");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
   });
   it("maps configurable model effort and long-context tiers from SDK metadata", () => {
     const model: ModelInfo = {

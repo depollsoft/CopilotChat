@@ -580,6 +580,19 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .archive-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .settings-note { display: grid; gap: 4px; padding: 13px; border: 1px dashed var(--border-strong); border-radius: 16px; background: color-mix(in srgb, var(--surface-muted) 62%, transparent); }
 .settings-note p { margin: 0; color: var(--text-muted); font-size: calc(13px * var(--text-scale)); line-height: 1.45; }
+.context-privacy-note { border-style: solid; }
+.context-profile-form textarea, .project-note-form textarea, .memory-editor textarea { line-height: 1.55; }
+.location-card { gap: 14px; }
+.location-level-control { width: 100%; }
+.location-summary, .memory-card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.location-summary > div, .memory-card-head > div { display: grid; gap: 2px; min-width: 0; }
+.location-summary span:not(.tag), .memory-card-head div span { color: var(--text-muted); font-size: calc(12px * var(--text-scale)); overflow-wrap: anywhere; }
+.memory-scope-card { padding-bottom: 12px; }
+.memory-list { display: grid; gap: 8px; }
+.memory-card { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); }
+.memory-card.paused { background: color-mix(in srgb, var(--surface-muted) 54%, var(--surface)); }
+.memory-card > p { margin: 0; color: var(--text-muted); line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.memory-card .card-actions { justify-content: flex-end; }
 .text-scale-control { display: grid; gap: 8px; margin-top: 6px; }
 .text-scale-control span { display: flex; align-items: center; justify-content: space-between; color: var(--text-muted); font-weight: 700; }
 .text-scale-control strong { color: var(--text); }
@@ -693,6 +706,9 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .drawer-head { padding: calc(18px + env(safe-area-inset-top, 0px)) max(18px, env(safe-area-inset-right, 0px)) 18px max(18px, env(safe-area-inset-left, 0px)); }
   .drawer-tabs { padding: 8px max(10px, env(safe-area-inset-right, 0px)) 8px max(10px, env(safe-area-inset-left, 0px)); }
   .drawer-body { padding: 16px max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
+  .settings-row, .location-summary, .memory-card-head { align-items: stretch; flex-direction: column; }
+  .segmented-control:not(.vertical) { width: 100%; }
+  .segmented-control:not(.vertical) button { flex: 1; justify-items: center; text-align: center; }
   .editor-modal, .app-dialog { inset: max(10px, env(safe-area-inset-top, 0px)) max(10px, env(safe-area-inset-right, 0px)) max(10px, env(safe-area-inset-bottom, 0px)) max(10px, env(safe-area-inset-left, 0px)); width: auto; max-height: calc(100dvh - max(10px, env(safe-area-inset-top, 0px)) - max(10px, env(safe-area-inset-bottom, 0px))); border-radius: 18px; }
   .app-dialog.shortcuts-dialog { width: auto; }
   .editor-modal-body textarea { min-height: 260px; }
