@@ -9,6 +9,7 @@ type StreamListener = {
   reply: FastifyReply;
   queue: StreamEvent[];
   draining: boolean;
+  heartbeat: ReturnType<typeof setInterval> | null;
 };
 type StreamEvent = { event: string; data: unknown };
 type ActiveTurn = { chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest };
@@ -54,6 +55,7 @@ const persistedMetadataLimit = 950_000;
 const persistedActivityStringLimit = 8_000;
 const persistedNestedStepLimit = 24;
 const sseBackpressureLimit = 256 * 1024;
+export const sseHeartbeatIntervalMs = 15_000;
 const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interaction"]);
 
 export class ActiveChatResponses {
@@ -201,10 +203,20 @@ export class ActiveChatResponse {
   get signal(): AbortSignal { return this.controller.signal; }
 
   attach(reply: FastifyReply): void {
-    const listener: StreamListener = { reply, queue: [], draining: false };
+    const listener: StreamListener = { reply, queue: [], draining: false, heartbeat: null };
     this.listeners.add(listener);
-    reply.raw.on("close", () => this.listeners.delete(listener));
-    if (this.assistantContent || this.activities.length > 0 || this.interactions.length > 0 || this.pendingTurns.length > 0) this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns });
+    reply.raw.on("close", () => this.dropListener(listener));
+    listener.heartbeat = setInterval(() => {
+      if (!writeSseComment(listener.reply, "ping")) this.dropListener(listener);
+    }, sseHeartbeatIntervalMs);
+    listener.heartbeat.unref();
+    this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns });
+  }
+
+  private dropListener(listener: StreamListener): void {
+    if (listener.heartbeat) clearInterval(listener.heartbeat);
+    listener.heartbeat = null;
+    this.listeners.delete(listener);
   }
 
   decorateProviderRequest(request: ProviderChatRequest): ProviderChatRequest {
@@ -390,7 +402,7 @@ export class ActiveChatResponse {
       const accepted = writeSse(listener.reply, event, data);
       if (!accepted) this.waitForDrain(listener);
     } catch {
-      this.listeners.delete(listener);
+      this.dropListener(listener);
     }
   }
 
@@ -425,7 +437,7 @@ export class ActiveChatResponse {
           return;
         }
       } catch {
-        this.listeners.delete(listener);
+        this.dropListener(listener);
         return;
       }
     }
@@ -440,6 +452,8 @@ export class ActiveChatResponse {
 
   close(): void {
     for (const listener of [...this.listeners]) {
+      if (listener.heartbeat) clearInterval(listener.heartbeat);
+      listener.heartbeat = null;
       try { listener.reply.raw.end(); } catch { /* already closed */ }
     }
     this.listeners.clear();
@@ -706,4 +720,16 @@ export function writeSse(reply: FastifyReply, event: string, data: unknown): boo
   const raw = reply.raw as typeof reply.raw & { flush?: () => void };
   raw.flush?.();
   return accepted;
+}
+
+export function writeSseComment(reply: FastifyReply, text: string): boolean {
+  try {
+    if (reply.raw.writableEnded || reply.raw.destroyed) return false;
+    reply.raw.write(`: ${text}\n\n`);
+    const raw = reply.raw as typeof reply.raw & { flush?: () => void };
+    raw.flush?.();
+    return true;
+  } catch {
+    return false;
+  }
 }

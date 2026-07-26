@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 
@@ -620,6 +621,44 @@ test("assistant responses stream incrementally before the final message is saved
   await expect(streamingResponse).toContainText("I am running with the local development provider");
   await expect(streamingResponse).not.toContainText("Configure Copilot auth/provider settings");
   await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
+});
+
+test("a dropped stream reconnects without losing the running response", async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers transport recovery.");
+  const sockets = new Set<net.Socket>();
+  const proxy = net.createServer((client) => {
+    const upstream = net.connect(4528, "127.0.0.1");
+    client.pipe(upstream);
+    upstream.pipe(client);
+    const track = (socket: net.Socket): void => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.on("error", () => sockets.delete(socket)); };
+    track(client); track(upstream);
+    client.on("close", () => upstream.destroy());
+  });
+  await new Promise<void>((resolve) => { proxy.listen(4529, "127.0.0.1", resolve); });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const streamedLength = async (): Promise<number> => (await page.locator(".msg.assistant").last().innerText()).length;
+  try {
+    await page.goto("http://127.0.0.1:4529/");
+    await expect(page.getByText(/Back at it/i)).toBeVisible();
+    await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`start a long response ${"keep streaming ".repeat(6000)}`);
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect.poll(streamedLength).toBeGreaterThan(500);
+    const beforeDrop = await streamedLength();
+
+    // Sever every open socket the way a phone does when the app is suspended.
+    for (const socket of [...sockets]) socket.end();
+
+    // The running turn must stay on screen instead of collapsing back to an idle chat.
+    await page.waitForTimeout(1500);
+    await expect(page.getByPlaceholder("Steer or queue a follow-up")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect.poll(streamedLength, { timeout: 20_000 }).toBeGreaterThan(beforeDrop);
+  } finally {
+    await context.close();
+    await new Promise<void>((resolve) => { proxy.close(() => resolve()); });
+  }
 });
 
 test("editing works after stopping an in-progress response", async ({ page }, testInfo) => {

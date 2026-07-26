@@ -12,6 +12,7 @@ type Theme = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
 type Tab = "preferences" | "skills" | "tools" | "code";
 type SseEvent = { event: string; data: unknown };
+type StreamHooks = { onOpen?: () => void; onChunk?: () => void };
 const API_TOKEN_KEY = "copilotchat.apiToken";
 const MODEL_KEY = "copilotchat.model";
 const EFFORT_KEY = "copilotchat.reasoningEffort";
@@ -23,6 +24,12 @@ const SYSTEM_THEME_QUERY = "(prefers-color-scheme: dark)";
 const CHAT_ROUTE_PREFIX = "/chats/";
 const PROJECT_ROUTE_PREFIX = "/projects/";
 const LIVE_SCROLL_THRESHOLD = 96;
+const STREAM_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+const STREAM_RECONNECT_LIMIT = 24;
+const STREAM_STALE_MS = 40_000;
+const STREAM_WATCHDOG_MS = 2000;
+const STREAM_WAKE_PROBE_MS = 1200;
+const STREAM_OPEN_TIMEOUT_MS = 8000;
 const DEFAULT_TEXT_SCALE = 0.95;
 const IMPORT_ASSISTANT_SKILL_ID = "import-assistant";
 const EMPTY_PROVIDER: ProviderStatus = { id: "unknown", label: "Loading", available: false, details: "", capabilities: [], models: [], defaultModel: undefined };
@@ -107,6 +114,14 @@ function App(): React.ReactElement {
   const selectedChatIdRef = useRef<string | null>(null);
   const appPathRef = useRef(appPathForSelection(selectedChatId, activeProjectId));
   const stopResponseRef = useRef<() => void>(() => {});
+  const attachedStreamRef = useRef<{ chatId: string; controller: AbortController } | null>(null);
+  const activeChatIdsRef = useRef<Set<string>>(new Set());
+  const streamAliveAtRef = useRef(0);
+  const transientErrorRef = useRef(false);
+  const loadedChatIdRef = useRef<string | null>(null);
+  const streamWatchdogRef = useRef<() => void>(() => {});
+  const streamWakeRef = useRef<() => void>(() => {});
+  const wakeProbeRef = useRef(0);
   const provider = state?.provider ?? EMPTY_PROVIDER;
   const chats = state?.chats ?? [];
   const allChats = useMemo(() => [...(state?.chats ?? []), ...(state?.archivedChats ?? [])], [state?.chats, state?.archivedChats]);
@@ -154,6 +169,7 @@ function App(): React.ReactElement {
   useEffect(() => { busyRef.current = busy; }, [busy]);
   useEffect(() => { selectedChatIdRef.current = selectedChatId; appPathRef.current = appPathForSelection(selectedChatId, selectedChat?.projectId ?? activeProjectId); syncAppUrl(appPathRef.current); }, [selectedChatId, selectedChat?.projectId, activeProjectId]);
   useEffect(() => { stopResponseRef.current = () => { void stopActiveResponse(); }; });
+  useEffect(() => { streamWatchdogRef.current = ensureLiveStream; streamWakeRef.current = wakeStreams; });
   useEffect(() => installBackGuard({ drawerRef, sidebarOpenRef, busyRef, stopResponseRef, currentPath: () => appPathRef.current, closeDrawer: () => setDrawer(null), closeSidebar: () => setSidebarOpen(false), toast: setToast }), []);
   useEffect(() => {
     function keyDown(event: KeyboardEvent): void {
@@ -173,7 +189,7 @@ function App(): React.ReactElement {
   });
   useEffect(() => { void registerServiceWorker(); void refreshState(); }, []);
   useEffect(() => { if (selectedChat) { markChatSeen(selectedChat.id, selectedChat.updatedAt); setActiveProjectId(selectedChat.projectId); setActiveWorkspaceId(selectedChat.workspaceId); if (selectedChat.model) setSelectedModel(selectedChat.model); setReasoningEffort(selectedChat.reasoningEffort && EFFORT_OPTIONS.includes(selectedChat.reasoningEffort) ? selectedChat.reasoningEffort : "default"); setContextTier(selectedChat.contextTier ?? "default"); } }, [selectedChat]);
-  useEffect(() => { if (!selectedChatId) { setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); return; } const controller = new AbortController(); void loadChatAndReconnect(selectedChatId, controller); return () => controller.abort(); }, [selectedChatId, apiToken]);
+  useEffect(() => { if (!selectedChatId) { loadedChatIdRef.current = null; attachedStreamRef.current?.controller.abort(); attachedStreamRef.current = null; setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); return; } const controller = new AbortController(); void loadChatAndReconnect(selectedChatId, controller); return () => controller.abort(); }, [selectedChatId, apiToken]);
   useEffect(() => {
     setShowJumpToLive(false);
     if (!selectedChatId) {
@@ -186,9 +202,19 @@ function App(): React.ReactElement {
     pendingChatScrollRef.current = { chatId: selectedChatId, state: saved };
     liveScrollRef.current = saved?.atLive ?? true;
   }, [selectedChatId, activeProjectId]);
+  useEffect(() => { activeChatIdsRef.current = new Set(state?.activeChatIds ?? []); }, [state?.activeChatIds]);
   useEffect(() => { if (!state) return; const active = new Set(state.activeChatIds); setLocalRunningChatIds((current) => current.filter((id) => active.has(id) || (busy && id === selectedChatId))); }, [state?.activeChatIds, busy, selectedChatId]);
   useEffect(() => { if (!runningChatKey) return; const id = window.setInterval(() => void refreshState(), 1200); return () => window.clearInterval(id); }, [runningChatKey, apiToken]);
   useEffect(() => { if (provider.id !== "unknown") return; const id = window.setInterval(() => void refreshState(), 1000); return () => window.clearInterval(id); }, [provider.id, apiToken]);
+  useEffect(() => {
+    const watchdog = window.setInterval(() => streamWatchdogRef.current(), STREAM_WATCHDOG_MS);
+    function wake(): void { streamWakeRef.current(); }
+    function restored(event: PageTransitionEvent): void { if (event.persisted) streamWakeRef.current(); }
+    document.addEventListener("visibilitychange", wake);
+    window.addEventListener("online", wake);
+    window.addEventListener("pageshow", restored);
+    return () => { window.clearInterval(watchdog); window.clearTimeout(wakeProbeRef.current); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); window.removeEventListener("pageshow", restored); };
+  }, []);
   useLayoutEffect(() => {
     if (!selectedChatId) return;
     const pending = pendingChatScrollRef.current;
@@ -199,7 +225,9 @@ function App(): React.ReactElement {
     }
     if (liveScrollRef.current) scrollToLive("auto");
   }, [selectedChatId, messages, streamingText, streamingActivities, pendingTurns, pendingInteractions, busy]);
-  async function refreshState(): Promise<void> { try { const next = await api<AppState>("/api/state", {}, apiToken); setLoginRequired(false); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); setError(message); } }
+  async function refreshState(): Promise<void> { try { const next = await api<AppState>("/api/state", {}, apiToken); setLoginRequired(false); clearTransientError(); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); reportTransientError(message); } }
+  function reportTransientError(message: string): void { transientErrorRef.current = true; setError(message); }
+  function clearTransientError(): void { if (!transientErrorRef.current) return; transientErrorRef.current = false; setError(null); }
   async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { saveCurrentChatScroll(); activateLiveScroll(); const projectDefaultModel = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const model = projectDefaultModel ?? selectedModelInfo?.id ?? selectedModel; const modelInfo = providerModels.find((item) => item.id === model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = choices.includes(reasoningEffort) ? reasoningEffort : "default"; const nextContextTier = modelInfo?.supportsLongContext ? contextTier : "default"; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); composerRef.current?.focus(); return chat; }
   async function renameChat(chat: Chat): Promise<void> { setDialog({ kind: "text", title: "Rename chat", label: "Chat title", initialValue: chat.title, confirmLabel: "Save title", onConfirm: async (title) => { if (!title.trim()) return; await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { title: title.trim() } }, apiToken); await refreshState(); } }); }
   async function archiveChat(chat: Chat): Promise<void> { await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { archived: true } }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Archived chat"); }
@@ -217,16 +245,52 @@ function App(): React.ReactElement {
   async function sendWhileBusy(mode: "steer" | "queue", content: string, attachments: MessageAttachment[] = []): Promise<void> { const trimmed = content.trim(); const chat = selectedChat; if ((!trimmed && attachments.length === 0) || !chat || !busy) return; setDraft(""); const pending = await api<PendingTurn>(`/api/chats/${chat.id}/active-response/input`, { method: "POST", body: { ...turnBody(trimmed, chat, selectedSkillIds, attachments), mode } }, apiToken); setPendingTurns((current) => upsertPendingTurn(current, pending)); }
   async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
-  async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> { try { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", false); } catch (e) { if ((e as Error).name === "AbortError") return; const message = toErr(e); if (message.includes("Chat not found")) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); syncAppUrl(appPathForSelection(null, activeProjectId)); await refreshState(); return; } setError(message); } }
+  async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> { try { if (loadedChatIdRef.current !== chatId) { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); } loadedChatIdRef.current = chatId; const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken); if (controller.signal.aborted) return; setMessages(loaded); if (hasLiveStream(chatId)) return; await streamChatResponse(chatId, activeResponsePath(chatId), undefined, controller, "GET", false); } catch (e) { if (isAbortError(e)) return; const message = toErr(e); if (message.includes("Chat not found")) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); syncAppUrl(appPathForSelection(null, activeProjectId)); await refreshState(); return; } setError(message); } }
   async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", notifyWhenDone = true): Promise<void> {
+    // Only one stream may own the visible chat state, otherwise racing snapshots rewind the transcript.
+    const previous = attachedStreamRef.current;
+    if (previous && previous.controller !== controller) previous.controller.abort();
+    attachedStreamRef.current = { chatId, controller };
     abortRef.current = controller;
     addRunningChat(chatId);
+    markStreamAlive();
     let completed = false;
+    let attempts = 0;
+    let target: { url: string; body: unknown; method: string } = { url, body, method };
     try {
-      for await (const event of streamSse(url, body, controller.signal, apiToken, method)) {
-        const done = await handleStreamEvent(chatId, event);
-        if (done) { completed = true; break; }
+      while (!completed) {
+        let opened = false;
+        // A suspended app can leave a pooled socket that accepts the request but never answers, so cap the connect wait.
+        const attemptController = new AbortController();
+        const abortAttempt = (): void => attemptController.abort();
+        controller.signal.addEventListener("abort", abortAttempt);
+        const openTimer = window.setTimeout(() => { if (!opened) attemptController.abort(); }, STREAM_OPEN_TIMEOUT_MS);
+        try {
+          for await (const event of streamSse(target.url, target.body, attemptController.signal, apiToken, target.method, { onOpen: () => { opened = true; window.clearTimeout(openTimer); markStreamAlive(); clearTransientError(); }, onChunk: markStreamAlive })) {
+            attempts = 0;
+            const done = await handleStreamEvent(chatId, event);
+            if (done) { completed = true; break; }
+          }
+        } catch (e) {
+          if (isFatalStreamError(e) || (isAbortError(e) && controller.signal.aborted)) throw e;
+          // A POST that never opened may never have reached the server, so retrying it could duplicate the turn.
+          if (!opened && target.method !== "GET") throw e;
+          if (attempts >= STREAM_RECONNECT_LIMIT) throw e;
+        } finally {
+          window.clearTimeout(openTimer);
+          controller.signal.removeEventListener("abort", abortAttempt);
+        }
+        if (completed) break;
+        if (controller.signal.aborted) return;
+        // The transport ended without a terminal event: the response is probably still running server-side.
+        if (attempts >= STREAM_RECONNECT_LIMIT) throw new Error("Lost the connection to this response. Reload to reconnect.");
+        target = { url: activeResponsePath(chatId), body: undefined, method: "GET" };
+        const offline = !navigator.onLine;
+        await waitBeforeReconnect(STREAM_RECONNECT_DELAYS_MS[Math.min(attempts, STREAM_RECONNECT_DELAYS_MS.length - 1)] ?? 1000, controller.signal);
+        await waitUntilOnline(controller.signal);
+        attempts = offline ? 0 : attempts + 1;
       }
+      if (controller.signal.aborted) return;
       setStreamingText("");
       setStreamingActivities([]);
       setPendingInteractions([]);
@@ -235,19 +299,51 @@ function App(): React.ReactElement {
       await refreshState();
       if (notifyWhenDone) notify("CopilotChat", "Response ready");
     } catch (e) {
-      if ((e as Error).name !== "AbortError") { removeRunningChat(chatId); setError(toErr(e)); }
+      if (!isAbortError(e)) { removeRunningChat(chatId); if (isFatalStreamError(e)) setError(toErr(e)); else reportTransientError(toErr(e)); }
     } finally {
-      if (completed || !controller.signal.aborted) removeRunningChat(chatId);
-      if (abortRef.current === controller) abortRef.current = null;
-      setBusy(false);
+      const owned = abortRef.current === controller;
+      if (completed || (owned && !controller.signal.aborted)) removeRunningChat(chatId);
+      if (attachedStreamRef.current?.controller === controller) attachedStreamRef.current = null;
+      if (owned) {
+        abortRef.current = null;
+        setBusy(false);
+      }
     }
   }
-  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> { if (event.event === "snapshot") { const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown }; setBusy(true); setStreamingText(data.text ?? ""); setStreamingActivities(readActivities(data.activities)); setPendingInteractions(readInteractions(data.interactions)); setPendingTurns(readPendingTurns(data.pendingTurns)); return false; } if (event.event === "pending") { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); return false; } if (event.event === "message") { setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); setStreamingText(""); setStreamingActivities([]); return false; } if (event.event === "interaction") { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); return false; } if (event.event === "activity") { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); return false; } if (event.event === "delta") { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); return false; } if (event.event === "artifact") { void refreshState(); setToast("Artifact created"); return false; } if (event.event === "error") throw new Error((event.data as { message?: string }).message ?? "Message failed"); if (event.event === "done") { const data = event.data as { active?: boolean; cancelled?: boolean } | undefined; if (data?.active === false) return true; if (data?.cancelled) setToast("Response stopped"); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); return true; } return false; }
+  function markStreamAlive(): void { streamAliveAtRef.current = Date.now(); }
+  function hasLiveStream(chatId: string): boolean { const attached = attachedStreamRef.current; return attached?.chatId === chatId && !attached.controller.signal.aborted; }
+  function attachToActiveResponse(chatId: string): void {
+    void streamChatResponse(chatId, activeResponsePath(chatId), undefined, new AbortController(), "GET", false);
+  }
+  function ensureLiveStream(): void {
+    const chatId = selectedChatIdRef.current;
+    if (!chatId) return;
+    if (!hasLiveStream(chatId)) { if (activeChatIdsRef.current.has(chatId)) attachToActiveResponse(chatId); return; }
+    // A frozen tab keeps a dead socket open, so treat a stream with no traffic as lost once heartbeats stop arriving.
+    if (document.visibilityState !== "visible" || Date.now() - streamAliveAtRef.current < STREAM_STALE_MS) return;
+    attachToActiveResponse(chatId);
+  }
+  function wakeStreams(): void {
+    if (document.visibilityState !== "visible") return;
+    void refreshState();
+    ensureLiveStream();
+    // Suspending the app can kill the socket without an EOF, so re-attach unless traffic resumes right after waking.
+    const wokeAt = Date.now();
+    window.clearTimeout(wakeProbeRef.current);
+    wakeProbeRef.current = window.setTimeout(() => {
+      const chatId = selectedChatIdRef.current;
+      if (document.visibilityState !== "visible" || !chatId) return;
+      if (!hasLiveStream(chatId)) { ensureLiveStream(); return; }
+      if (streamAliveAtRef.current < wokeAt) attachToActiveResponse(chatId);
+    }, STREAM_WAKE_PROBE_MS);
+  }
+  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> { if (event.event === "snapshot") { const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown }; setBusy(true); setStreamingText(data.text ?? ""); setStreamingActivities(readActivities(data.activities)); setPendingInteractions(readInteractions(data.interactions)); setPendingTurns(readPendingTurns(data.pendingTurns)); return false; } if (event.event === "pending") { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); return false; } if (event.event === "message") { setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); setStreamingText(""); setStreamingActivities([]); return false; } if (event.event === "interaction") { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); return false; } if (event.event === "activity") { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); return false; } if (event.event === "delta") { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); return false; } if (event.event === "artifact") { void refreshState(); setToast("Artifact created"); return false; } if (event.event === "error") throw new FatalStreamError((event.data as { message?: string }).message ?? "Message failed"); if (event.event === "done") { const data = event.data as { active?: boolean; cancelled?: boolean } | undefined; if (data?.active === false) return true; if (data?.cancelled) setToast("Response stopped"); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); return true; } return false; }
   async function resolveInteraction(interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }): Promise<void> { const chatId = selectedChatIdRef.current; if (!chatId) return; setPendingInteractions((current) => current.filter((item) => item.id !== interaction.id)); await api<void>(`/api/chats/${chatId}/interactions/${interaction.id}`, { method: "POST", body: resolution, raw: true }, apiToken); }
   async function stopActiveResponse(): Promise<void> {
     const chatId = selectedChatIdRef.current;
     const controller = abortRef.current;
     controller?.abort();
+    attachedStreamRef.current = null;
     try {
       if (chatId) {
         await api<void>(`/api/chats/${chatId}/active-response`, { method: "DELETE", raw: true }, apiToken);
@@ -816,8 +912,29 @@ function routeSegment(path: string, prefix: string): string | null { const segme
 function appPathForSelection(chatId: string | null, projectId: string | null): string { if (chatId) return `${CHAT_ROUTE_PREFIX}${encodeURIComponent(chatId)}`; return projectId ? `${PROJECT_ROUTE_PREFIX}${encodeURIComponent(projectId)}` : "/"; }
 function syncAppUrl(path: string): void { if (location.pathname === path) return; history.replaceState({ copilotChatBackGuard: true }, "", path); }
 async function api<T>(url:string,init:{method?:string;body?:unknown;raw?:boolean}={},token=localStorage.getItem(API_TOKEN_KEY)??""):Promise<T>{const method=init.method??"GET";const headers:Record<string,string>={};if(init.body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:init.body!==undefined?JSON.stringify(init.body):undefined});if(!res.ok)throw new Error(httpErrorMessage(res.status,await res.text()));return init.raw?undefined as T:await res.json() as T;}
-async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST"):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new Error(httpErrorMessage(res.status,await res.text()));const reader=res.body.getReader();const dec=new TextDecoder();let buf="";while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}
+async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",hooks:StreamHooks={}):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new FatalStreamError(httpErrorMessage(res.status,await res.text()));hooks.onOpen?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";try{while(true){const{done,value}=await reader.read();if(done)break;hooks.onChunk?.();buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}finally{void reader.cancel().catch(()=>undefined);}}
 function parseSse(chunk:string):SseEvent|null{const lines=chunk.split("\n");const event=lines.find(l=>l.startsWith("event:"))?.slice(6).trim();const data=lines.find(l=>l.startsWith("data:"))?.slice(5).trim();return event&&data?{event,data:JSON.parse(data) as unknown}:null;}
+class FatalStreamError extends Error { constructor(message: string) { super(message); this.name = "FatalStreamError"; } }
+function isFatalStreamError(e: unknown): boolean { return e instanceof Error && e.name === "FatalStreamError"; }
+function isAbortError(e: unknown): boolean { return e instanceof Error && e.name === "AbortError"; }
+function activeResponsePath(chatId: string): string { return `/api/chats/${chatId}/active-response`; }
+function waitBeforeReconnect(delayMs: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) { resolve(); return; }
+    const finish = (): void => { window.clearTimeout(timer); signal.removeEventListener("abort", finish); window.removeEventListener("online", finish); resolve(); };
+    const timer = window.setTimeout(finish, delayMs);
+    signal.addEventListener("abort", finish);
+    window.addEventListener("online", finish);
+  });
+}
+function waitUntilOnline(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted || navigator.onLine) { resolve(); return; }
+    const finish = (): void => { signal.removeEventListener("abort", finish); window.removeEventListener("online", finish); resolve(); };
+    signal.addEventListener("abort", finish);
+    window.addEventListener("online", finish);
+  });
+}
 function readTheme(): Theme { const saved = localStorage.getItem("copilotchat.theme"); return saved === "system" || saved === "light" || saved === "dark" ? saved : "system"; }
 function readSystemTheme(): ResolvedTheme { return window.matchMedia(SYSTEM_THEME_QUERY).matches ? "dark" : "light"; }
 function readContextTier(): ContextTier { return localStorage.getItem(CONTEXT_TIER_KEY) === "long_context" ? "long_context" : "default"; }
