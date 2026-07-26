@@ -638,6 +638,8 @@ test("a dropped stream reconnects without losing the running response", async ({
   const context = await browser.newContext();
   const page = await context.newPage();
   const streamedLength = async (): Promise<number> => (await page.locator(".msg.assistant").last().innerText()).length;
+  let messageFetches = 0;
+  page.on("request", (request) => { if (request.method() === "GET" && /\/api\/chats\/[^/]+\/messages/.test(request.url())) messageFetches += 1; });
   try {
     await page.goto("http://127.0.0.1:4529/");
     await expect(page.getByText(/Back at it/i)).toBeVisible();
@@ -648,6 +650,7 @@ test("a dropped stream reconnects without losing the running response", async ({
     const beforeDrop = await streamedLength();
 
     // Sever every open socket the way a phone does when the app is suspended.
+    messageFetches = 0;
     for (const socket of [...sockets]) socket.end();
 
     // The running turn must stay on screen instead of collapsing back to an idle chat.
@@ -655,6 +658,8 @@ test("a dropped stream reconnects without losing the running response", async ({
     await expect(page.getByPlaceholder("Steer or queue a follow-up")).toBeVisible();
     await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
     await expect.poll(streamedLength, { timeout: 20_000 }).toBeGreaterThan(beforeDrop);
+    // A turn that finished during the outage is only in the saved transcript, so reattaching has to refetch it.
+    await expect.poll(() => messageFetches, { timeout: 10_000 }).toBeGreaterThan(0);
   } finally {
     await context.close();
     await new Promise<void>((resolve) => { proxy.close(() => resolve()); });

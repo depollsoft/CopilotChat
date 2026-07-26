@@ -30,6 +30,7 @@ const STREAM_STALE_MS = 40_000;
 const STREAM_WATCHDOG_MS = 2000;
 const STREAM_WAKE_PROBE_MS = 1200;
 const STREAM_OPEN_TIMEOUT_MS = 8000;
+const STREAM_HEALTHY_MS = 20_000;
 const DEFAULT_TEXT_SCALE = 0.95;
 const IMPORT_ASSISTANT_SKILL_ID = "import-assistant";
 const EMPTY_PROVIDER: ProviderStatus = { id: "unknown", label: "Loading", available: false, details: "", capabilities: [], models: [], defaultModel: undefined };
@@ -117,10 +118,12 @@ function App(): React.ReactElement {
   const attachedStreamRef = useRef<{ chatId: string; controller: AbortController } | null>(null);
   const activeChatIdsRef = useRef<Set<string>>(new Set());
   const streamAliveAtRef = useRef(0);
-  const transientErrorRef = useRef(false);
+  const transientErrorRef = useRef<string | null>(null);
   const loadedChatIdRef = useRef<string | null>(null);
   const streamWatchdogRef = useRef<() => void>(() => {});
   const streamWakeRef = useRef<() => void>(() => {});
+  const stoppingChatIdRef = useRef<string | null>(null);
+  const notifyChatIdsRef = useRef<Set<string>>(new Set());
   const wakeProbeRef = useRef(0);
   const provider = state?.provider ?? EMPTY_PROVIDER;
   const chats = state?.chats ?? [];
@@ -226,8 +229,8 @@ function App(): React.ReactElement {
     if (liveScrollRef.current) scrollToLive("auto");
   }, [selectedChatId, messages, streamingText, streamingActivities, pendingTurns, pendingInteractions, busy]);
   async function refreshState(): Promise<void> { try { const next = await api<AppState>("/api/state", {}, apiToken); setLoginRequired(false); clearTransientError(); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); reportTransientError(message); } }
-  function reportTransientError(message: string): void { transientErrorRef.current = true; setError(message); }
-  function clearTransientError(): void { if (!transientErrorRef.current) return; transientErrorRef.current = false; setError(null); }
+  function reportTransientError(message: string): void { transientErrorRef.current = message; setError(message); }
+  function clearTransientError(): void { const shown = transientErrorRef.current; if (shown === null) return; transientErrorRef.current = null; setError((current) => current === shown ? null : current); }
   async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { saveCurrentChatScroll(); activateLiveScroll(); const projectDefaultModel = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const model = projectDefaultModel ?? selectedModelInfo?.id ?? selectedModel; const modelInfo = providerModels.find((item) => item.id === model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = choices.includes(reasoningEffort) ? reasoningEffort : "default"; const nextContextTier = modelInfo?.supportsLongContext ? contextTier : "default"; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); composerRef.current?.focus(); return chat; }
   async function renameChat(chat: Chat): Promise<void> { setDialog({ kind: "text", title: "Rename chat", label: "Chat title", initialValue: chat.title, confirmLabel: "Save title", onConfirm: async (title) => { if (!title.trim()) return; await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { title: title.trim() } }, apiToken); await refreshState(); } }); }
   async function archiveChat(chat: Chat): Promise<void> { await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { archived: true } }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Archived chat"); }
@@ -246,36 +249,48 @@ function App(): React.ReactElement {
   async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> { try { if (loadedChatIdRef.current !== chatId) { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); } loadedChatIdRef.current = chatId; const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken); if (controller.signal.aborted) return; setMessages(loaded); if (hasLiveStream(chatId)) return; await streamChatResponse(chatId, activeResponsePath(chatId), undefined, controller, "GET", false); } catch (e) { if (isAbortError(e)) return; const message = toErr(e); if (message.includes("Chat not found")) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); syncAppUrl(appPathForSelection(null, activeProjectId)); await refreshState(); return; } setError(message); } }
-  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", notifyWhenDone = true): Promise<void> {
+  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", notifyWhenDone = true, resyncMessages = false): Promise<void> {
     // Only one stream may own the visible chat state, otherwise racing snapshots rewind the transcript.
     const previous = attachedStreamRef.current;
     if (previous && previous.controller !== controller) previous.controller.abort();
     attachedStreamRef.current = { chatId, controller };
     abortRef.current = controller;
+    // A reconnect replaces the stream that was waiting to notify, so the intent lives with the chat.
+    if (notifyWhenDone) notifyChatIdsRef.current.add(chatId);
     addRunningChat(chatId);
     markStreamAlive();
     let completed = false;
     let attempts = 0;
+    let resync = resyncMessages;
     let target: { url: string; body: unknown; method: string } = { url, body, method };
     try {
       while (!completed) {
+        if (controller.signal.aborted) return;
         let opened = false;
+        let openedAt = 0;
+        let openTimedOut = false;
         // A suspended app can leave a pooled socket that accepts the request but never answers, so cap the connect wait.
         const attemptController = new AbortController();
         const abortAttempt = (): void => attemptController.abort();
         controller.signal.addEventListener("abort", abortAttempt);
-        const openTimer = window.setTimeout(() => { if (!opened) attemptController.abort(); }, STREAM_OPEN_TIMEOUT_MS);
+        const openTimer = window.setTimeout(() => { if (!opened) { openTimedOut = true; attemptController.abort(); } }, STREAM_OPEN_TIMEOUT_MS);
         try {
-          for await (const event of streamSse(target.url, target.body, attemptController.signal, apiToken, target.method, { onOpen: () => { opened = true; window.clearTimeout(openTimer); markStreamAlive(); clearTransientError(); }, onChunk: markStreamAlive })) {
-            attempts = 0;
+          // Only a connection that stays up earns a fresh retry budget, otherwise a server that snapshots
+          // and immediately drops the body would be reconnected forever at the shortest backoff.
+          const noteTraffic = (): void => { markStreamAlive(); if (attempts > 0 && Date.now() - openedAt >= STREAM_HEALTHY_MS) attempts = 0; };
+          for await (const event of streamSse(target.url, target.body, attemptController.signal, apiToken, target.method, { onOpen: () => { opened = true; openedAt = Date.now(); window.clearTimeout(openTimer); markStreamAlive(); clearTransientError(); }, onChunk: noteTraffic })) {
             const done = await handleStreamEvent(chatId, event);
             if (done) { completed = true; break; }
+            // A turn can finish while the socket is dead, and its saved message only ever arrives once,
+            // so a reattached stream has to pull the transcript back in line.
+            if (resync) { resync = false; const saved = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken); if (controller.signal.aborted) return; setMessages(saved); }
           }
         } catch (e) {
-          if (isFatalStreamError(e) || (isAbortError(e) && controller.signal.aborted)) throw e;
+          const failure = openTimedOut && isAbortError(e) && !controller.signal.aborted ? new Error("Timed out connecting to this response.") : e;
+          if (isFatalStreamError(failure) || isAbortError(failure)) throw failure;
           // A POST that never opened may never have reached the server, so retrying it could duplicate the turn.
-          if (!opened && target.method !== "GET") throw e;
-          if (attempts >= STREAM_RECONNECT_LIMIT) throw e;
+          if (!opened && target.method !== "GET") throw failure;
+          if (attempts >= STREAM_RECONNECT_LIMIT) throw failure;
         } finally {
           window.clearTimeout(openTimer);
           controller.signal.removeEventListener("abort", abortAttempt);
@@ -285,9 +300,11 @@ function App(): React.ReactElement {
         // The transport ended without a terminal event: the response is probably still running server-side.
         if (attempts >= STREAM_RECONNECT_LIMIT) throw new Error("Lost the connection to this response. Reload to reconnect.");
         target = { url: activeResponsePath(chatId), body: undefined, method: "GET" };
+        resync = true;
         const offline = !navigator.onLine;
         await waitBeforeReconnect(STREAM_RECONNECT_DELAYS_MS[Math.min(attempts, STREAM_RECONNECT_DELAYS_MS.length - 1)] ?? 1000, controller.signal);
         await waitUntilOnline(controller.signal);
+        if (controller.signal.aborted) return;
         attempts = offline ? 0 : attempts + 1;
       }
       if (controller.signal.aborted) return;
@@ -297,11 +314,14 @@ function App(): React.ReactElement {
       setPendingTurns([]);
       setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
       await refreshState();
-      if (notifyWhenDone) notify("CopilotChat", "Response ready");
+      if (notifyChatIdsRef.current.delete(chatId) || notifyWhenDone) notify("CopilotChat", "Response ready");
     } catch (e) {
-      if (!isAbortError(e)) { removeRunningChat(chatId); if (isFatalStreamError(e)) setError(toErr(e)); else reportTransientError(toErr(e)); }
+      // Only a cancelled stream is silent; a connect timeout still has to reach the user.
+      if (!(isAbortError(e) && controller.signal.aborted)) { removeRunningChat(chatId); if (isFatalStreamError(e)) setError(toErr(e)); else reportTransientError(toErr(e)); }
     } finally {
       const owned = abortRef.current === controller;
+      // A state poll in flight during completion can still list this chat, so do not let the watchdog re-attach.
+      if (completed) activeChatIdsRef.current.delete(chatId);
       if (completed || (owned && !controller.signal.aborted)) removeRunningChat(chatId);
       if (attachedStreamRef.current?.controller === controller) attachedStreamRef.current = null;
       if (owned) {
@@ -313,11 +333,11 @@ function App(): React.ReactElement {
   function markStreamAlive(): void { streamAliveAtRef.current = Date.now(); }
   function hasLiveStream(chatId: string): boolean { const attached = attachedStreamRef.current; return attached?.chatId === chatId && !attached.controller.signal.aborted; }
   function attachToActiveResponse(chatId: string): void {
-    void streamChatResponse(chatId, activeResponsePath(chatId), undefined, new AbortController(), "GET", false);
+    void streamChatResponse(chatId, activeResponsePath(chatId), undefined, new AbortController(), "GET", false, true);
   }
   function ensureLiveStream(): void {
     const chatId = selectedChatIdRef.current;
-    if (!chatId) return;
+    if (!chatId || stoppingChatIdRef.current === chatId) return;
     if (!hasLiveStream(chatId)) { if (activeChatIdsRef.current.has(chatId)) attachToActiveResponse(chatId); return; }
     // A frozen tab keeps a dead socket open, so treat a stream with no traffic as lost once heartbeats stop arriving.
     if (document.visibilityState !== "visible" || Date.now() - streamAliveAtRef.current < STREAM_STALE_MS) return;
@@ -342,8 +362,10 @@ function App(): React.ReactElement {
   async function stopActiveResponse(): Promise<void> {
     const chatId = selectedChatIdRef.current;
     const controller = abortRef.current;
+    stoppingChatIdRef.current = chatId;
+    if (chatId) notifyChatIdsRef.current.delete(chatId);
     controller?.abort();
-    attachedStreamRef.current = null;
+    if (attachedStreamRef.current?.controller === controller) attachedStreamRef.current = null;
     try {
       if (chatId) {
         await api<void>(`/api/chats/${chatId}/active-response`, { method: "DELETE", raw: true }, apiToken);
@@ -353,12 +375,16 @@ function App(): React.ReactElement {
     } catch (e) {
       setError(toErr(e));
     } finally {
+      stoppingChatIdRef.current = null;
       if (abortRef.current === controller) abortRef.current = null;
-      setBusy(false);
-      setStreamingText("");
-      setStreamingActivities([]);
-      setPendingInteractions([]);
-      setPendingTurns([]);
+      // A newer stream may have taken over while the cancel was in flight; its state must survive.
+      if (attachedStreamRef.current === null) {
+        setBusy(false);
+        setStreamingText("");
+        setStreamingActivities([]);
+        setPendingInteractions([]);
+        setPendingTurns([]);
+      }
     }
   }
   function turnBody(content: string, chat: Chat, skillIds = selectedSkillIds, attachments: MessageAttachment[] = [], chatSettings?: Chat): Record<string, unknown> { return { content, attachments, projectId: chat.projectId, workspaceId: chat.workspaceId ?? activeWorkspaceId, skillIds, model: chatSettings?.model ?? selectedModel, reasoningEffort: chatSettings?.reasoningEffort ?? reasoningEffort, contextTier: chatSettings?.contextTier ?? contextTier, permissionMode }; }
