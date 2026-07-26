@@ -8,7 +8,7 @@ import fastifyStatic from "@fastify/static";
 import { previewImportPayload } from "@copilotchat/importers";
 import { createCopilotProvider } from "@copilotchat/provider";
 import type { ProviderChatRequest } from "@copilotchat/provider";
-import { activeResponseInputRequestSchema, apiPrefix, createArtifactRequestSchema, createChatRequestSchema, createProjectChatReferenceRequestSchema, createProjectReferenceRequestSchema, createProjectRequestSchema, editMessageRequestSchema, importPreviewRequestSchema, permissionModeSchema, registerWorkspaceRequestSchema, runWorkspaceCommandRequestSchema, sendMessageRequestSchema, skillManifestSchema, titleFromContent, updateArtifactRequestSchema, updateChatRequestSchema, updateMcpServerRequestSchema, updateProjectReferenceRequestSchema, updateProjectRequestSchema, updateSkillRequestSchema, updateWorkspaceRequestSchema } from "@copilotchat/shared";
+import { activeResponseInputRequestSchema, apiPrefix, createArtifactRequestSchema, createChatRequestSchema, createMemoryRequestSchema, createProjectChatReferenceRequestSchema, createProjectReferenceRequestSchema, createProjectRequestSchema, editMessageRequestSchema, importPreviewRequestSchema, permissionModeSchema, registerWorkspaceRequestSchema, runWorkspaceCommandRequestSchema, sendMessageRequestSchema, skillManifestSchema, titleFromContent, updateArtifactRequestSchema, updateChatRequestSchema, updateMcpServerRequestSchema, updateMemoryRequestSchema, updateProjectReferenceRequestSchema, updateProjectRequestSchema, updateSkillRequestSchema, updateUserContextRequestSchema, updateWorkspaceRequestSchema } from "@copilotchat/shared";
 import type { Chat, ChatMessage, ImportPreview, Owner, ProviderStatus, SendMessageRequest } from "@copilotchat/shared";
 import Fastify from "fastify";
 import type { FastifyRequest } from "fastify";
@@ -224,15 +224,20 @@ app.delete(`${apiPrefix}/data`, async (request, reply) => {
   }
   return { ok: true };
 });
+app.patch(`${apiPrefix}/user-context`, async (request) => { const owner = ownerFor(request); const input = updateUserContextRequestSchema.parse(request.body); if (db.userContextWouldChange(owner.id, input)) cancelOwnerContextResponses(owner.id); return db.updateUserContext(owner.id, input); });
+app.get(`${apiPrefix}/memories`, async (request) => { const owner = ownerFor(request); const query = z.object({ projectId: z.string().min(1).optional(), offset: z.coerce.number().int().nonnegative().default(0), limit: z.coerce.number().int().min(1).max(50).default(20) }).parse(request.query); return db.listMemoriesPage(owner.id, query.projectId ?? null, query.offset, query.limit); });
+app.post(`${apiPrefix}/memories`, async (request) => { const owner = ownerFor(request); const input = createMemoryRequestSchema.parse(request.body); if (input.projectId) db.getProject(owner.id, input.projectId); cancelScopedContextResponses(owner.id, input.projectId ?? null); return db.createMemory(owner.id, input); });
+app.patch(`${apiPrefix}/memories/:memoryId`, async (request) => { const owner = ownerFor(request); const params = z.object({ memoryId: z.string() }).parse(request.params); const memory = db.getMemory(owner.id, params.memoryId); const input = updateMemoryRequestSchema.parse(request.body); cancelScopedContextResponses(owner.id, memory.projectId); return db.updateMemory(owner.id, params.memoryId, input); });
+app.delete(`${apiPrefix}/memories/:memoryId`, async (request) => { const owner = ownerFor(request); const params = z.object({ memoryId: z.string() }).parse(request.params); const memory = db.getMemory(owner.id, params.memoryId); cancelScopedContextResponses(owner.id, memory.projectId); db.deleteMemory(owner.id, params.memoryId); return { ok: true }; });
 app.post(`${apiPrefix}/projects`, async (request) => db.createProject(ownerFor(request).id, createProjectRequestSchema.parse(request.body)));
-app.patch(`${apiPrefix}/projects/:projectId`, async (request) => { const owner = ownerFor(request); const params = z.object({ projectId: z.string() }).parse(request.params); return db.updateProject(owner.id, params.projectId, updateProjectRequestSchema.parse(request.body)); });
-app.delete(`${apiPrefix}/projects/:projectId`, async (request) => { const owner = ownerFor(request); const params = z.object({ projectId: z.string() }).parse(request.params); db.deleteProject(owner.id, params.projectId); return { ok: true }; });
+app.patch(`${apiPrefix}/projects/:projectId`, async (request) => { const owner = ownerFor(request); const params = z.object({ projectId: z.string() }).parse(request.params); const input = updateProjectRequestSchema.parse(request.body); db.getProject(owner.id, params.projectId); if (input.instructions !== undefined || input.memory !== undefined || input.defaultModel !== undefined) cancelProjectContextResponses(owner.id, params.projectId); return db.updateProject(owner.id, params.projectId, input); });
+app.delete(`${apiPrefix}/projects/:projectId`, async (request) => { const owner = ownerFor(request); const params = z.object({ projectId: z.string() }).parse(request.params); db.getProject(owner.id, params.projectId); cancelProjectContextResponses(owner.id, params.projectId); db.deleteProject(owner.id, params.projectId); return { ok: true }; });
 app.get(`${apiPrefix}/projects/:projectId/search`, async (request) => { const owner = ownerFor(request); const params = z.object({ projectId: z.string() }).parse(request.params); const query = z.object({ q: z.string().default("") }).parse(request.query); return db.searchProjectMessages(owner.id, params.projectId, query.q); });
-app.post(`${apiPrefix}/project-references`, async (request) => { const owner = ownerFor(request); return db.createProjectReference(owner.id, createProjectReferenceRequestSchema.parse(request.body)); });
-app.patch(`${apiPrefix}/project-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); return db.updateProjectReference(owner.id, params.referenceId, updateProjectReferenceRequestSchema.parse(request.body)); });
-app.delete(`${apiPrefix}/project-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); db.deleteProjectReference(owner.id, params.referenceId); return { ok: true }; });
-app.post(`${apiPrefix}/project-chat-references`, async (request) => { const owner = ownerFor(request); return db.createProjectChatReference(owner.id, createProjectChatReferenceRequestSchema.parse(request.body)); });
-app.delete(`${apiPrefix}/project-chat-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); db.deleteProjectChatReference(owner.id, params.referenceId); return { ok: true }; });
+app.post(`${apiPrefix}/project-references`, async (request) => { const owner = ownerFor(request); const input = createProjectReferenceRequestSchema.parse(request.body); db.getProject(owner.id, input.projectId); cancelProjectContextResponses(owner.id, input.projectId); return db.createProjectReference(owner.id, input); });
+app.patch(`${apiPrefix}/project-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); const reference = projectReferenceForOwner(owner.id, params.referenceId); const input = updateProjectReferenceRequestSchema.parse(request.body); cancelProjectContextResponses(owner.id, reference.projectId); return db.updateProjectReference(owner.id, params.referenceId, input); });
+app.delete(`${apiPrefix}/project-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); const reference = projectReferenceForOwner(owner.id, params.referenceId); cancelProjectContextResponses(owner.id, reference.projectId); db.deleteProjectReference(owner.id, params.referenceId); return { ok: true }; });
+app.post(`${apiPrefix}/project-chat-references`, async (request) => { const owner = ownerFor(request); const input = createProjectChatReferenceRequestSchema.parse(request.body); db.getProject(owner.id, input.projectId); cancelProjectContextResponses(owner.id, input.projectId); return db.createProjectChatReference(owner.id, input); });
+app.delete(`${apiPrefix}/project-chat-references/:referenceId`, async (request) => { const owner = ownerFor(request); const params = z.object({ referenceId: z.string() }).parse(request.params); const reference = projectChatReferenceForOwner(owner.id, params.referenceId); cancelProjectContextResponses(owner.id, reference.projectId); db.deleteProjectChatReference(owner.id, params.referenceId); return { ok: true }; });
 app.post(`${apiPrefix}/chats`, async (request) => db.createChat(ownerFor(request).id, createChatRequestSchema.parse(request.body)));
 app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerFor(request); const query = z.object({ except: z.string().optional() }).parse(request.query); const chats = db.listChats(owner.id); const filesByChat = new Map(chats.map((chat) => [chat.id, chatFiles(owner.id, chat)])); const deletedChatIds = db.deleteEmptyChats(owner.id, query.except ?? null); await Promise.all(deletedChatIds.flatMap((chatId) => filesByChat.get(chatId) ?? []).map(async (target) => { forgetValidatedAttachmentTree(target); await fs.promises.rm(target, { recursive: true, force: true }); })); return { deletedChatIds }; });
 app.patch(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); return db.updateChat(owner.id, params.chatId, updateChatRequestSchema.parse(request.body)); });
@@ -517,6 +522,26 @@ function publicOrigin(request: FastifyRequest): string {
 }
 function validateMcpTransportForMode(transport: "stdio" | "http" | "sse"): void {
   if (config.authMode === "github" && transport === "stdio") throw new Error("stdio MCP servers are disabled in GitHub auth mode.");
+}
+function cancelOwnerContextResponses(ownerId: string): void {
+  for (const chat of [...db.listChats(ownerId), ...db.listArchivedChats(ownerId)]) activeResponses.cancel(chat.id);
+}
+function cancelProjectContextResponses(ownerId: string, projectId: string): void {
+  for (const chat of [...db.listChats(ownerId), ...db.listArchivedChats(ownerId)]) if (chat.projectId === projectId) activeResponses.cancel(chat.id);
+}
+function cancelScopedContextResponses(ownerId: string, projectId: string | null): void {
+  if (projectId) cancelProjectContextResponses(ownerId, projectId);
+  else cancelOwnerContextResponses(ownerId);
+}
+function projectReferenceForOwner(ownerId: string, referenceId: string) {
+  const reference = db.listProjectReferences(ownerId).find((item) => item.id === referenceId);
+  if (!reference) throw new Error("Project reference not found.");
+  return reference;
+}
+function projectChatReferenceForOwner(ownerId: string, referenceId: string) {
+  const reference = db.listProjectChatReferences(ownerId).find((item) => item.id === referenceId);
+  if (!reference) throw new Error("Project chat reference not found.");
+  return reference;
 }
 function createConfiguredProvider(gitHubToken?: string) {
   return createCopilotProvider({ provider: config.copilotProvider, apiBaseUrl: config.copilotApiBaseUrl, apiToken: config.copilotApiToken, model: config.copilotModel, cliCommand: config.copilotCliCommand, sdkCliPath: config.copilotSdkCliPath, gitHubToken });

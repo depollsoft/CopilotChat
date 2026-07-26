@@ -4,6 +4,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
+  workers: 1,
   reporter: [["list"], ["html", { open: "never" }]],
   use: { baseURL: "http://127.0.0.1:4528", trace: "retain-on-failure", screenshot: "only-on-failure" },
   webServer: { command: "rm -rf .data/e2e && pnpm build && COPILOT_PROVIDER=echo COPILOTCHAT_DATA_DIR=.data/e2e COPILOTCHAT_HOST=127.0.0.1 COPILOTCHAT_PORT=4528 node apps/server/dist/index.js", url: "http://127.0.0.1:4528/api/health", reuseExistingServer: !process.env.CI, timeout: 120_000 },

@@ -30,7 +30,7 @@ test("core app flows work end to end", async ({ page }, testInfo) => {
   await page.getByRole("button", { name: "Save changes" }).click();
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
-  await page.getByRole("button", { name: "Manage" }).click();
+  await page.getByRole("button", { name: "Manage", exact: true }).click();
   await page.getByRole("button", { name: "New skill" }).click();
   await page.getByLabel("Skill name").fill(`Skill ${testInfo.project.name}`);
   await page.getByLabel("Short description").fill("E2E skill");
@@ -293,9 +293,18 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.locator(".project-summary-card.editable").filter({ hasText: "Custom instructions" }).click();
   await page.getByRole("dialog", { name: "Edit custom instructions" }).getByLabel("Project context editor").fill("Landing instructions.");
   await page.getByRole("button", { name: "Save changes" }).click();
-  await page.locator(".project-summary-card.editable").filter({ hasText: "Memory" }).click();
-  await page.getByRole("dialog", { name: "Edit memory" }).getByLabel("Project context editor").fill("Landing memory.");
-  await page.getByRole("button", { name: "Save changes" }).click();
+  await page.locator(".project-summary-card.editable").filter({ hasText: "Memories" }).click();
+  const contextDrawer = page.getByRole("dialog", { name: "Personal context" });
+  await expect(contextDrawer.getByLabel("Memory scope")).toHaveValue(/.+/);
+  await contextDrawer.getByLabel("Shared project note").fill("Landing memory.");
+  await contextDrawer.getByLabel("Title").fill("Landing decision");
+  await contextDrawer.getByLabel("What should CopilotChat remember?").fill("Prefer the landing deployment plan.");
+  await contextDrawer.getByRole("button", { name: "Save project note" }).click();
+  await expect(contextDrawer.getByLabel("Title")).toHaveValue("Landing decision");
+  await expect(contextDrawer.getByLabel("What should CopilotChat remember?")).toHaveValue("Prefer the landing deployment plan.");
+  await contextDrawer.getByRole("button", { name: "Add memory" }).click();
+  await expect(contextDrawer.getByText("Landing decision")).toBeVisible();
+  await contextDrawer.getByRole("button", { name: "Close" }).click();
   await page.getByRole("button", { name: "Add reference" }).click();
   await page.getByRole("dialog", { name: "Add reference material" }).getByLabel("Reference title").fill("Landing reference");
   await page.getByRole("dialog", { name: "Add reference material" }).getByLabel("Project context editor").fill("Landing reference material.");
@@ -306,6 +315,8 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "gpt-5-mini" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Project context: Project instructions: Landing instructions." }).last()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Shared project memory: Landing memory." }).last()).toBeVisible();
+  await expect(page.locator(".msg.assistant .msg-body").filter({ hasText: "Landing decision" }).last()).toBeVisible();
   await page.getByRole("button", { name: "More actions" }).click();
   await page.getByRole("menu", { name: "Header actions menu" }).getByRole("button", { name: "Star chat" }).click();
   await page.getByRole("button", { name: "More actions" }).click();
@@ -319,6 +330,297 @@ test("project navigation shows editable context and project chats", async ({ pag
   await page.locator(".sidebar-row").filter({ hasText: "General" }).click();
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByText(/Back at it/i)).toBeVisible();
+});
+
+test("personal context and coarse location are included in chats", async ({ page, context }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers personal context management.");
+  await context.grantPermissions(["geolocation"]);
+  await context.setGeolocation({ latitude: 47.60621, longitude: -122.33207 });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  const profile = "I am a staff engineer who prefers concise TypeScript examples.";
+  await drawer.getByLabel("About you").fill(profile);
+  const coarseLocation = drawer.getByRole("radio", { name: /^Coarse/ });
+  await coarseLocation.click();
+  await expect(coarseLocation).toHaveAttribute("aria-checked", "true");
+  await drawer.getByRole("button", { name: "Save current location" }).click();
+  await expect(drawer.getByLabel("About you")).toHaveValue(profile);
+  const fineLocation = drawer.getByRole("radio", { name: /^Fine/ });
+  await fineLocation.click();
+  await drawer.getByRole("button", { name: "Save profile" }).click();
+  await expect(fineLocation).toHaveAttribute("aria-checked", "true");
+  await coarseLocation.click();
+  await expect(drawer.locator(".location-summary")).toContainText("47.6, -122.3");
+  await drawer.getByLabel("Title").fill("Response style");
+  await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
+  await drawer.getByRole("button", { name: "Add memory" }).click();
+  let memoryCard = drawer.locator(".memory-card").filter({ hasText: "Response style" });
+  await expect(memoryCard).toBeVisible();
+  const serializedState = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/state")).json()));
+  expect(serializedState).not.toContain("Lead with the recommendation.");
+  await memoryCard.getByRole("button", { name: "Edit" }).click();
+  const memoryEditor = drawer.locator(".memory-card.memory-editor");
+  await memoryEditor.getByLabel("Title").fill("Updated response style");
+  await memoryEditor.getByLabel("Memory").fill("Lead with the edited recommendation.");
+  await memoryEditor.getByRole("button", { name: "Save changes" }).click();
+  memoryCard = drawer.locator(".memory-card").filter({ hasText: "Updated response style" });
+  await expect(memoryCard).toContainText("Lead with the edited recommendation.");
+  await memoryCard.getByRole("button", { name: "Pause" }).click();
+  await expect(memoryCard.getByText("Paused", { exact: true })).toBeVisible();
+  await drawer.getByRole("button", { name: "Close" }).click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check paused personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  let response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("Personal context: Profile supplied by the user: I am a staff engineer", { timeout: 15000 });
+  await expect(response).toContainText("Location shared by the user (coarse): 47.6, -122.3");
+  await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Include" }).click();
+  await expect(memoryCard.getByText("Included", { exact: true })).toBeVisible();
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check included personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").last();
+  await expect(response).toContainText("Updated response style", { timeout: 15000 });
+
+  await page.locator(".sidebar-footer-user").click();
+  memoryCard = page.getByRole("dialog", { name: "Personal context" }).locator(".memory-card").filter({ hasText: "Updated response style" });
+  await memoryCard.getByRole("button", { name: "Delete", exact: true }).click();
+  await memoryCard.getByRole("button", { name: "Confirm delete" }).click();
+  await expect(page.getByRole("dialog", { name: "Personal context" }).getByText("Updated response style")).toHaveCount(0);
+  await page.getByRole("dialog", { name: "Personal context" }).getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check deleted personal context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check deleted personal context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
+  await expect(response).not.toContainText("Updated response style");
+
+  await page.locator(".sidebar-footer-user").click();
+  const locationDrawer = page.getByRole("dialog", { name: "Personal context" });
+  const offLocation = locationDrawer.getByRole("radio", { name: /^Off/ });
+  await offLocation.click();
+  await locationDrawer.getByRole("button", { name: "Turn off location" }).click();
+  await expect(locationDrawer.locator(".location-summary")).toContainText("No location saved.");
+  await expect(offLocation).toHaveAttribute("aria-checked", "true");
+  await expect(locationDrawer.getByRole("button", { name: "Turn off location" })).toBeDisabled();
+  await locationDrawer.getByRole("button", { name: "Close" }).click();
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Check disabled location context.");
+  await page.getByRole("button", { name: "Send" }).click();
+  response = page.locator(".msg.assistant .msg-body").filter({ hasText: "You said: Check disabled location context." }).last();
+  await expect(response).toBeVisible({ timeout: 15000 });
+  await expect(response).not.toContainText("Location shared by the user");
+  await expect(response).not.toContainText("47.6, -122.3");
+});
+
+test("no-op user context updates preserve active responses", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers active response context mutations.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const baseline = { profile: "No-op context baseline", locationLevel: "off", location: null };
+  await request.patch("/api/user-context", { headers, data: baseline });
+  await page.goto("/");
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`No-op context response ${"keep streaming ".repeat(1200)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  const chatId = page.url().split("/").pop() ?? "";
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+  const noOpResponse = await request.patch("/api/user-context", { headers, data: baseline });
+  expect(noOpResponse.ok()).toBe(true);
+  await expect.poll(async () => {
+    const state = await (await request.get("/api/state")).json() as { activeChatIds: string[] };
+    return state.activeChatIds.includes(chatId);
+  }).toBe(true);
+
+  const changedResponse = await request.patch("/api/user-context", { headers, data: { ...baseline, profile: "Changed context baseline" } });
+  expect(changedResponse.ok()).toBe(true);
+  await expect.poll(async () => {
+    const state = await (await request.get("/api/state")).json() as { activeChatIds: string[] };
+    return state.activeChatIds.includes(chatId);
+  }).toBe(false);
+});
+
+test("stale memory pages cannot cross scopes", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectAResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope A", description: "", instructions: "", memory: "" } });
+  const projectBResponse = await request.post("/api/projects", { headers, data: { name: "Memory scope B", description: "", instructions: "", memory: "" } });
+  const projectA = await projectAResponse.json() as { id: string };
+  const projectB = await projectBResponse.json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: "Delayed A memory", content: "Must never appear in scope B.", enabled: true } });
+  for (let index = 1; index <= 20; index += 1) await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: `Recent A memory ${index}`, content: `A ${index}`, enabled: true } });
+  await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Only B memory", content: "Belongs to scope B.", enabled: true } });
+  let releasePage!: () => void;
+  let markRequested!: () => void;
+  const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+  const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20") {
+      markRequested();
+      await pageGate;
+      await route.continue();
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(projectA.id);
+  await expect(drawer.getByText("Recent A memory 20")).toBeVisible();
+  const delayedResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/memories" && url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20";
+  });
+  await drawer.getByRole("button", { name: /Load more/ }).click();
+  await pageRequested;
+  await drawer.getByLabel("Memory scope").selectOption(projectB.id);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
+  releasePage();
+  const delayedResponse = await delayedResponsePromise;
+  await delayedResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(drawer.getByText("Delayed A memory")).toHaveCount(0);
+  await expect(drawer.getByText("Only B memory")).toBeVisible();
+});
+
+test("stale memory pages cannot overwrite same-scope reloads", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectResponse = await request.post("/api/projects", { headers, data: { name: "Memory reload scope", description: "", instructions: "", memory: "" } });
+  const project = await projectResponse.json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Delayed reload memory", content: "Must not return after reload.", enabled: true } });
+  for (let index = 1; index <= 20; index += 1) await request.post("/api/memories", { headers, data: { projectId: project.id, title: `Reload memory ${index}`, content: `Reload ${index}`, enabled: true } });
+  let releasePage!: () => void;
+  let markRequested!: () => void;
+  const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+  const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") === project.id && url.searchParams.get("offset") === "20") {
+      markRequested();
+      await pageGate;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(project.id);
+  const visibleMemory = drawer.locator(".memory-card").filter({ hasText: "Reload memory 20" });
+  await expect(visibleMemory).toBeVisible();
+  const delayedResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/memories" && url.searchParams.get("projectId") === project.id && url.searchParams.get("offset") === "20";
+  });
+  await drawer.getByRole("button", { name: /Load more/ }).click();
+  await pageRequested;
+  await visibleMemory.getByRole("button", { name: "Pause" }).click();
+  await expect(visibleMemory.getByText("Paused", { exact: true })).toBeVisible();
+  releasePage();
+  const delayedResponse = await delayedResponsePromise;
+  await delayedResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(drawer.getByText("Delayed reload memory")).toHaveCount(0);
+  await expect(visibleMemory.getByText("Paused", { exact: true })).toBeVisible();
+});
+
+test("stale memory mutations cannot invalidate a new scope load", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers memory mutation races.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectA = await (await request.post("/api/projects", { headers, data: { name: "Mutation scope A", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  const projectB = await (await request.post("/api/projects", { headers, data: { name: "Mutation scope B", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  const memoryA = await (await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: "Mutation A memory", content: "A", enabled: true } })).json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Mutation B memory", content: "B", enabled: true } });
+  let releaseMutation!: () => void;
+  let markRequested!: () => void;
+  const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+  const mutationRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  await page.route(`**/api/memories/${memoryA.id}`, async (route) => {
+    if (route.request().method() === "PATCH") {
+      markRequested();
+      await mutationGate;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  const scopeSelect = drawer.getByLabel("Memory scope");
+  await scopeSelect.selectOption(projectA.id);
+  const memoryCardA = drawer.locator(".memory-card").filter({ hasText: "Mutation A memory" });
+  await expect(memoryCardA).toBeVisible();
+  const mutationResponsePromise = page.waitForResponse((response) => response.url().endsWith(`/api/memories/${memoryA.id}`) && response.request().method() === "PATCH");
+  await memoryCardA.getByRole("button", { name: "Pause" }).click();
+  await mutationRequested;
+  await scopeSelect.selectOption(projectB.id);
+  await expect(drawer.getByText("Mutation B memory")).toBeVisible();
+  releaseMutation();
+  const mutationResponse = await mutationResponsePromise;
+  await mutationResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(scopeSelect).toHaveValue(projectB.id);
+  await expect(drawer.getByText("Mutation B memory")).toBeVisible();
+  await expect(drawer.getByText("Loading memories…")).toHaveCount(0);
+  await expect(drawer.getByText("Mutation A memory")).toHaveCount(0);
+});
+
+test("superseded memory reload errors stay hidden", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers overlapping memory mutations.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const project = await (await request.post("/api/projects", { headers, data: { name: "Overlapping mutation scope", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Overlap memory A", content: "A", enabled: true } });
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Overlap memory B", content: "B", enabled: true } });
+  let memoryPageRequests = 0;
+  let releaseStaleReload!: () => void;
+  let markStaleReload!: () => void;
+  const staleReloadGate = new Promise<void>((resolve) => { releaseStaleReload = resolve; });
+  const staleReloadRequested = new Promise<void>((resolve) => { markStaleReload = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") !== project.id || url.searchParams.get("offset") !== "0") {
+      await route.continue();
+      return;
+    }
+    memoryPageRequests += 1;
+    if (memoryPageRequests === 2) {
+      markStaleReload();
+      await staleReloadGate;
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "stale reload failure" }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(project.id);
+  const memoryA = drawer.locator(".memory-card").filter({ hasText: "Overlap memory A" });
+  const memoryB = drawer.locator(".memory-card").filter({ hasText: "Overlap memory B" });
+  await expect(memoryA).toBeVisible();
+  await expect(memoryB).toBeVisible();
+  await memoryA.getByRole("button", { name: "Pause" }).click();
+  await staleReloadRequested;
+  await memoryB.getByRole("button", { name: "Pause" }).click();
+  await expect(memoryA.getByText("Paused", { exact: true })).toBeVisible();
+  await expect(memoryB.getByText("Paused", { exact: true })).toBeVisible();
+  const staleResponsePromise = page.waitForResponse((response) => response.status() === 500 && response.url().includes("/api/memories?"));
+  releaseStaleReload();
+  await staleResponsePromise;
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(drawer.locator(".field-error")).toHaveCount(0);
+  await expect(drawer.getByText("Loading memories…")).toHaveCount(0);
 });
 
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
@@ -672,8 +974,33 @@ test("assistant can auto-title chats until the user renames them", async ({ page
   await expect(page.locator(".sidebar-row-title").filter({ hasText: "completely different topic" })).toHaveCount(0);
 });
 
-test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {
+test("chat header reports AI credit usage as it accumulates", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers the header usage readout.");
   await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const usagePill = page.locator(".usage-pill");
+  await expect(usagePill).toHaveCount(0);
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("First note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
+  await expect(usagePill).toHaveText("0.43 AIC");
+  await expect(page.locator(".msg.assistant .msg-usage").last()).toHaveText("0.43 AIC");
+  await usagePill.click();
+  const details = page.getByRole("dialog", { name: "AI credit usage" });
+  await expect(details).toContainText("0.43 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
+  await page.keyboard.press("Escape");
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Second note about credits.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(usagePill).toHaveText("0.86 AIC", { timeout: 15000 });
+  await page.reload();
+  await expect(usagePill).toHaveText("0.86 AIC");
+  await usagePill.click();
+  await expect(details).toContainText("0.86 AIC used in this chat.");
+  await expect(details).toContainText("0.43 AIC in the latest response.");
+});
+
+test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {  await page.goto("/");
   await expect(page.getByText(/Back at it/i)).toBeVisible();
   if (testInfo.project.name === "desktop") {
     await page.locator(".sidebar-new").click();
@@ -1002,6 +1329,8 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
   await subagent.locator("summary").first().click();
   await expect(subagent).toContainText("Inspect project context");
   await expect(subagent).toContainText("Found shared project context");
+  await expect(subagent.locator(".subagent-usage")).toHaveText("0.08 AIC used by this subagent");
+  await expect(subagent.locator(".subagent-detail")).not.toContainText("nanoAiu");
   await expect(subagent.locator(".activity-card.reasoning")).toContainText("Thinking");
   await expect(subagent.locator(".activity-card.tool > summary")).toContainText("context.search");
   await subagent.locator(".activity-card.tool > summary").click();

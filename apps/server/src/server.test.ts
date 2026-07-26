@@ -166,6 +166,104 @@ describe("chat provider context", () => {
     expect(request.sessionId).not.toBe("old-session");
   });
 
+  it("injects profile, consented location, and scoped memories into chat context", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Context project", description: null, instructions: "Use project rules." });
+    db.updateUserContext(owner.id, {
+      profile: "I am a staff engineer who prefers concise TypeScript examples.",
+      locationLevel: "coarse",
+      location: { latitude: 47.60621, longitude: -122.33207, accuracy: 25, capturedAt: "2026-07-24T08:00:00.000Z", precision: "coarse" },
+    });
+    db.createMemory(owner.id, { projectId: null, title: "Response style", content: "Lead with the recommendation.", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Deployment target", content: "Deploy to the edge runtime.", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Old decision", content: "Use the retired runtime.", enabled: false });
+    const chat = db.createChat(owner.id, { title: "Context chat", projectId: project.id, workspaceId: null });
+    db.addMessage({ chatId: chat.id, role: "user", content: "What should we do?" });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "What should we do?", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.userContext).toContain("staff engineer");
+    expect(request.userContext).toContain("47.6, -122.3");
+    expect(request.userContext).toContain("Response style");
+    expect(request.projectContext).toContain("Deployment target");
+    expect(request.projectContext).not.toContain("Old decision");
+    expect(db.getUserContext(owner.id).location).toMatchObject({ latitude: 47.6, longitude: -122.3, accuracy: 10_000, precision: "coarse" });
+  });
+
+  it("does not invalidate provider sessions for no-op user context updates", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "No-op context", projectId: null, workspaceId: null });
+    db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "active-session", providerSessionWorkspacePath: "/tmp/active" });
+    const contextBefore = db.getUserContext(owner.id);
+    const input = { locationLevel: "off" as const, location: null };
+
+    expect(db.userContextWouldChange(owner.id, input)).toBe(false);
+    const contextAfter = db.updateUserContext(owner.id, input);
+
+    expect(contextAfter.updatedAt).toBe(contextBefore.updatedAt);
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ providerSessionId: "active-session", providerSessionWorkspacePath: "/tmp/active" });
+    expect(db.userContextWouldChange(owner.id, { profile: "Changed" })).toBe(true);
+  });
+
+  it("bounds enabled memory context and reports omitted content", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    db.createMemory(owner.id, { projectId: null, title: "Paused oversized memory", content: "paused-marker".repeat(2_000), enabled: false });
+    for (let index = 0; index < 105; index += 1) db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}`.repeat(200), enabled: true });
+    const chat = db.createChat(owner.id, { title: "Bounded context", projectId: null, workspaceId: null });
+    db.addMessage({ chatId: chat.id, role: "user", content: "Use bounded context" });
+
+    const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Use bounded context", skillIds: [] }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
+
+    expect(request.userContext?.length).toBeLessThanOrEqual(16_000);
+    expect(request.userContext).toContain("Memory context limited to 16000 characters");
+    expect(request.userContext).toContain("memories omitted");
+    expect(request.userContext).not.toContain("paused-marker");
+  });
+
+  it("invalidates provider sessions when user or scoped memory context changes", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Scoped context", description: null, instructions: "" });
+    const generalChat = db.createChat(owner.id, { title: "General", projectId: null, workspaceId: null });
+    const projectChat = db.createChat(owner.id, { title: "Project", projectId: project.id, workspaceId: null });
+    db.setChatProviderSession(owner.id, generalChat.id, { providerSessionId: "general-session" });
+    db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session" });
+    const generalBeforeProjectMemory = db.getChat(owner.id, generalChat.id).updatedAt;
+    const projectBeforeProjectMemory = db.getChat(owner.id, projectChat.id).updatedAt;
+
+    db.createMemory(owner.id, { projectId: project.id, title: "Project fact", content: "Use durable storage.", enabled: true });
+
+    expect(db.getChat(owner.id, generalChat.id)).toMatchObject({ providerSessionId: "general-session", updatedAt: generalBeforeProjectMemory });
+    expect(db.getChat(owner.id, projectChat.id)).toMatchObject({ providerSessionId: null, updatedAt: projectBeforeProjectMemory });
+
+    db.setChatProviderSession(owner.id, projectChat.id, { providerSessionId: "project-session-2" });
+    const generalBeforeProfile = db.getChat(owner.id, generalChat.id).updatedAt;
+    const projectBeforeProfile = db.getChat(owner.id, projectChat.id).updatedAt;
+    db.updateUserContext(owner.id, { profile: "Prefer concise answers." });
+
+    expect(db.getChat(owner.id, generalChat.id)).toMatchObject({ providerSessionId: null, updatedAt: generalBeforeProfile });
+    expect(db.getChat(owner.id, projectChat.id)).toMatchObject({ providerSessionId: null, updatedAt: projectBeforeProfile });
+    expect(db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false }).memoryStats.projects[project.id]).toMatchObject({ total: 1, enabled: 1 });
+  });
+
+  it("invalidates surviving chat sessions before deleting their project memories", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const project = db.createProject(owner.id, { name: "Deleted context", description: null, instructions: "" });
+    db.createMemory(owner.id, { projectId: project.id, title: "Temporary decision", content: "Only valid in this project.", enabled: true });
+    const chat = db.createChat(owner.id, { title: "Surviving chat", projectId: project.id, workspaceId: null });
+    db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "project-session", providerSessionWorkspacePath: "/tmp/project-session" });
+    const updatedAt = db.getChat(owner.id, chat.id).updatedAt;
+
+    db.deleteProject(owner.id, project.id);
+
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ projectId: null, providerSessionId: null, providerSessionWorkspacePath: null, updatedAt });
+    expect(db.listMemories(owner.id)).toHaveLength(0);
+  });
+
   it("uses saved chat model choices when a request does not override them", () => {
     const db = createTestDb();
     const owner = db.getOwner();
@@ -329,6 +427,9 @@ describe("chat provider context", () => {
     db.createToolRun(owner.id, { chatId: chat.id, workspaceId: workspace.id, toolName: "test.tool", input: {} });
     db.saveMcpServer(owner.id, { id: "test-mcp", name: "Test MCP", transport: "stdio", command: "node", args: [], url: null, tools: ["tool"], enabled: true, projectId: project.id });
     db.upsertSkill(owner.id, { id: "custom-skill", name: "Custom", description: "Custom skill", version: "1", instructions: "Use it.", prompts: [], workflow: [], artifactTemplates: [], mcpDependencies: [], toolDependencies: [], activationRules: [], permissions: [] }, false, null);
+    db.updateUserContext(owner.id, { profile: "Sensitive profile", locationLevel: "fine", location: { latitude: 47.60621, longitude: -122.33207, accuracy: 15, capturedAt: "2026-07-25T00:00:00.000Z", precision: "fine" } });
+    db.createMemory(owner.id, { projectId: null, title: "User memory", content: "Sensitive user context", enabled: true });
+    db.createMemory(owner.id, { projectId: project.id, title: "Project memory", content: "Sensitive project context", enabled: true });
 
     db.clearAllData(owner.id);
 
@@ -341,6 +442,8 @@ describe("chat provider context", () => {
     expect(db.listArtifacts(owner.id)).toEqual([]);
     expect(db.listMcpServers(owner.id)).toEqual([]);
     expect(db.listWorkspaces(owner.id)).toEqual([]);
+    expect(db.getUserContext(owner.id)).toMatchObject({ profile: "", locationLevel: "off", location: null });
+    expect(db.listMemories(owner.id)).toEqual([]);
     const skills = db.listSkills(owner.id);
     expect(skills.some((skill) => skill.id === "custom-skill")).toBe(false);
     expect(skills.length).toBeGreaterThan(0);
@@ -447,6 +550,33 @@ describe("chat provider context", () => {
     expect(state.artifacts[0]?.contentPreview.length).toBeLessThan(content.length);
     expect(JSON.stringify(state)).not.toContain(content);
     expect(db.getArtifact(owner.id, artifact.id).content).toBe(content);
+  });
+
+  it("keeps memory content out of app state and pages it on demand", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const content = "sensitive memory ".repeat(1000);
+    const created = Array.from({ length: 3 }, (_, index) => db.createMemory(owner.id, { projectId: null, title: `Memory ${index}`, content: `${index}:${content}`, enabled: index !== 1 }));
+
+    let state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    const firstPage = db.listMemoriesPage(owner.id, null, 0, 2);
+    const secondPage = db.listMemoriesPage(owner.id, null, firstPage.nextOffset ?? 0, 2);
+
+    expect(state.memoryStats.user).toMatchObject({ total: 3, enabled: 2 });
+    expect(state.memoryStats.user.contextLength).toBeGreaterThan(0);
+    expect(JSON.stringify(state)).not.toContain("sensitive memory");
+    expect(firstPage).toMatchObject({ total: 3, nextOffset: 2 });
+    expect(firstPage.items).toHaveLength(2);
+    expect(firstPage.items[0]?.content).toContain("sensitive memory");
+    expect(secondPage).toMatchObject({ total: 3, nextOffset: null });
+    expect(secondPage.items).toHaveLength(1);
+
+    db.updateMemory(owner.id, created[0]!.id, { enabled: false });
+    state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    expect(state.memoryStats.user).toMatchObject({ total: 3, enabled: 1 });
+    db.deleteMemory(owner.id, created[1]!.id);
+    state = db.getState({ id: "echo", label: "Echo", available: true, details: "", capabilities: [], models: [], modelsAuthoritative: false });
+    expect(state.memoryStats.user).toMatchObject({ total: 2, enabled: 1 });
   });
 
   it("persists favorite project and chat flags", () => {
@@ -1028,6 +1158,116 @@ describe("chat provider context", () => {
     const request = buildProviderChatRequest({ db, ownerId: owner.id, chat, message: { content: "Use yolo permissions", skillIds: [], permissionMode: "yolo" }, defaultModel: "fallback", gitHubToken: null, context: { isolatedWorkspaceRoot: "/tmp/isolated" } });
 
     expect(request.permissionMode).toBe("yolo");
+  });
+
+  it("does not restore a stale provider session after a context mutation cancels the active response", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Context race", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Start with old context" });
+    let markStarted!: () => void;
+    let releaseSession!: () => void;
+    let markClosed!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const sessionGate = new Promise<void>((resolve) => { releaseSession = resolve; });
+    const closed = new Promise<void>((resolve) => { markClosed = resolve; });
+    const provider: CopilotProvider = {
+      id: "sdk",
+      label: "SDK",
+      status: async () => ({ id: "sdk", label: "SDK", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        markStarted();
+        try {
+          await sessionGate;
+          yield { type: "session", sessionId: "stale-session", workspacePath: "/tmp/stale", resumed: false, infinite: true };
+          yield { type: "done" };
+        } finally {
+          markClosed();
+        }
+      },
+    };
+    const responses = new ActiveChatResponses();
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Start with old context" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await started;
+
+    expect(responses.cancel(chat.id)).toBe(true);
+    db.updateUserContext(owner.id, { profile: "New context" });
+    releaseSession();
+    await closed;
+
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ providerSessionId: null, providerSessionWorkspacePath: null });
+    expect(db.listMessages(chat.id).some((message) => message.role === "assistant")).toBe(false);
+  });
+
+  it("accumulates AI credit usage per chat and persists it on the assistant message", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Usage chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Spend some credits" });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "usage", nanoAiu: 120_000_000, model: "gpt-test" };
+        yield { type: "delta", text: "Done." };
+        yield { type: "usage", nanoAiu: 30_000_000, model: "gpt-test" };
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Spend some credits" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+
+    const assistant = db.listMessages(chat.id).find((message) => message.role === "assistant");
+    expect(assistant?.metadata.usage).toEqual({ nanoAiu: 150_000_000 });
+    expect(db.getChat(owner.id, chat.id).totalNanoAiu).toBe(150_000_000);
+  });
+
+  it("attributes subagent AI credit usage to its activity card and the chat total", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Subagent usage chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Delegate and spend" });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "usage", nanoAiu: 100_000_000, model: "gpt-test" };
+        yield { type: "subagent-start", id: "research-agent", name: "research", displayName: "Research agent" };
+        yield { type: "usage", nanoAiu: 40_000_000, model: "gpt-test", agentId: "research-agent" };
+        yield { type: "usage", nanoAiu: 35_000_000, model: "gpt-test", agentId: "research-agent" };
+        yield { type: "usage", nanoAiu: 25_000_000, model: "gpt-test", agentId: "unknown-agent" };
+        yield { type: "subagent-complete", id: "research-agent", name: "research", displayName: "Research agent", durationMs: 10 };
+        yield { type: "delta", text: "Done." };
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+
+    responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Delegate and spend" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+
+    const assistant = db.listMessages(chat.id).find((message) => message.role === "assistant");
+    const activities = assistant?.metadata.activities as Array<{ type?: string; details?: { nanoAiu?: number; name?: string } }> | undefined;
+    const subagent = activities?.find((activity) => activity.type === "subagent");
+    expect(subagent?.details?.nanoAiu).toBe(75_000_000);
+    expect(subagent?.details?.name).toBe("research");
+    expect(assistant?.metadata.usage).toEqual({ nanoAiu: 200_000_000 });
+    expect(db.getChat(owner.id, chat.id).totalNanoAiu).toBe(200_000_000);
+  });
+
+  it("keeps chat AI credit totals across turns and ignores non-positive usage", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Running total chat", projectId: null, workspaceId: null });
+
+    expect(db.addChatUsage(owner.id, chat.id, 40_000_000).totalNanoAiu).toBe(40_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 60_000_000).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, 0).totalNanoAiu).toBe(100_000_000);
+    expect(db.addChatUsage(owner.id, chat.id, Number.NaN).totalNanoAiu).toBe(100_000_000);
   });
 
   it("hides title-tool activity when the SDK reports it as a generic tool", async () => {
