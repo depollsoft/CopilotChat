@@ -962,6 +962,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
   async function reloadMemories(): Promise<void> {
     const requestedProjectId = selectedProject?.id ?? null;
     const requestedScope = requestedProjectId ?? "user";
+    if (memoryScopeRef.current !== requestedScope) return;
     const requestVersion = ++memoryRequestVersionRef.current;
     setMemoriesLoading(true);
     try {

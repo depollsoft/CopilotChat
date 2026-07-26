@@ -506,6 +506,47 @@ test("stale memory pages cannot overwrite same-scope reloads", async ({ page, re
   await expect(visibleMemory.getByText("Paused", { exact: true })).toBeVisible();
 });
 
+test("stale memory mutations cannot invalidate a new scope load", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers memory mutation races.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectA = await (await request.post("/api/projects", { headers, data: { name: "Mutation scope A", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  const projectB = await (await request.post("/api/projects", { headers, data: { name: "Mutation scope B", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  const memoryA = await (await request.post("/api/memories", { headers, data: { projectId: projectA.id, title: "Mutation A memory", content: "A", enabled: true } })).json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Mutation B memory", content: "B", enabled: true } });
+  let releaseMutation!: () => void;
+  let markRequested!: () => void;
+  const mutationGate = new Promise<void>((resolve) => { releaseMutation = resolve; });
+  const mutationRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  await page.route(`**/api/memories/${memoryA.id}`, async (route) => {
+    if (route.request().method() === "PATCH") {
+      markRequested();
+      await mutationGate;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  const scopeSelect = drawer.getByLabel("Memory scope");
+  await scopeSelect.selectOption(projectA.id);
+  const memoryCardA = drawer.locator(".memory-card").filter({ hasText: "Mutation A memory" });
+  await expect(memoryCardA).toBeVisible();
+  const mutationResponsePromise = page.waitForResponse((response) => response.url().endsWith(`/api/memories/${memoryA.id}`) && response.request().method() === "PATCH");
+  await memoryCardA.getByRole("button", { name: "Pause" }).click();
+  await mutationRequested;
+  await scopeSelect.selectOption(projectB.id);
+  await expect(drawer.getByText("Mutation B memory")).toBeVisible();
+  releaseMutation();
+  const mutationResponse = await mutationResponsePromise;
+  await mutationResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(scopeSelect).toHaveValue(projectB.id);
+  await expect(drawer.getByText("Mutation B memory")).toBeVisible();
+  await expect(drawer.getByText("Loading memories…")).toHaveCount(0);
+  await expect(drawer.getByText("Mutation A memory")).toHaveCount(0);
+});
+
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers sidebar cleanup.");
   await page.goto("/");
