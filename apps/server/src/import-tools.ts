@@ -48,7 +48,7 @@ export function buildImportTools(input: { db: AppDatabase; ownerId: string; draf
       handler: async (args) => {
         const parsed = assignmentArgsSchema.parse(args);
         const draft = await input.drafts.setAssignments(input.ownerId, parsed.draftId, parsed.assignments);
-        const preview = await parseDraft(draft);
+        const preview = await parseDraft(input.drafts, draft);
         return { ...summarizeImportPreview({ draft, preview }), assignmentOverrides: draft.assignments.length };
       },
     },
@@ -59,9 +59,11 @@ export function buildImportTools(input: { db: AppDatabase; ownerId: string; draf
       handler: async (args) => {
         const parsed = applyArgsSchema.parse(args);
         if (!parsed.confirmed) throw new Error("Import apply requires explicit user confirmation.");
-        const { draft, preview } = await loadPreview(input, parsed.draftId);
-        const result = applyImportPreview(input.db, input.ownerId, preview, draft.assignments);
-        return { importedConversations: result.imported.length, importedProjects: result.importedProjects, warnings: result.warnings };
+        return input.drafts.consume(input.ownerId, parsed.draftId, async (draft) => {
+          const preview = await parseDraft(input.drafts, draft);
+          const result = applyImportPreview(input.db, input.ownerId, preview, draft.assignments);
+          return { importedConversations: result.imported.length, importedProjects: result.importedProjects, warnings: result.warnings };
+        });
       },
     },
   ];
@@ -69,11 +71,11 @@ export function buildImportTools(input: { db: AppDatabase; ownerId: string; draf
 
 async function loadPreview(input: { ownerId: string; drafts: ImportDraftStore }, draftId: string): Promise<{ draft: StoredImportDraft; preview: ImportPreview }> {
   const draft = await input.drafts.get(input.ownerId, draftId);
-  return { draft, preview: await parseDraft(draft) };
+  return { draft, preview: await parseDraft(input.drafts, draft) };
 }
 
-async function parseDraft(draft: StoredImportDraft): Promise<ImportPreview> {
-  return previewImportPayload(draft.source, draft.fileName, draft.content, draft.encoding);
+async function parseDraft(drafts: ImportDraftStore, draft: StoredImportDraft): Promise<ImportPreview> {
+  return previewImportPayload(draft.source, draft.fileName, await drafts.readContent(draft), draft.encoding);
 }
 
 function summarizeImportPreview(input: { draft: StoredImportDraft; preview: ImportPreview }): Record<string, unknown> {

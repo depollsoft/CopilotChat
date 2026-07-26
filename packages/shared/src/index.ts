@@ -162,9 +162,11 @@ export const messageAttachmentSchema = z.object({
   mimeType: z.string().min(1),
   size: z.number().int().nonnegative(),
   data: z.string().min(1).optional(),
+  uploadId: z.string().min(1).optional(),
+  filePath: z.string().min(1).optional(),
 });
 export type MessageAttachment = z.infer<typeof messageAttachmentSchema>;
-export const messageAttachmentInputSchema = messageAttachmentSchema.extend({ data: z.string().min(1) });
+export const messageAttachmentInputSchema = messageAttachmentSchema.refine((attachment) => [attachment.data, attachment.uploadId, attachment.filePath].filter(Boolean).length === 1, { message: "Attachment requires exactly one uploaded data or file reference." });
 
 export const messageSchema = z.object({
   id: z.string(),
@@ -283,7 +285,7 @@ export type ProviderStatus = z.infer<typeof providerStatusSchema>;
 export const appStateSchema = z.object({ owner: ownerSchema, authMode: z.enum(["local", "github"]).default("local"), userContext: userContextSchema, memoryStats: memoryStatsSchema, projects: z.array(projectSchema), projectReferences: z.array(projectReferenceSchema), projectChatReferences: z.array(projectChatReferenceSchema), chats: z.array(chatSchema), archivedChats: z.array(chatSchema), artifacts: z.array(artifactSummarySchema), skills: z.array(skillSchema), mcpServers: z.array(mcpServerSchema), workspaces: z.array(workspaceSchema), provider: providerStatusSchema, activeChatIds: z.array(z.string()).default([]) });
 export type AppState = z.infer<typeof appStateSchema>;
 
-export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
+export const sendMessageRequestSchema = z.object({ content: z.string(), attachments: z.array(messageAttachmentInputSchema).max(20).optional(), projectId: z.string().nullable().optional(), workspaceId: z.string().nullable().optional(), skillIds: z.array(z.string()).optional(), model: z.string().min(1).optional(), reasoningEffort: reasoningEffortSchema.optional(), contextTier: contextTierSchema.optional(), permissionMode: permissionModeSchema.optional() });
 export type SendMessageRequest = z.infer<typeof sendMessageRequestSchema>;
 export const activeResponseInputRequestSchema = sendMessageRequestSchema.extend({ mode: z.enum(["steer", "queue"]) });
 export type ActiveResponseInputRequest = z.infer<typeof activeResponseInputRequestSchema>;
@@ -348,7 +350,7 @@ export const updateWorkspaceRequestSchema = z.object({ name: z.string().min(1).o
 export type UpdateWorkspaceRequest = z.infer<typeof updateWorkspaceRequestSchema>;
 export const runWorkspaceCommandRequestSchema = z.object({ command: z.string().min(1), cwd: z.string().optional().default("."), timeoutMs: z.number().int().min(1000).max(120000).optional().default(30000) });
 export type RunWorkspaceCommandRequest = z.infer<typeof runWorkspaceCommandRequestSchema>;
-export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
+export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1).max(1024), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
 export type ImportPreviewRequest = z.infer<typeof importPreviewRequestSchema>;
 
 export function titleFromContent(content: string): string {

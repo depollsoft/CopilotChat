@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
+import type { MessageAttachment } from "@copilotchat/shared";
 
 test("core app flows work end to end", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers full management flow.");
@@ -709,6 +710,20 @@ test("preferences import starts a guided import chat", async ({ page }, testInfo
   await expect(response).toContainText("screenshots or pasted title lists");
 });
 
+test("failed guided imports discard their staged upload", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers guided import cleanup.");
+  let deleteCount = 0;
+  await page.route("**/api/imports/drafts", async (route) => route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Import exceeds limit" }) }));
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator(".sidebar-preferences-row").click();
+  await page.getByRole("dialog", { name: "Preferences" }).locator('input[type="file"]').setInputFiles({ name: "too-large.json", mimeType: "application/json", buffer: Buffer.from("{}") });
+
+  await expect(page.getByRole("alert")).toBeVisible();
+  await expect.poll(() => deleteCount).toBe(1);
+});
+
 test("composer sends attached files and pasted images", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer attachments.");
   await page.goto("/");
@@ -730,6 +745,203 @@ test("composer sends attached files and pasted images", async ({ page }, testInf
   await expect(response).toBeVisible({ timeout: 15000 });
   await expect(response).toContainText("notes.txt");
   await expect(response).toContainText("pasted.png");
+});
+
+test("upload endpoint reports invalid metadata and limits as client errors", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers upload API errors.");
+  const headers = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+
+  const tooLarge = await page.request.post("/api/uploads?fileName=large.bin&mimeType=application%2Foctet-stream&size=1073741825", { headers, data: Buffer.alloc(0) });
+  const invalid = await page.request.post("/api/uploads?fileName=bad.bin&mimeType=application%2Foctet-stream&size=invalid", { headers, data: Buffer.alloc(0) });
+  const invalidName = await page.request.post("/api/uploads?fileName=%2F&mimeType=application%2Foctet-stream&size=1", { headers, data: Buffer.from("x") });
+  const sizeMismatch = await page.request.post("/api/uploads?fileName=short.bin&mimeType=application%2Foctet-stream&size=2", { headers, data: Buffer.from("x") });
+
+  expect(tooLarge.status()).toBe(413);
+  expect(invalid.status()).toBe(400);
+  expect(invalidName.status()).toBe(400);
+  expect(sizeMismatch.status()).toBe(400);
+});
+
+test("failed turn preparation does not persist messages or consume uploads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers turn rollback.");
+  const workspaceRoot = testInfo.outputPath("failed-turn-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed turn", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Failed turn", workspaceId: workspace.id } });
+  const chat = await chatResponse.json() as { id: string };
+  const uploadResponse = await page.request.post("/api/uploads?fileName=retry.txt&mimeType=text%2Fplain&size=5", { headers: { ...csrfHeaders, "Content-Type": "application/x-copilotchat-upload" }, data: Buffer.from("retry") });
+  const attachment = await uploadResponse.json() as MessageAttachment;
+
+  const messageResponse = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "This preparation should fail.", attachments: [attachment], workspaceId: workspace.id } });
+
+  expect(messageResponse.status()).toBe(500);
+  expect(await (await page.request.get(`/api/chats/${chat.id}/messages`)).json()).toEqual([]);
+  const discard = await page.request.delete(`/api/uploads/${attachment.uploadId}`, { headers: csrfHeaders });
+  expect(discard.ok()).toBe(true);
+});
+
+test("failed retry preparation preserves conversation history", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers retry rollback.");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Retry rollback" } });
+  const chat = await chatResponse.json() as { id: string };
+  const firstTurn = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "Keep this history." }, timeout: 30_000 });
+  expect(firstTurn.ok()).toBe(true);
+  const before = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; role: string }>;
+  const assistant = before.find((message) => message.role === "assistant")!;
+  const workspaceRoot = testInfo.outputPath("failed-retry-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed retry", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  await page.request.patch(`/api/chats/${chat.id}`, { headers: csrfHeaders, data: { workspaceId: workspace.id } });
+
+  const retry = await page.request.post(`/api/chats/${chat.id}/messages/${assistant.id}/retry`, { headers: csrfHeaders, data: {} });
+
+  expect(retry.status()).toBe(500);
+  const after = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string }>;
+  expect(after.map((message) => message.id)).toEqual(before.map((message) => message.id));
+});
+
+test("failed edit preparation preserves conversation history", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers edit rollback.");
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const chatResponse = await page.request.post("/api/chats", { headers: csrfHeaders, data: { title: "Edit rollback" } });
+  const chat = await chatResponse.json() as { id: string };
+  const firstTurn = await page.request.post(`/api/chats/${chat.id}/messages`, { headers: csrfHeaders, data: { content: "Keep original edit history." }, timeout: 30_000 });
+  expect(firstTurn.ok()).toBe(true);
+  const before = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; role: string; content: string }>;
+  const user = before.find((message) => message.role === "user")!;
+  const workspaceRoot = testInfo.outputPath("failed-edit-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  fs.writeFileSync(path.join(workspaceRoot, "artifacts"), "block artifact scanning");
+  const workspaceResponse = await page.request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Failed edit", rootPath: workspaceRoot } });
+  const workspace = await workspaceResponse.json() as { id: string };
+  await page.request.patch(`/api/chats/${chat.id}`, { headers: csrfHeaders, data: { workspaceId: workspace.id } });
+
+  const edit = await page.request.post(`/api/chats/${chat.id}/messages/${user.id}/edit`, { headers: csrfHeaders, data: { content: "This edit must roll back." } });
+
+  expect(edit.status()).toBe(500);
+  const after = await (await page.request.get(`/api/chats/${chat.id}/messages`)).json() as Array<{ id: string; content: string }>;
+  expect(after.map(({ id, content }) => ({ id, content }))).toEqual(before.map(({ id, content }) => ({ id, content })));
+});
+
+test("composer retains successful files and discards each upload once", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers composer upload errors.");
+  await page.route("**/api/uploads?*", async (route) => {
+    const fileName = new URL(route.request().url()).searchParams.get("fileName");
+    if (fileName === "bad.txt") { await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Upload rejected" }) }); return; }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles([
+    { name: "good.txt", mimeType: "text/plain", buffer: Buffer.from("keep me") },
+    { name: "bad.txt", mimeType: "text/plain", buffer: Buffer.from("reject me") },
+  ]);
+
+  await expect(page.locator(".attachment-tray").filter({ hasText: "good.txt" })).toBeVisible();
+  await expect(page.locator(".attachment-error")).toContainText("too large");
+  await expect(page.locator(".attachment-tray").filter({ hasText: "bad.txt" })).toHaveCount(0);
+  let deleteCount = 0;
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  await page.getByRole("button", { name: "Remove good.txt" }).click();
+  await expect.poll(() => deleteCount).toBe(1);
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
+});
+
+test("composer retains staged uploads when message acceptance fails", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers composer submission failures.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "retry.txt", mimeType: "text/plain", buffer: Buffer.from("retry me") });
+  await composer.fill("Please retry this.");
+  await page.route("**/api/chats/*/messages", async (route) => {
+    if (route.request().method() === "POST") { await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Message rejected" }) }); return; }
+    await route.continue();
+  });
+
+  await page.getByRole("button", { name: "Send" }).click();
+
+  await expect(page.locator(".attachment-tray").filter({ hasText: "retry.txt" })).toBeVisible();
+  await expect(composer).toHaveValue("Please retry this.");
+  await expect(page.getByRole("alert")).toBeVisible();
+});
+
+test("composer disables attachment removal while message submission is pending", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers attachment submission races.");
+  let releaseSubmission!: () => void;
+  let markSubmissionStarted!: () => void;
+  const submissionBlocked = new Promise<void>((resolve) => { releaseSubmission = resolve; });
+  const submissionStarted = new Promise<void>((resolve) => { markSubmissionStarted = resolve; });
+  await page.route("**/api/chats/*/messages", async (route) => {
+    if (route.request().method() === "POST") {
+      markSubmissionStarted();
+      await submissionBlocked;
+      await route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Message rejected" }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "pending-submit.txt", mimeType: "text/plain", buffer: Buffer.from("keep staged") });
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Hold this submission.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await submissionStarted;
+
+  const remove = page.getByRole("button", { name: "Remove pending-submit.txt" });
+  await expect(remove).toBeDisabled();
+  releaseSubmission();
+  await expect(remove).toBeEnabled();
+  await remove.click();
+});
+
+test("composer disables submission while selected files are uploading", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers pending uploads.");
+  let releaseUpload!: () => void;
+  let markUploadStarted!: () => void;
+  const uploadBlocked = new Promise<void>((resolve) => { releaseUpload = resolve; });
+  const uploadStarted = new Promise<void>((resolve) => { markUploadStarted = resolve; });
+  await page.route("**/api/uploads?*", async (route) => {
+    if (new URL(route.request().url()).searchParams.get("fileName") === "pending.txt") { markUploadStarted(); await uploadBlocked; }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  const selecting = page.locator('.composer input[type="file"]').setInputFiles({ name: "pending.txt", mimeType: "text/plain", buffer: Buffer.from("pending") });
+  await uploadStarted;
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await composer.fill("Wait for the file.");
+
+  await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+  releaseUpload();
+  await selecting;
+  await expect(page.locator(".attachment-tray").filter({ hasText: "pending.txt" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+  await page.getByRole("button", { name: "Remove pending.txt" }).click();
+});
+
+test("Escape discards staged composer uploads", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers slash-menu resets.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "escape.txt", mimeType: "text/plain", buffer: Buffer.from("discard me") });
+  let deleteCount = 0;
+  await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
+  const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
+  await composer.fill("/");
+  await expect(page.getByRole("listbox", { name: "Slash commands" })).toBeVisible();
+
+  await composer.press("Escape");
+
+  await expect(page.locator(".attachment-tray")).toHaveCount(0);
+  await expect(composer).toHaveValue("");
+  await expect.poll(() => deleteCount).toBe(1);
 });
 
 test("composer shows slash command autocomplete with descriptions", async ({ page }, testInfo) => {
@@ -1199,6 +1411,26 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".msg.user").filter({ hasText: "queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "You said: Queued follow up." }).last()).toBeVisible({ timeout: 15000 });
   await expect(page.locator(".msg.assistant").filter({ hasText: "Attachments: queued-note.txt" }).last()).toBeVisible({ timeout: 15000 });
+});
+
+test("message POST rejects payloads while a response is active", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers active response message routing.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
+  const chatId = decodeURIComponent(new URL(page.url()).pathname.split("/").pop()!);
+  const upload = await page.request.post("/api/uploads?fileName=active.txt&mimeType=text%2Fplain&size=6", { headers: { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" }, data: Buffer.from("active") });
+  expect(upload.ok()).toBe(true);
+  const attachment = await upload.json() as MessageAttachment;
+
+  const response = await page.request.post(`/api/chats/${chatId}/messages`, { headers: { "X-CopilotChat-CSRF": "1" }, data: { content: "Do not ignore this.", attachments: [attachment] } });
+
+  expect(response.status()).toBe(409);
+  const discard = await page.request.delete(`/api/uploads/${attachment.uploadId}`, { headers: { "X-CopilotChat-CSRF": "1" } });
+  expect(discard.ok()).toBe(true);
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
 });
 
 test("chat viewport follows live updates and can jump back to live", async ({ page }, testInfo) => {
