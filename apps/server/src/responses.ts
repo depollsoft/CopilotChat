@@ -1,8 +1,11 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import type { CopilotProvider, ProviderChatControls, ProviderChatRequest, ProviderElicitationRequest, ProviderElicitationValue, ProviderEvent, ProviderMessage, ProviderPermissionRequest, ProviderTaskListItem, ProviderUserInputRequest } from "@copilotchat/provider";
 import { titleFromContent } from "@copilotchat/shared";
 import type { ActiveResponseInputRequest, Chat, ChatMessage, PermissionMode, SendMessageRequest } from "@copilotchat/shared";
 import type { FastifyReply } from "fastify";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
+import { forgetValidatedAttachmentFiles } from "./attachment-files.js";
 import type { AppDatabase } from "./db.js";
 
 type StreamListener = {
@@ -13,6 +16,10 @@ type StreamListener = {
 };
 type StreamEvent = { event: string; data: unknown };
 type ActiveTurn = { chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest };
+export type InternalSendMessageRequest = SendMessageRequest & { uploadClaimId?: string };
+type InternalActiveResponseInputRequest = ActiveResponseInputRequest & { uploadClaimId?: string };
+type ResponseCleanup = { id: string; run: () => Promise<void> };
+type ResponseResources = { temporaryFiles?: string[]; cleanup?: ResponseCleanup };
 type PendingTurn = {
   id: string;
   mode: "steer" | "queue";
@@ -20,7 +27,7 @@ type PendingTurn = {
   status: "queued" | "sent" | "running" | "done" | "failed";
   createdAt: string;
 };
-type QueuedTurn = PendingTurn & { request: SendMessageRequest };
+type QueuedTurn = PendingTurn & { request: InternalSendMessageRequest };
 type PendingInteraction = {
   id: string;
   kind: "permission" | "user-input" | "elicitation";
@@ -56,21 +63,39 @@ const persistedActivityStringLimit = 8_000;
 const persistedNestedStepLimit = 24;
 const sseBackpressureLimit = 256 * 1024;
 export const sseHeartbeatIntervalMs = 15_000;
-const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interaction"]);
+const coalescedSseEvents = new Set(["activity", "snapshot", "pending", "interaction", "usage"]);
 
 export class ActiveChatResponses {
   private readonly active = new Map<string, ActiveChatResponse>();
+  private readonly preparing = new Set<string>();
+  private readonly deleting = new Set<string>();
+  private readonly completions = new Map<string, Set<Promise<void>>>();
+  private readonly chatOwners = new Map<string, string>();
 
   has(chatId: string): boolean { return this.active.has(chatId); }
-  chatIds(): string[] { return [...this.active.keys()]; }
+  /** Chats whose response is running or still being prepared, so clients keep showing them as live. */
+  chatIds(): string[] { return [...new Set([...this.active.keys(), ...this.preparing])]; }
+  reserve(chatId: string): boolean { if (this.active.has(chatId) || this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.preparing.add(chatId); return true; }
+  releaseReservation(chatId: string): void { this.preparing.delete(chatId); }
+  beginDeletion(chatId: string): boolean { if (this.preparing.has(chatId) || this.deleting.has(chatId)) return false; this.deleting.add(chatId); return true; }
+  endDeletion(chatId: string): void { this.deleting.delete(chatId); }
 
-  start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: SendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
+  start(input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): ActiveChatResponse {
+    this.preparing.delete(input.chat.id);
     const existing = this.active.get(input.chat.id);
     if (existing) return existing;
     const response = new ActiveChatResponse(input.chat.id);
     this.active.set(input.chat.id, response);
+    this.chatOwners.set(input.chat.id, input.ownerId);
     const providerRequest = response.decorateProviderRequest(input.providerRequest);
-    void Promise.resolve().then(() => this.run(response, { ...input, providerRequest }));
+    const completion = Promise.resolve().then(() => this.run(response, { ...input, providerRequest })).finally(() => {
+      const chatCompletions = this.completions.get(input.chat.id);
+      chatCompletions?.delete(completion);
+      if (chatCompletions?.size === 0) { this.completions.delete(input.chat.id); this.chatOwners.delete(input.chat.id); }
+    });
+    const chatCompletions = this.completions.get(input.chat.id) ?? new Set<Promise<void>>();
+    chatCompletions.add(completion);
+    this.completions.set(input.chat.id, chatCompletions);
     return response;
   }
 
@@ -99,15 +124,30 @@ export class ActiveChatResponses {
     for (const chatId of [...this.active.keys()]) this.cancel(chatId);
   }
 
+  async cancelAndWait(chatId: string): Promise<boolean> {
+    const cancelled = this.cancel(chatId);
+    const completions = [...(this.completions.get(chatId) ?? [])];
+    if (completions.length > 0) await Promise.allSettled(completions);
+    return cancelled;
+  }
+
+  async cancelOwnerAndWait(ownerId: string): Promise<void> {
+    const chatIds = [...this.chatOwners.entries()].filter(([, owner]) => owner === ownerId).map(([chatId]) => chatId);
+    for (const chatId of chatIds) this.cancel(chatId);
+    const completions = chatIds.flatMap((chatId) => [...(this.completions.get(chatId) ?? [])]);
+    if (completions.length > 0) await Promise.allSettled(completions);
+  }
+
   resolveInteraction(chatId: string, interactionId: string, resolution: InteractionResolution): boolean {
     const response = this.active.get(chatId);
     if (!response) return false;
     return response.resolveInteraction(interactionId, resolution);
   }
 
-  enqueue(chatId: string, request: ActiveResponseInputRequest): PendingTurn | null {
+  enqueue(chatId: string, request: InternalActiveResponseInputRequest, resources?: ResponseResources): PendingTurn | null {
     const response = this.active.get(chatId);
-    return response?.enqueue(request) ?? null;
+    if (!response || !response.trackResources(resources)) return null;
+    return response.enqueue(request);
   }
   setPermissionMode(chatId: string, permissionMode: PermissionMode): boolean {
     const response = this.active.get(chatId);
@@ -116,13 +156,20 @@ export class ActiveChatResponses {
     return true;
   }
 
-  async steer(chatId: string, request: ActiveResponseInputRequest): Promise<PendingTurn | null> {
+  async steer(chatId: string, request: InternalActiveResponseInputRequest, resources?: ResponseResources): Promise<{ turn: PendingTurn | null; delivered: boolean } | null> {
     const response = this.active.get(chatId);
-    return response ? await response.steer(request) : null;
+    return response ? await response.steer(request, resources) : null;
   }
 
-  private async run(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: SendMessageRequest) => Promise<ActiveTurn> }): Promise<void> {
+  trackTemporaryFiles(chatId: string, filePaths: string[]): boolean {
+    const response = this.active.get(chatId);
+    if (!response) return false;
+    return response.trackTemporaryFiles(filePaths);
+  }
+
+  private async run(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string; chat: Chat; userMessage: ChatMessage; providerRequest: ProviderChatRequest; prepareTurn: (request: InternalSendMessageRequest) => Promise<ActiveTurn> }): Promise<void> {
     let turn: ActiveTurn = { chat: input.chat, userMessage: input.userMessage, providerRequest: input.providerRequest };
+    let terminal: { event: "done" | "error"; data: Record<string, unknown> };
     try {
       while (!response.cancelled) {
         turn = await this.runTurn(response, input, turn);
@@ -131,14 +178,18 @@ export class ActiveChatResponses {
         response.markPendingRunning(next.id);
         turn = await input.prepareTurn(next.request);
       }
-      response.emit("done", response.cancelled ? { ok: false, cancelled: true } : { ok: true });
+      terminal = { event: "done", data: response.cancelled ? { ok: false, cancelled: true } : { ok: true } };
     } catch (error) {
-      if (response.cancelled) response.emit("done", { ok: false, cancelled: true });
-      else response.emit("error", { message: (error as Error).message });
-    } finally {
-      response.close();
-      if (this.active.get(input.chat.id) === response) this.active.delete(input.chat.id);
+      terminal = response.cancelled ? { event: "done", data: { ok: false, cancelled: true } } : { event: "error", data: { message: (error as Error).message } };
     }
+    if (this.active.get(input.chat.id) === response) this.active.delete(input.chat.id);
+    try {
+      await response.cleanupResources();
+    } catch (error) {
+      terminal = { event: "error", data: { message: `Could not clean temporary attachments: ${(error as Error).message}` } };
+    }
+    response.emit(terminal.event, terminal.data);
+    response.close();
   }
 
   private async runTurn(response: ActiveChatResponse, input: { db: AppDatabase; provider: CopilotProvider; ownerId: string }, turn: ActiveTurn): Promise<ActiveTurn> {
@@ -160,6 +211,7 @@ export class ActiveChatResponses {
       if (event.type === "subagent-tool-result") { response.finishSubagentTool(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "subagent-complete" || event.type === "subagent-failed") { response.finishSubagent(event); response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "task-list") { response.setTaskList(event); response.emit("activity", { activities: response.activities }); continue; }
+      if (event.type === "usage") { const updated = input.db.addChatUsage(input.ownerId, chat.id, event.nanoAiu); if (response.addUsage(event.nanoAiu, updated.totalNanoAiu, event.agentId ?? null)) response.emit("activity", { activities: response.activities }); continue; }
       if (event.type === "session") chat = input.db.setChatProviderSession(input.ownerId, chat.id, { providerSessionId: event.sessionId, providerSessionWorkspacePath: event.workspacePath });
       if (event.type === "artifact") {
         const artifact = workspaceDir
@@ -173,7 +225,7 @@ export class ActiveChatResponses {
     if (workspaceDir) await syncArtifactFiles({ db: input.db, ownerId: input.ownerId, chat, workspaceDir });
     response.finishOpenActivities();
     if (!response.cancelled) {
-      const assistant = input.db.addMessage({ chatId: chat.id, role: "assistant", content: response.assistantContent, provider: input.provider.id, metadata: messageMetadataForActivities(response.activities) });
+      const assistant = input.db.addMessage({ chatId: chat.id, role: "assistant", content: response.assistantContent, provider: input.provider.id, metadata: { ...messageMetadataForActivities(response.activities), ...messageMetadataForUsage(response.turnNanoAiu) } });
       response.finishRunningPendingTurn();
       response.emit("message", assistant);
     }
@@ -184,10 +236,16 @@ export class ActiveChatResponses {
 export class ActiveChatResponse {
   readonly controller = new AbortController();
   readonly listeners = new Set<StreamListener>();
+  private readonly temporaryFiles = new Set<string>();
+  private readonly cleanupTasks = new Map<string, () => Promise<void>>();
+  private readonly inFlightSteers = new Set<Promise<void>>();
+  private finalizing = false;
   assistantContent = "";
   activities: AssistantActivity[] = [];
   interactions: PendingInteraction[] = [];
   pendingTurns: PendingTurn[] = [];
+  turnNanoAiu = 0;
+  chatNanoAiu = 0;
   cancelled = false;
   assistantContentLimitReached = false;
   private activityIndex = 0;
@@ -210,13 +268,33 @@ export class ActiveChatResponse {
       if (!writeSseComment(listener.reply, "ping")) this.dropListener(listener);
     }, sseHeartbeatIntervalMs);
     listener.heartbeat.unref();
-    this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns });
+    // Always snapshot, even when empty, so a reconnecting client learns immediately that a response is live.
+    this.send(listener, "snapshot", { text: this.assistantContent, activities: this.activities, interactions: this.interactions, pendingTurns: this.pendingTurns, usage: this.usage });
   }
 
   private dropListener(listener: StreamListener): void {
     if (listener.heartbeat) clearInterval(listener.heartbeat);
     listener.heartbeat = null;
     this.listeners.delete(listener);
+  }
+
+  get usage(): { turnNanoAiu: number; chatNanoAiu: number } { return { turnNanoAiu: this.turnNanoAiu, chatNanoAiu: this.chatNanoAiu }; }
+
+  addUsage(nanoAiu: number, chatNanoAiu: number, agentId: string | null = null): boolean {
+    if (!Number.isFinite(nanoAiu) || nanoAiu <= 0) return false;
+    this.turnNanoAiu += nanoAiu;
+    this.chatNanoAiu = Math.max(chatNanoAiu, this.turnNanoAiu);
+    this.emit("usage", this.usage);
+    return agentId ? this.addSubagentUsage(agentId, nanoAiu) : false;
+  }
+
+  /** Attributes a sub-agent's model call to its activity card. Usage still counts toward the turn and chat totals. */
+  private addSubagentUsage(agentId: string, nanoAiu: number): boolean {
+    const activity = this.activities.find((item) => item.type === "subagent" && item.id === agentId);
+    if (!activity) return false;
+    const current = typeof activity.details?.nanoAiu === "number" ? activity.details.nanoAiu : 0;
+    activity.details = limitActivityRecord({ ...(activity.details ?? {}), nanoAiu: current + nanoAiu });
+    return true;
   }
 
   decorateProviderRequest(request: ProviderChatRequest): ProviderChatRequest {
@@ -240,7 +318,8 @@ export class ActiveChatResponse {
     this.assistantContentLimitReached = false;
     this.activities = [];
     this.interactions = [];
-    this.emit("snapshot", { text: "", activities: [], interactions: this.interactions, pendingTurns: this.pendingTurns });
+    this.turnNanoAiu = 0;
+    this.emit("snapshot", { text: "", activities: [], interactions: this.interactions, pendingTurns: this.pendingTurns, usage: this.usage });
   }
 
   appendAssistantContent(text: string): string {
@@ -258,7 +337,7 @@ export class ActiveChatResponse {
     return appended;
   }
 
-  enqueue(request: ActiveResponseInputRequest): PendingTurn {
+  enqueue(request: InternalActiveResponseInputRequest): PendingTurn {
     const turn = this.createPendingTurn("queue", request.content);
     this.pendingTurns = [...this.pendingTurns, turn];
     this.queuedTurns.push({ ...turn, request: queueRequest(request) });
@@ -266,13 +345,30 @@ export class ActiveChatResponse {
     return turn;
   }
 
-  async steer(request: ActiveResponseInputRequest): Promise<PendingTurn> {
-    const turn = this.createPendingTurn("steer", request.content, this.steerHandler ? "sent" : "queued");
+  async steer(request: InternalActiveResponseInputRequest, resources?: ResponseResources): Promise<{ turn: PendingTurn | null; delivered: boolean } | null> {
+    const steerHandler = this.steerHandler;
+    if (!steerHandler) return { turn: null, delivered: false };
+    if (!this.trackResources(resources)) return null;
+    const turn = this.createPendingTurn("steer", request.content, "sent");
     this.pendingTurns = [...this.pendingTurns, turn];
-    if (this.steerHandler) await this.steerHandler(providerMessageForActiveInput(request));
-    else this.queuedTurns.push({ ...turn, mode: "queue", status: "queued", request: queueRequest(request) });
+    const delivery = (async () => {
+      try {
+        await steerHandler(providerMessageForActiveInput(request));
+      } catch (error) {
+        this.pendingTurns = this.pendingTurns.filter((pending) => pending.id !== turn.id);
+        this.untrackResources(resources);
+        this.emitPendingTurns();
+        throw error;
+      }
+    })();
+    this.inFlightSteers.add(delivery);
+    try {
+      await delivery;
+    } finally {
+      this.inFlightSteers.delete(delivery);
+    }
     this.emitPendingTurns();
-    return turn;
+    return { turn, delivered: true };
   }
 
   nextQueued(): QueuedTurn | null {
@@ -459,6 +555,61 @@ export class ActiveChatResponse {
     this.listeners.clear();
   }
 
+  trackResources(resources?: ResponseResources): boolean {
+    if (this.finalizing) return false;
+    if (resources?.cleanup) this.cleanupTasks.set(resources.cleanup.id, resources.cleanup.run);
+    if (resources?.temporaryFiles) for (const filePath of resources.temporaryFiles) this.temporaryFiles.add(filePath);
+    return true;
+  }
+
+  untrackResources(resources?: ResponseResources): void {
+    if (resources?.cleanup) this.cleanupTasks.delete(resources.cleanup.id);
+    if (resources?.temporaryFiles) for (const filePath of resources.temporaryFiles) this.temporaryFiles.delete(filePath);
+  }
+
+  trackTemporaryFiles(filePaths: string[]): boolean {
+    if (this.finalizing) return false;
+    for (const filePath of filePaths) this.temporaryFiles.add(filePath);
+    return true;
+  }
+
+  async cleanupTemporaryFiles(): Promise<void> {
+    const filePaths = [...this.temporaryFiles];
+    this.temporaryFiles.clear();
+    forgetValidatedAttachmentFiles(filePaths);
+    const errors: unknown[] = [];
+    for (const filePath of filePaths) {
+      try {
+        await fs.rm(filePath, { force: true });
+        await fs.rmdir(path.dirname(filePath)).catch((error: NodeJS.ErrnoException) => { if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error; });
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, "Temporary attachment cleanup failed.");
+  }
+
+  async cleanupResources(): Promise<void> {
+    this.finalizing = true;
+    await Promise.allSettled([...this.inFlightSteers]);
+    const errors: unknown[] = [];
+    try {
+      await this.cleanupTemporaryFiles();
+    } catch (error) {
+      errors.push(error);
+    }
+    const tasks = [...this.cleanupTasks.values()];
+    this.cleanupTasks.clear();
+    for (const task of tasks) {
+      try {
+        await task();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length > 0) throw new AggregateError(errors, "Active response resource cleanup failed.");
+  }
+
   private findToolActivity(id: string | null | undefined, toolName: string): AssistantActivity | undefined {
     if (id) {
       const byId = this.activities.find((activity) => activity.type === "tool" && activity.id === id);
@@ -471,7 +622,7 @@ export class ActiveChatResponse {
     const activity = this.ensureSubagent(event.id, event.displayName);
     activity.title = event.displayName;
     activity.status = "running";
-    activity.details = limitActivityRecord(compactRecord({ name: event.name, description: event.description, model: event.model, toolCallId: event.toolCallId }));
+    activity.details = limitActivityRecord({ ...(activity.details ?? {}), ...compactRecord({ name: event.name, description: event.description, model: event.model, toolCallId: event.toolCallId }) });
   }
 
   appendSubagentContent(id: string, text: string): void {
@@ -591,6 +742,10 @@ function finishActivities(activities: AssistantActivity[]): void {
     if (activity.steps) finishActivities(activity.steps);
   }
 }
+function messageMetadataForUsage(turnNanoAiu: number): Record<string, unknown> {
+  if (!Number.isFinite(turnNanoAiu) || turnNanoAiu <= 0) return {};
+  return { usage: { nanoAiu: Math.round(turnNanoAiu) } };
+}
 function messageMetadataForActivities(activities: AssistantActivity[]): Record<string, unknown> {
   if (activities.length === 0) return {};
   let stringLimit = persistedActivityStringLimit;
@@ -696,11 +851,20 @@ function limitActivityValue(value: unknown, depth = 0, stringLimit = activityStr
   if (entries.length > activityObjectKeyLimit) limited.__truncated = `${entries.length - activityObjectKeyLimit} fields omitted`;
   return limited;
 }
-function queueRequest(request: ActiveResponseInputRequest): SendMessageRequest {
-  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, contextTier: request.contextTier, permissionMode: request.permissionMode };
+function queueRequest(request: InternalActiveResponseInputRequest): InternalSendMessageRequest {
+  return { content: request.content, attachments: request.attachments, projectId: request.projectId, workspaceId: request.workspaceId, skillIds: request.skillIds, model: request.model, reasoningEffort: request.reasoningEffort, contextTier: request.contextTier, permissionMode: request.permissionMode, uploadClaimId: request.uploadClaimId };
 }
-function providerMessageForActiveInput(request: ActiveResponseInputRequest): ProviderMessage {
-  return { role: "user", content: request.content, attachments: request.attachments?.map((attachment) => ({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name })) };
+function providerMessageForActiveInput(request: InternalActiveResponseInputRequest): ProviderMessage {
+  const attachments: NonNullable<ProviderMessage["attachments"]> = [];
+  for (const attachment of request.attachments ?? []) {
+    if (attachment.filePath) attachments.push({ type: "file", path: attachment.filePath, displayName: attachment.name, size: attachment.size });
+    else if (attachment.data) attachments.push({ type: "blob", data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.name, size: attachment.size });
+  }
+  return {
+    role: "user",
+    content: request.content,
+    attachments: attachments.length > 0 ? attachments : undefined,
+  };
 }
 function normalizeArtifactKind(kind: string): "text" | "markdown" | "code" | "json" | "mermaid" | "html" | "file-bundle" {
   return kind === "html" || kind === "json" || kind === "mermaid" || kind === "code" || kind === "text" || kind === "file-bundle" ? kind : "markdown";

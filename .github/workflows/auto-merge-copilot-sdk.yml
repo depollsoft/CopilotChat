@@ -1,0 +1,157 @@
+name: Auto-merge Copilot SDK
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.pull_requests[0].number != null
+    runs-on: ubuntu-latest
+    concurrency:
+      group: auto-merge-copilot-sdk-${{ github.event.workflow_run.pull_requests[0].number }}
+      cancel-in-progress: false
+    steps:
+      - name: Verify and merge the tested SDK update
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          TESTED_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          pr="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          actor="$(jq -r '.user.login' <<<"${pr}")"
+          state="$(jq -r '.state' <<<"${pr}")"
+          merged="$(jq -r '.merged' <<<"${pr}")"
+          base_ref="$(jq -r '.base.ref' <<<"${pr}")"
+          base_sha="$(jq -r '.base.sha' <<<"${pr}")"
+          head_repo="$(jq -r '.head.repo.full_name' <<<"${pr}")"
+          head_sha="$(jq -r '.head.sha' <<<"${pr}")"
+          default_branch="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.default_branch')"
+          branch_rules="$(gh api "repos/${GITHUB_REPOSITORY}/rules/branches/${default_branch}")"
+
+          if [[ "${merged}" != "true" ]]; then
+            for required_check in build-test docker; do
+              if ! jq -e --arg check "${required_check}" '
+                any(.[];
+                  .type == "required_status_checks" and
+                  .parameters.strict_required_status_checks_policy == true and
+                  any(.parameters.required_status_checks[]?; .context == $check)
+                )
+              ' <<<"${branch_rules}" >/dev/null; then
+                echo "Strict ${required_check} branch protection is not active; skipping."
+                exit 0
+              fi
+            done
+          fi
+
+          if [[ "${actor}" != "dependabot[bot]" ||
+                ("${state}" != "open" && "${merged}" != "true") ||
+                "${base_ref}" != "${default_branch}" ||
+                "${head_repo}" != "${GITHUB_REPOSITORY}" ||
+                "${head_sha}" != "${TESTED_SHA}" ]]; then
+            echo "PR no longer matches the tested Dependabot commit; skipping."
+            exit 0
+          fi
+
+          saw_manifest=false
+          saw_lockfile=false
+          mapfile -t changed_files < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+              --jq '.[].filename'
+          )
+
+          for file in "${changed_files[@]}"; do
+            case "${file}" in
+              packages/provider/package.json)
+                saw_manifest=true
+                ;;
+              pnpm-lock.yaml)
+                saw_lockfile=true
+                ;;
+              *)
+                echo "Unexpected changed file ${file}; skipping."
+                exit 0
+                ;;
+            esac
+          done
+
+          if [[ "${saw_manifest}" != true || "${saw_lockfile}" != true ]]; then
+            echo "The expected SDK manifest and lockfile were not both changed; skipping."
+            exit 0
+          fi
+
+          base_manifest="$(
+            gh api \
+              -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/packages/provider/package.json?ref=${base_sha}"
+          )"
+          head_manifest="$(
+            gh api \
+              -H "Accept: application/vnd.github.raw+json" \
+              "repos/${GITHUB_REPOSITORY}/contents/packages/provider/package.json?ref=${head_sha}"
+          )"
+          old_version="$(jq -er '.dependencies["@github/copilot-sdk"]' <<<"${base_manifest}")"
+          new_version="$(jq -er '.dependencies["@github/copilot-sdk"]' <<<"${head_manifest}")"
+
+          if [[ "${old_version}" == "${new_version}" ]]; then
+            echo "@github/copilot-sdk was not updated; skipping."
+            exit 0
+          fi
+
+          if [[ "${merged}" == "true" ]]; then
+            merge_sha="$(jq -er '.merge_commit_sha' <<<"${pr}")"
+            echo "Resuming publication for merged SDK update ${old_version} -> ${new_version}."
+          else
+            echo "Merging tested @github/copilot-sdk update ${old_version} -> ${new_version}."
+            result="$(
+              gh api \
+                --method PUT \
+                "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/merge" \
+                -f merge_method=squash \
+                -f sha="${TESTED_SHA}"
+            )"
+            jq -e '.merged == true' <<<"${result}" >/dev/null
+            merge_sha="$(jq -er '.sha' <<<"${result}")"
+          fi
+
+          publish_title="CI publish ${merge_sha}"
+          runs="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=workflow_dispatch&per_page=50"
+          )"
+          if jq -e --arg title "${publish_title}" '
+            any(.workflow_runs[];
+              .display_title == $title and
+              (.status != "completed" or .conclusion == "success")
+            )
+          ' <<<"${runs}" >/dev/null; then
+            echo "Publication is already dispatched for ${merge_sha}."
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            if gh workflow run ci.yml \
+              --repo "${GITHUB_REPOSITORY}" \
+              --ref "${default_branch}" \
+              -f publish=true \
+              -f commit_sha="${merge_sha}"; then
+              exit 0
+            fi
+            echo "Publication dispatch attempt ${attempt} failed; retrying."
+            sleep 5
+          done
+
+          echo "Unable to dispatch publication for ${merge_sha}." >&2
+          exit 1

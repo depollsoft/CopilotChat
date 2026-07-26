@@ -4,13 +4,17 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, McpServer, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, Workspace } from "@copilotchat/shared";
-import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload } from "./icons.js";
+import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
+import { formatAic } from "@copilotchat/shared";
+import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
+import { ChatStreamRegistry, pruneLocalRunningChats } from "./chat-streams.js";
+import type { LocalRunningChats } from "./chat-streams.js";
+import { externalLinkProps } from "./links.js";
 import "./styles.css";
 
 type Theme = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
-type Tab = "preferences" | "skills" | "tools" | "code";
+type Tab = "preferences" | "context" | "skills" | "tools" | "code";
 type SseEvent = { event: string; data: unknown };
 type StreamHooks = { onOpen?: () => void; onChunk?: () => void };
 const API_TOKEN_KEY = "copilotchat.apiToken";
@@ -24,16 +28,20 @@ const SYSTEM_THEME_QUERY = "(prefers-color-scheme: dark)";
 const CHAT_ROUTE_PREFIX = "/chats/";
 const PROJECT_ROUTE_PREFIX = "/projects/";
 const LIVE_SCROLL_THRESHOLD = 96;
-const STREAM_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
-const STREAM_RECONNECT_LIMIT = 24;
-const STREAM_STALE_MS = 40_000;
-const STREAM_WATCHDOG_MS = 2000;
-const STREAM_WAKE_PROBE_MS = 1200;
-const STREAM_OPEN_TIMEOUT_MS = 8000;
-const STREAM_HEALTHY_MS = 20_000;
 const DEFAULT_TEXT_SCALE = 0.95;
 const IMPORT_ASSISTANT_SKILL_ID = "import-assistant";
-const EMPTY_PROVIDER: ProviderStatus = { id: "unknown", label: "Loading", available: false, details: "", capabilities: [], models: [], defaultModel: undefined };
+const MODEL_REFRESH_COOLDOWN_MS = 60_000;
+const STREAM_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+const STREAM_RECONNECT_LIMIT = 24;
+/** A suspended app leaves sockets that accept a request but never answer, so cap how long an attempt may stay unopened. */
+const STREAM_OPEN_TIMEOUT_MS = 8_000;
+/** Heartbeats arrive every 15s, so silence for longer than this means the socket died without an EOF. */
+const STREAM_IDLE_TIMEOUT_MS = 40_000;
+/** Only a connection that stays up this long earns a fresh retry budget. */
+const STREAM_HEALTHY_MS = 20_000;
+/** An outage should not burn the retry budget, but a stuck `navigator.onLine` must not stall recovery either. */
+const STREAM_OFFLINE_WAIT_MS = 30_000;
+const EMPTY_PROVIDER: ProviderStatus = { id: "unknown", label: "Loading", available: false, details: "", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: undefined };
 const STARTERS = [
   ["Search the web", "Get up-to-date answers using Copilot tools.", "Search the web for the latest GitHub Copilot SDK release notes and summarize the highlights."],
   ["Plan a refactor", "Outline phases, risks, and validation.", "Help me plan a step-by-step refactor of a Node.js service to TypeScript."],
@@ -48,7 +56,10 @@ type TaskListItem = { title: string; completed: boolean; depth?: number };
 type AssistantActivity = { id: string; type: "reasoning" | "tool" | "subagent" | "task-list"; title: string; status: "running" | "succeeded" | "failed"; content?: string; items?: TaskListItem[]; input?: unknown; output?: unknown; error?: string | null; details?: Record<string, unknown>; steps?: AssistantActivity[] };
 type PendingInteraction = { id: string; kind: "permission" | "user-input" | "elicitation"; title: string; message: string; choices?: string[]; allowFreeform?: boolean; request?: unknown; requestedSchema?: unknown };
 type PendingTurn = { id: string; mode: "steer" | "queue"; content: string; status: "queued" | "sent" | "running" | "done" | "failed"; createdAt: string };
-type ProjectEditorState = { kind: "memory" | "instructions"; title: string; value: string; placeholder: string } | { kind: "reference"; title: string; referenceId?: string; referenceTitle: string; value: string };
+type ChatUsage = { turnNanoAiu: number; chatNanoAiu: number };
+type UsageStatus = ChatUsage & { reported: boolean };
+const emptyChatUsage: ChatUsage = { turnNanoAiu: 0, chatNanoAiu: 0 };
+type ProjectEditorState = { kind: "instructions"; title: string; value: string; placeholder: string } | { kind: "reference"; title: string; referenceId?: string; referenceTitle: string; value: string };
 type AppDialog = { kind: "text"; title: string; message?: string; label: string; initialValue?: string; placeholder?: string; confirmLabel: string; onConfirm: (value: string) => void | Promise<void> } | { kind: "confirm"; title: string; message: string; confirmLabel: string; danger?: boolean; requireText?: string; onConfirm: () => void | Promise<void> };
 type AppRoute = { kind: "home" } | { kind: "chat"; chatId: string } | { kind: "project"; projectId: string };
 type SlashCommand = { command: string; title: string; description: string; body: string };
@@ -57,12 +68,14 @@ type ChatScrollState = { top: number; atLive: boolean };
 type MessageProps = { message: ChatMessage; streaming?: boolean; activities?: AssistantActivity[]; editing?: boolean; editValue?: string; canEdit?: boolean; canRetry?: boolean; onEditStart?: (message: ChatMessage) => void; onEditChange?: (content: string) => void; onEditCancel?: () => void; onEditSave?: (message: ChatMessage, content: string) => void; onRetry?: (message: ChatMessage) => void };
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "preferences", label: "Preferences", icon: <IconSettings width={14} height={14} /> },
+  { id: "context", label: "Personal context", icon: <IconUser width={14} height={14} /> },
   { id: "skills", label: "Skills", icon: <IconSparkle width={14} height={14} /> },
   { id: "tools", label: "Tools", icon: <IconPlug width={14} height={14} /> },
   { id: "code", label: "Code", icon: <IconTerminal width={14} height={14} /> },
 ];
 const DRAWER_DESCRIPTIONS: Record<Tab, string> = {
   preferences: "Account, appearance, imports, notifications, and local data.",
+  context: "Control what CopilotChat knows about you and remembers across conversations.",
   skills: "Choose reusable behaviors for the next turn.",
   tools: "Connect external tools and keep their permissions visible.",
   code: "Attach local folders for cowork tasks.",
@@ -84,7 +97,7 @@ function App(): React.ReactElement {
   const [permissionMode, setPermissionMode] = useState<PermissionMode>(() => localStorage.getItem(PERMISSION_MODE_KEY) === "yolo" ? "yolo" : "ask");
   const [textScale, setTextScale] = useState(() => readTextScale());
   const [seenChatUpdates, setSeenChatUpdates] = useState<Record<string, string>>(() => readSeenChatUpdates());
-  const [localRunningChatIds, setLocalRunningChatIds] = useState<string[]>([]);
+  const [localRunningChats, setLocalRunningChats] = useState<LocalRunningChats>({});
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [editingMessage, setEditingMessage] = useState<{ id: string; content: string } | null>(null);
@@ -92,17 +105,23 @@ function App(): React.ReactElement {
   const [streamingActivities, setStreamingActivities] = useState<AssistantActivity[]>([]);
   const [pendingInteractions, setPendingInteractions] = useState<PendingInteraction[]>([]);
   const [pendingTurns, setPendingTurns] = useState<PendingTurn[]>([]);
+  const [liveUsage, setLiveUsage] = useState<ChatUsage>(emptyChatUsage);
   const [searchQuery, setSearchQuery] = useState("");
   const [drawer, setDrawer] = useState<Tab | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [connectionRevision, setConnectionRevision] = useState(0);
   const [loginRequired, setLoginRequired] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [dialog, setDialog] = useState<AppDialog | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [showJumpToLive, setShowJumpToLive] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const [modelsRefreshing, setModelsRefreshing] = useState(false);
+  const chatStreamsRef = useRef(new ChatStreamRegistry());
+  const loadedChatIdRef = useRef<string | null>(null);
+  const runningChatIdsRef = useRef<Set<string>>(new Set());
+  const stateSnapshotStartedAtRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const liveScrollRef = useRef(true);
   const chatScrollStatesRef = useRef<Record<string, ChatScrollState>>({});
@@ -115,16 +134,8 @@ function App(): React.ReactElement {
   const selectedChatIdRef = useRef<string | null>(null);
   const appPathRef = useRef(appPathForSelection(selectedChatId, activeProjectId));
   const stopResponseRef = useRef<() => void>(() => {});
-  const attachedStreamRef = useRef<{ chatId: string; controller: AbortController } | null>(null);
-  const activeChatIdsRef = useRef<Set<string>>(new Set());
-  const streamAliveAtRef = useRef(0);
-  const transientErrorRef = useRef<string | null>(null);
-  const loadedChatIdRef = useRef<string | null>(null);
-  const streamWatchdogRef = useRef<() => void>(() => {});
-  const streamWakeRef = useRef<() => void>(() => {});
-  const stoppingChatIdRef = useRef<string | null>(null);
-  const notifyChatIdsRef = useRef<Set<string>>(new Set());
-  const wakeProbeRef = useRef(0);
+  const modelRefreshAttemptRef = useRef(0);
+  const modelRefreshPromiseRef = useRef<Promise<void> | null>(null);
   const provider = state?.provider ?? EMPTY_PROVIDER;
   const chats = state?.chats ?? [];
   const allChats = useMemo(() => [...(state?.chats ?? []), ...(state?.archivedChats ?? [])], [state?.chats, state?.archivedChats]);
@@ -134,17 +145,20 @@ function App(): React.ReactElement {
   const activeProject = useMemo(() => projects.find((p) => p.id === (selectedChat?.projectId ?? activeProjectId)) ?? null, [projects, activeProjectId, selectedChat?.projectId]);
   const activeWorkspace = useMemo(() => (state?.workspaces ?? []).find((w) => w.id === (selectedChat?.workspaceId ?? activeWorkspaceId)) ?? null, [state?.workspaces, selectedChat?.workspaceId, activeWorkspaceId]);
   const selectedSkills = useMemo(() => skills.filter((s) => selectedSkillIds.includes(s.id)), [skills, selectedSkillIds]);
-  const runningChatIdsArray = useMemo(() => Array.from(new Set([...(state?.activeChatIds ?? []), ...localRunningChatIds])), [state?.activeChatIds, localRunningChatIds]);
+  const runningChatIdsArray = useMemo(() => Array.from(new Set([...(state?.activeChatIds ?? []), ...Object.keys(localRunningChats)])), [state?.activeChatIds, localRunningChats]);
   const runningChatIds = useMemo(() => new Set(runningChatIdsArray), [runningChatIdsArray]);
   const runningChatKey = runningChatIdsArray.join("|");
   const unreadChatIds = useMemo(() => new Set(chats.filter((chat) => chat.id !== selectedChatId && Boolean(seenChatUpdates[chat.id]) && chat.updatedAt > seenChatUpdates[chat.id]!).map((chat) => chat.id)), [chats, selectedChatId, seenChatUpdates]);
-  const fallbackModel = provider.defaultModel ?? (selectedModel || "gpt-4.1");
-  const providerModels = provider.models.length > 0 ? provider.models : [{ id: fallbackModel, name: fallbackModel, supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 128000, maxPromptTokens: 128000 }];
+  const modelsAuthoritative = provider.modelsAuthoritative;
+  const fallbackModel = !modelsAuthoritative && selectedModel ? selectedModel : provider.defaultModel ?? (selectedModel || "gpt-4.1");
+  const providerModels = modelsAuthoritative && provider.models.length > 0 ? provider.models : [fallbackProviderModel(fallbackModel)];
   const providerDefaultModel = provider.defaultModel ?? providerModels[0]?.id ?? selectedModel;
   const selectedModelInfo = providerModels.find((model) => model.id === selectedModel) ?? providerModels.find((model) => model.id === providerDefaultModel) ?? providerModels[0];
   const effortChoices = reasoningEffortChoices(selectedModelInfo);
   const supportsLongContext = Boolean(selectedModelInfo?.supportsLongContext);
-  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, selectedModelInfo, contextTier]);
+  const memoryContextLength = (state?.memoryStats.user.contextLength ?? 0) + (activeProject ? state?.memoryStats.projects[activeProject.id]?.contextLength ?? 0 : 0);
+  const contextStatus = useMemo(() => buildContextStatus(messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile ?? "", state?.userContext.location ?? null, memoryContextLength, selectedModelInfo ?? null, contextTier), [messages, streamingText, draft, activeProject, activeWorkspace, selectedSkills, state?.userContext.profile, state?.userContext.location, memoryContextLength, selectedModelInfo, contextTier]);
+  const usageStatus = useMemo<UsageStatus>(() => { const chatNanoAiu = Math.max(liveUsage.chatNanoAiu, selectedChat?.totalNanoAiu ?? 0); return { chatNanoAiu, turnNanoAiu: liveUsage.turnNanoAiu, reported: chatNanoAiu > 0 }; }, [liveUsage, selectedChat?.totalNanoAiu]);
   useEffect(() => {
     const query = window.matchMedia(SYSTEM_THEME_QUERY);
     const update = () => setSystemTheme(query.matches ? "dark" : "light");
@@ -156,23 +170,28 @@ function App(): React.ReactElement {
   useEffect(() => { document.documentElement.style.setProperty("--text-scale", textScale.toFixed(2)); localStorage.setItem(TEXT_SCALE_KEY, textScale.toFixed(2)); }, [textScale]);
   useEffect(() => { if (selectedModel) localStorage.setItem(MODEL_KEY, selectedModel); }, [selectedModel]);
   useEffect(() => {
-    if (!provider.defaultModel || provider.models.length === 0) return;
+    if (!modelsAuthoritative || !provider.defaultModel || provider.models.length === 0) return;
     const isSavedFallback = selectedModel === "gpt-4.1" && provider.defaultModel !== "gpt-4.1";
     const missingFromProvider = !provider.models.some((model) => model.id === selectedModel);
     if (!selectedModel || isSavedFallback || missingFromProvider) setSelectedModel(provider.defaultModel);
-  }, [provider.defaultModel, provider.models, selectedModel]);
-  useEffect(() => { if (selectedModelInfo && selectedModelInfo.id !== selectedModel) setSelectedModel(selectedModelInfo.id); }, [selectedModel, selectedModelInfo]);
-  useEffect(() => { if (!effortChoices.includes(reasoningEffort)) setReasoningEffort("default"); }, [effortChoices, reasoningEffort]);
+  }, [modelsAuthoritative, provider.defaultModel, provider.models, selectedModel]);
+  useEffect(() => { if (modelsAuthoritative && selectedModelInfo && selectedModelInfo.id !== selectedModel) setSelectedModel(selectedModelInfo.id); }, [modelsAuthoritative, selectedModel, selectedModelInfo]);
+  useEffect(() => { if (modelsAuthoritative && !effortChoices.includes(reasoningEffort)) setReasoningEffort("default"); }, [modelsAuthoritative, effortChoices, reasoningEffort]);
   useEffect(() => { localStorage.setItem(EFFORT_KEY, reasoningEffort); }, [reasoningEffort]);
-  useEffect(() => { if (provider.id !== "unknown" && !supportsLongContext && contextTier !== "default") setContextTier("default"); }, [provider.id, supportsLongContext, contextTier]);
+  useEffect(() => { if (modelsAuthoritative && !supportsLongContext && contextTier !== "default") setContextTier("default"); }, [modelsAuthoritative, supportsLongContext, contextTier]);
   useEffect(() => { localStorage.setItem(CONTEXT_TIER_KEY, contextTier); }, [contextTier]);
   useEffect(() => { localStorage.setItem(PERMISSION_MODE_KEY, permissionMode); }, [permissionMode]);
   useEffect(() => { drawerRef.current = drawer; }, [drawer]);
   useEffect(() => { sidebarOpenRef.current = sidebarOpen; }, [sidebarOpen]);
   useEffect(() => { busyRef.current = busy; }, [busy]);
+  useEffect(() => {
+    const previous = runningChatIdsRef.current;
+    runningChatIdsRef.current = runningChatIds;
+    const known = new Set(allChats.map((chat) => chat.id));
+    for (const chatId of previous) if (!runningChatIds.has(chatId) && chatId !== selectedChatIdRef.current && known.has(chatId)) notify("CopilotChat", "Response ready");
+  }, [runningChatIds, allChats]);
   useEffect(() => { selectedChatIdRef.current = selectedChatId; appPathRef.current = appPathForSelection(selectedChatId, selectedChat?.projectId ?? activeProjectId); syncAppUrl(appPathRef.current); }, [selectedChatId, selectedChat?.projectId, activeProjectId]);
   useEffect(() => { stopResponseRef.current = () => { void stopActiveResponse(); }; });
-  useEffect(() => { streamWatchdogRef.current = ensureLiveStream; streamWakeRef.current = wakeStreams; });
   useEffect(() => installBackGuard({ drawerRef, sidebarOpenRef, busyRef, stopResponseRef, currentPath: () => appPathRef.current, closeDrawer: () => setDrawer(null), closeSidebar: () => setSidebarOpen(false), toast: setToast }), []);
   useEffect(() => {
     function keyDown(event: KeyboardEvent): void {
@@ -191,8 +210,46 @@ function App(): React.ReactElement {
     return () => window.removeEventListener("keydown", keyDown);
   });
   useEffect(() => { void registerServiceWorker(); void refreshState(); }, []);
+  useEffect(() => {
+    function reconnect(): void {
+      if (document.visibilityState !== "visible") return;
+      setConnectionRevision((revision) => revision + 1);
+    }
+    function visibilityChanged(): void {
+      if (document.visibilityState === "visible") reconnect();
+    }
+    function pageShown(event: PageTransitionEvent): void {
+      if (event.persisted) reconnect();
+    }
+    document.addEventListener("visibilitychange", visibilityChanged);
+    window.addEventListener("pageshow", pageShown);
+    window.addEventListener("online", reconnect);
+    return () => {
+      document.removeEventListener("visibilitychange", visibilityChanged);
+      window.removeEventListener("pageshow", pageShown);
+      window.removeEventListener("online", reconnect);
+    };
+  }, []);
+  useEffect(() => {
+    if (connectionRevision === 0) return;
+    void refreshState();
+    void refreshModels();
+  }, [connectionRevision, apiToken]);
+  useEffect(() => {
+    const refreshFocusedModels = () => { if (document.visibilityState === "visible") void refreshModels(); };
+    window.addEventListener("focus", refreshFocusedModels);
+    return () => window.removeEventListener("focus", refreshFocusedModels);
+  }, [apiToken]);
   useEffect(() => { if (selectedChat) { markChatSeen(selectedChat.id, selectedChat.updatedAt); setActiveProjectId(selectedChat.projectId); setActiveWorkspaceId(selectedChat.workspaceId); if (selectedChat.model) setSelectedModel(selectedChat.model); setReasoningEffort(selectedChat.reasoningEffort && EFFORT_OPTIONS.includes(selectedChat.reasoningEffort) ? selectedChat.reasoningEffort : "default"); setContextTier(selectedChat.contextTier ?? "default"); } }, [selectedChat]);
-  useEffect(() => { if (!selectedChatId) { loadedChatIdRef.current = null; attachedStreamRef.current?.controller.abort(); attachedStreamRef.current = null; setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); return; } const controller = new AbortController(); void loadChatAndReconnect(selectedChatId, controller); return () => controller.abort(); }, [selectedChatId, apiToken]);
+  useEffect(() => {
+    if (!selectedChatId) { loadedChatIdRef.current = null; setBusy(false); setLiveUsage(emptyChatUsage); setMessages([]); clearStreamingView(); return; }
+    const chatId = selectedChatId;
+    const alreadyStreaming = chatStreamsRef.current.has(chatId);
+    setBusy(alreadyStreaming || runningChatIdsRef.current.has(chatId));
+    const controller = new AbortController();
+    if (!alreadyStreaming) { setLiveUsage(emptyChatUsage); void loadChatAndReconnect(chatId, controller); }
+    return () => { controller.abort(); chatStreamsRef.current.abort(chatId); };
+  }, [selectedChatId, apiToken, connectionRevision]);
   useEffect(() => {
     setShowJumpToLive(false);
     if (!selectedChatId) {
@@ -205,19 +262,9 @@ function App(): React.ReactElement {
     pendingChatScrollRef.current = { chatId: selectedChatId, state: saved };
     liveScrollRef.current = saved?.atLive ?? true;
   }, [selectedChatId, activeProjectId]);
-  useEffect(() => { activeChatIdsRef.current = new Set(state?.activeChatIds ?? []); }, [state?.activeChatIds]);
-  useEffect(() => { if (!state) return; const active = new Set(state.activeChatIds); setLocalRunningChatIds((current) => current.filter((id) => active.has(id) || (busy && id === selectedChatId))); }, [state?.activeChatIds, busy, selectedChatId]);
+  useEffect(() => { if (!state) return; setLocalRunningChats((current) => pruneLocalRunningChats(current, state.activeChatIds, stateSnapshotStartedAtRef.current, busy ? selectedChatId : null)); }, [state?.activeChatIds, busy, selectedChatId]);
   useEffect(() => { if (!runningChatKey) return; const id = window.setInterval(() => void refreshState(), 1200); return () => window.clearInterval(id); }, [runningChatKey, apiToken]);
   useEffect(() => { if (provider.id !== "unknown") return; const id = window.setInterval(() => void refreshState(), 1000); return () => window.clearInterval(id); }, [provider.id, apiToken]);
-  useEffect(() => {
-    const watchdog = window.setInterval(() => streamWatchdogRef.current(), STREAM_WATCHDOG_MS);
-    function wake(): void { streamWakeRef.current(); }
-    function restored(event: PageTransitionEvent): void { if (event.persisted) streamWakeRef.current(); }
-    document.addEventListener("visibilitychange", wake);
-    window.addEventListener("online", wake);
-    window.addEventListener("pageshow", restored);
-    return () => { window.clearInterval(watchdog); window.clearTimeout(wakeProbeRef.current); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); window.removeEventListener("pageshow", restored); };
-  }, []);
   useLayoutEffect(() => {
     if (!selectedChatId) return;
     const pending = pendingChatScrollRef.current;
@@ -228,10 +275,34 @@ function App(): React.ReactElement {
     }
     if (liveScrollRef.current) scrollToLive("auto");
   }, [selectedChatId, messages, streamingText, streamingActivities, pendingTurns, pendingInteractions, busy]);
-  async function refreshState(): Promise<void> { try { const next = await api<AppState>("/api/state", {}, apiToken); setLoginRequired(false); clearTransientError(); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); reportTransientError(message); } }
-  function reportTransientError(message: string): void { transientErrorRef.current = message; setError(message); }
-  function clearTransientError(): void { const shown = transientErrorRef.current; if (shown === null) return; transientErrorRef.current = null; setError((current) => current === shown ? null : current); }
-  async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { saveCurrentChatScroll(); activateLiveScroll(); const projectDefaultModel = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const model = projectDefaultModel ?? selectedModelInfo?.id ?? selectedModel; const modelInfo = providerModels.find((item) => item.id === model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = choices.includes(reasoningEffort) ? reasoningEffort : "default"; const nextContextTier = modelInfo?.supportsLongContext ? contextTier : "default"; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); composerRef.current?.focus(); return chat; }
+  async function refreshState(): Promise<void> { const requestedAt = Date.now(); try { const next = await api<AppState>("/api/state", {}, apiToken); stateSnapshotStartedAtRef.current = Math.max(stateSnapshotStartedAtRef.current, requestedAt); setLoginRequired(false); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); clearStreamingView(); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); setError((current) => current && isNetworkError(current) ? null : current); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); setError(message); } }
+  async function refreshModels(force = false): Promise<void> {
+    const now = Date.now();
+    if (!force && now - modelRefreshAttemptRef.current < MODEL_REFRESH_COOLDOWN_MS) return;
+    if (modelRefreshPromiseRef.current) return modelRefreshPromiseRef.current;
+    const promise = (async () => {
+      setModelsRefreshing(true);
+      try {
+        const nextProvider = await api<ProviderStatus>("/api/provider/refresh", { method: "POST", body: { force } }, apiToken);
+        modelRefreshAttemptRef.current = nextProvider.modelsAuthoritative ? Date.now() : 0;
+        setState((current) => current ? { ...current, provider: nextProvider } : current);
+        if (force && nextProvider.modelsAuthoritative) { setError(null); setToast(`${nextProvider.models.length} models available`); }
+        if (force && !nextProvider.modelsAuthoritative) setError(nextProvider.details || "Model discovery is unavailable.");
+      } catch (e) {
+        modelRefreshAttemptRef.current = 0;
+        setError(toErr(e));
+      } finally {
+        setModelsRefreshing(false);
+      }
+    })();
+    modelRefreshPromiseRef.current = promise;
+    try {
+      await promise;
+    } finally {
+      if (modelRefreshPromiseRef.current === promise) modelRefreshPromiseRef.current = null;
+    }
+  }
+  async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { saveCurrentChatScroll(); activateLiveScroll(); const configuredProjectDefault = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const projectDefaultModel = configuredProjectDefault && modelsAuthoritative && provider.models.some((model) => model.id === configuredProjectDefault) ? configuredProjectDefault : null; const safeDefaultModel = selectedModel || provider.defaultModel || provider.models[0]?.id || selectedModelInfo?.id || "gpt-4.1"; const model = projectDefaultModel ?? (modelsAuthoritative ? selectedModelInfo?.id ?? safeDefaultModel : safeDefaultModel); const modelInfo = providerModels.find((item) => item.id === model) ?? fallbackProviderModel(model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = modelsAuthoritative ? choices.includes(reasoningEffort) ? reasoningEffort : "default" : reasoningEffort; const nextContextTier = modelsAuthoritative ? modelInfo.supportsLongContext ? contextTier : "default" : contextTier; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); clearStreamingView(); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); composerRef.current?.focus(); return chat; }
   async function renameChat(chat: Chat): Promise<void> { setDialog({ kind: "text", title: "Rename chat", label: "Chat title", initialValue: chat.title, confirmLabel: "Save title", onConfirm: async (title) => { if (!title.trim()) return; await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { title: title.trim() } }, apiToken); await refreshState(); } }); }
   async function archiveChat(chat: Chat): Promise<void> { await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { archived: true } }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Archived chat"); }
   async function deleteChat(chat: Chat): Promise<void> { setDialog({ kind: "confirm", title: "Delete chat?", message: `"${chat.title}" will be permanently deleted from this device.`, confirmLabel: "Delete chat", danger: true, onConfirm: async () => { await api<void>(`/api/chats/${chat.id}`, { method: "DELETE", raw: true }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Deleted chat"); } }); }
@@ -244,150 +315,191 @@ function App(): React.ReactElement {
   function changeReasoningEffort(effort: ReasoningEffort): void { setReasoningEffort(effort); if (selectedChatIdRef.current) void api<Chat>(`/api/chats/${selectedChatIdRef.current}`, { method: "PATCH", body: { reasoningEffort: effort } }, apiToken).then(() => refreshState()).catch((e) => setError(toErr(e))); }
   function changeContextTier(tier: ContextTier): void { setContextTier(tier); if (selectedChatIdRef.current) void api<Chat>(`/api/chats/${selectedChatIdRef.current}`, { method: "PATCH", body: { contextTier: tier } }, apiToken).then(() => refreshState()).catch((e) => setError(toErr(e))); }
   function changePermissionMode(mode: PermissionMode): void { setPermissionMode(mode); const chatId = selectedChatIdRef.current; if (chatId && busyRef.current) void api<{ active: boolean }>(`/api/chats/${chatId}/active-response`, { method: "PATCH", body: { permissionMode: mode } }, apiToken).catch((e) => setError(toErr(e))); }
-  async function sendMessage(content: string, options: { chat?: Chat; skillIds?: string[]; attachments?: MessageAttachment[] } = {}): Promise<void> { const trimmed = content.trim(); const attachments = options.attachments ?? []; if ((!trimmed && attachments.length === 0) || busy) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); let chat = options.chat ?? selectedChat; const useChatSettings = Boolean(options.chat) || !chat; if (!chat) chat = await createChat(activeProjectId, activeWorkspaceId, { cleanup: false, refresh: false }); setDraft(""); setMessages((m) => [...m, { id: `optimistic-${Date.now()}`, chatId: chat.id, role: "user", content: trimmed, provider: null, metadata: attachments.length ? { attachments } : {}, createdAt: new Date().toISOString() }]); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(chat.id, `/api/chats/${chat.id}/messages`, turnBody(trimmed, chat, options.skillIds, attachments, useChatSettings ? chat : undefined), controller); }
-  async function sendWhileBusy(mode: "steer" | "queue", content: string, attachments: MessageAttachment[] = []): Promise<void> { const trimmed = content.trim(); const chat = selectedChat; if ((!trimmed && attachments.length === 0) || !chat || !busy) return; setDraft(""); const pending = await api<PendingTurn>(`/api/chats/${chat.id}/active-response/input`, { method: "POST", body: { ...turnBody(trimmed, chat, selectedSkillIds, attachments), mode } }, apiToken); setPendingTurns((current) => upsertPendingTurn(current, pending)); }
-  async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
-  async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setMessages(messages.slice(0, index)); const controller = new AbortController(); abortRef.current = controller; await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
-  async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> { try { if (loadedChatIdRef.current !== chatId) { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); } loadedChatIdRef.current = chatId; const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken); if (controller.signal.aborted) return; setMessages(loaded); if (hasLiveStream(chatId)) return; await streamChatResponse(chatId, activeResponsePath(chatId), undefined, controller, "GET", false); } catch (e) { if (isAbortError(e)) return; const message = toErr(e); if (message.includes("Chat not found")) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); syncAppUrl(appPathForSelection(null, activeProjectId)); await refreshState(); return; } setError(message); } }
-  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", notifyWhenDone = true, resyncMessages = false): Promise<void> {
-    // Only one stream may own the visible chat state, otherwise racing snapshots rewind the transcript.
-    const previous = attachedStreamRef.current;
-    if (previous && previous.controller !== controller) previous.controller.abort();
-    attachedStreamRef.current = { chatId, controller };
-    abortRef.current = controller;
-    // A reconnect replaces the stream that was waiting to notify, so the intent lives with the chat.
-    if (notifyWhenDone) notifyChatIdsRef.current.add(chatId);
+  async function sendMessage(content: string, options: { chat?: Chat; skillIds?: string[]; attachments?: MessageAttachment[] } = {}, onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const attachments = options.attachments ?? []; if ((!trimmed && attachments.length === 0) || (options.chat ? chatStreamsRef.current.has(options.chat.id) : busy)) return; activateLiveScroll(); setBusy(true); setError(null); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); try { let chat = options.chat ?? selectedChat; const useChatSettings = Boolean(options.chat) || !chat; if (!chat) chat = await createChat(activeProjectId, activeWorkspaceId, { cleanup: false, refresh: false }); const controller = new AbortController(); const accepted = () => { setDraft(""); void api<ChatMessage[]>(`/api/chats/${chat.id}/messages`, {}, apiToken).then((next) => { if (selectedChatIdRef.current === chat.id) setMessages(next); }).catch((error) => setError(toErr(error))); onAccepted?.(); }; await streamChatResponse(chat.id, `/api/chats/${chat.id}/messages`, turnBody(trimmed, chat, options.skillIds, attachments, useChatSettings ? chat : undefined), controller, "POST", false, accepted); } catch (error) { setBusy(false); setError(toErr(error)); throw error; } }
+  async function sendWhileBusy(mode: "steer" | "queue", content: string, attachments: MessageAttachment[] = [], onAccepted?: () => void): Promise<void> { const trimmed = content.trim(); const chat = selectedChat; if ((!trimmed && attachments.length === 0) || !chat || !busy) return; const pending = await api<PendingTurn>(`/api/chats/${chat.id}/active-response/input`, { method: "POST", body: { ...turnBody(trimmed, chat, selectedSkillIds, attachments), mode } }, apiToken); onAccepted?.(); setDraft(""); if (isVisibleChat(chat.id)) setPendingTurns((current) => upsertPendingTurn(current, pending)); }
+  async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
+  async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
+  async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> {
+    // Reattaching to the chat already on screen must not blank its running turn; only a chat switch should.
+    if (loadedChatIdRef.current !== chatId) clearStreamingView();
+    loadedChatIdRef.current = chatId;
+    let networkFailures = 0;
+    while (!controller.signal.aborted) {
+      try {
+        const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
+        if (selectedChatIdRef.current !== chatId) return;
+        setMessages(loaded);
+        setLiveUsage((current) => current.turnNanoAiu > 0 ? current : { ...current, turnNanoAiu: latestResponseNanoAiu(loaded) });
+        setError((current) => current && isNetworkError(current) ? null : current);
+        if (chatStreamsRef.current.has(chatId)) return;
+        await streamChatResponse(chatId, `/api/chats/${chatId}/active-response`, undefined, controller, "GET", true);
+        return;
+      } catch (e) {
+        if ((e as Error).name === "AbortError" || controller.signal.aborted) return;
+        const message = toErr(e);
+        if (message.includes("Chat not found")) {
+          selectedChatIdRef.current = null;
+          setSelectedChatId(null);
+          setMessages([]);
+          clearStreamingView();
+          setError(null);
+          syncAppUrl(appPathForSelection(null, activeProjectId));
+          await refreshState();
+          return;
+        }
+        if (!isNetworkError(message)) {
+          setError(message);
+          return;
+        }
+        networkFailures += 1;
+        if (networkFailures >= 3) setError(message);
+        await waitForRetry(Math.min(500 * (2 ** (networkFailures - 1)), 4_000), controller.signal);
+      }
+    }
+  }
+  /** True while `chatId` is the chat on screen, so only its stream may write to the visible response. */
+  function isVisibleChat(chatId: string): boolean { return selectedChatIdRef.current === chatId; }
+  function clearStreamingView(): void { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); }
+  async function syncChatMessages(chatId: string, controller?: AbortController): Promise<void> {
+    if (!isVisibleChat(chatId)) return;
+    const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
+    // This fetch is not tied to the stream, so a chat switch or a replacement stream during it has to win.
+    if (!isVisibleChat(chatId)) return;
+    if (controller && !chatStreamsRef.current.isLive(chatId, controller)) return;
+    setMessages(loaded);
+  }
+  async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", rethrowNetworkErrors = false, onAccepted?: () => void): Promise<void> {
+    chatStreamsRef.current.begin(chatId, controller);
     addRunningChat(chatId);
-    markStreamAlive();
     let completed = false;
+    let idle = false;
     let attempts = 0;
-    let resync = resyncMessages;
-    let target: { url: string; body: unknown; method: string } = { url, body, method };
+    let resync = false;
+    let target: { url: string; body: unknown; method: string; onAccepted?: () => void } = { url, body, method, onAccepted };
     try {
       while (!completed) {
         if (controller.signal.aborted) return;
-        let opened = false;
-        let openedAt = 0;
-        let openTimedOut = false;
-        // A suspended app can leave a pooled socket that accepts the request but never answers, so cap the connect wait.
-        const attemptController = new AbortController();
-        const abortAttempt = (): void => attemptController.abort();
+        const attempt = new AbortController();
+        const abortAttempt = (): void => attempt.abort();
         controller.signal.addEventListener("abort", abortAttempt);
-        const openTimer = window.setTimeout(() => { if (!opened) { openTimedOut = true; attemptController.abort(); } }, STREAM_OPEN_TIMEOUT_MS);
+        const state = { opened: false, openedAt: 0, expired: null as "open" | "idle" | null };
+        let timer = window.setTimeout(() => { state.expired = "open"; attempt.abort(); }, STREAM_OPEN_TIMEOUT_MS);
+        const armIdleTimer = (): void => { window.clearTimeout(timer); timer = window.setTimeout(() => { state.expired = "idle"; attempt.abort(); }, STREAM_IDLE_TIMEOUT_MS); };
         try {
-          // Only a connection that stays up earns a fresh retry budget, otherwise a server that snapshots
-          // and immediately drops the body would be reconnected forever at the shortest backoff.
-          const noteTraffic = (): void => { markStreamAlive(); if (attempts > 0 && Date.now() - openedAt >= STREAM_HEALTHY_MS) attempts = 0; };
-          for await (const event of streamSse(target.url, target.body, attemptController.signal, apiToken, target.method, { onOpen: () => { opened = true; openedAt = Date.now(); window.clearTimeout(openTimer); markStreamAlive(); clearTransientError(); }, onChunk: noteTraffic })) {
-            const done = await handleStreamEvent(chatId, event);
-            if (done) { completed = true; break; }
-            // A turn can finish while the socket is dead, and its saved message only ever arrives once,
-            // so a reattached stream has to pull the transcript back in line.
-            if (resync) { resync = false; const saved = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken); if (controller.signal.aborted) return; setMessages(saved); }
+          for await (const event of streamSse(target.url, target.body, attempt.signal, apiToken, target.method, target.onAccepted, {
+            onOpen: () => { state.opened = true; state.openedAt = Date.now(); armIdleTimer(); },
+            onChunk: () => { armIdleTimer(); if (attempts > 0 && Date.now() - state.openedAt >= STREAM_HEALTHY_MS) attempts = 0; },
+          })) {
+            // A queued or steered turn can finish while the socket is dead and its saved message arrives
+            // exactly once, so a stream that just reattached has to pull the transcript back in line.
+            if (resync) { resync = false; await syncChatMessages(chatId, controller); if (!chatStreamsRef.current.isLive(chatId, controller)) return; }
+            const outcome = await handleStreamEvent(chatId, event, controller);
+            if (outcome !== "continue") { completed = true; idle = outcome === "idle"; break; }
           }
         } catch (e) {
-          const failure = openTimedOut && isAbortError(e) && !controller.signal.aborted ? new Error("Timed out connecting to this response.") : e;
-          if (isFatalStreamError(failure) || isAbortError(failure)) throw failure;
-          // A POST that never opened may never have reached the server, so retrying it could duplicate the turn.
-          if (!opened && target.method !== "GET") throw failure;
-          if (attempts >= STREAM_RECONNECT_LIMIT) throw failure;
+          if (controller.signal.aborted) return;
+          // A timeout only aborts this attempt, so it has to become a real failure instead of a silent cancel.
+          const failure = state.expired && isAbortError(e) ? new Error(state.expired === "open" ? "Network error: timed out connecting to this response." : "Network error: this response stream went silent.") : e;
+          // A fatal error is the server's own answer, and a POST that never opened may still have started a
+          // turn, so retrying either one is wrong.
+          if (failure instanceof FatalStreamError || isAbortError(failure) || (!state.opened && target.method !== "GET") || attempts >= STREAM_RECONNECT_LIMIT) throw failure;
         } finally {
-          window.clearTimeout(openTimer);
+          window.clearTimeout(timer);
           controller.signal.removeEventListener("abort", abortAttempt);
         }
         if (completed) break;
         if (controller.signal.aborted) return;
-        // The transport ended without a terminal event: the response is probably still running server-side.
-        if (attempts >= STREAM_RECONNECT_LIMIT) throw new Error("Lost the connection to this response. Reload to reconnect.");
-        target = { url: activeResponsePath(chatId), body: undefined, method: "GET" };
+        // The transport ended without a terminal event, so the response is probably still running server-side.
+        // Reattaching keeps the turn on screen instead of collapsing the chat back to an idle state.
+        if (attempts >= STREAM_RECONNECT_LIMIT) throw new Error("Network error: lost the connection to this response.");
+        target = { url: `/api/chats/${chatId}/active-response`, body: undefined, method: "GET" };
         resync = true;
         const offline = !navigator.onLine;
-        await waitBeforeReconnect(STREAM_RECONNECT_DELAYS_MS[Math.min(attempts, STREAM_RECONNECT_DELAYS_MS.length - 1)] ?? 1000, controller.signal);
-        await waitUntilOnline(controller.signal);
+        await waitForRetry(STREAM_RECONNECT_DELAYS_MS[Math.min(attempts, STREAM_RECONNECT_DELAYS_MS.length - 1)] ?? 8_000, controller.signal);
+        // Waiting out an outage keeps it from burning the retry budget, but a stuck `onLine` flag must not
+        // strand the stream, so the wait is bounded and a retry happens either way.
+        if (offline) await waitUntilOnline(controller.signal, STREAM_OFFLINE_WAIT_MS);
+        // Both waits resolve immediately once aborted, and an abort listener added afterwards never fires,
+        // so ownership has to be rechecked before another attempt may open.
         if (controller.signal.aborted) return;
-        attempts = offline ? 0 : attempts + 1;
+        // Time spent offline is not the server's fault, so it must not burn the retry budget.
+        if (!offline) attempts += 1;
       }
-      if (controller.signal.aborted) return;
-      setStreamingText("");
-      setStreamingActivities([]);
-      setPendingInteractions([]);
-      setPendingTurns([]);
-      setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
+      if (!chatStreamsRef.current.isLive(chatId, controller)) return;
+      if (isVisibleChat(chatId)) clearStreamingView();
+      await syncChatMessages(chatId, controller);
       await refreshState();
-      if (notifyChatIdsRef.current.delete(chatId) || notifyWhenDone) notify("CopilotChat", "Response ready");
+      if (!idle) notify("CopilotChat", "Response ready");
     } catch (e) {
-      // Only a cancelled stream is silent; a connect timeout still has to reach the user.
-      if (!(isAbortError(e) && controller.signal.aborted)) { removeRunningChat(chatId); if (isFatalStreamError(e)) setError(toErr(e)); else reportTransientError(toErr(e)); }
-    } finally {
-      const owned = abortRef.current === controller;
-      // A state poll in flight during completion can still list this chat, so do not let the watchdog re-attach.
-      if (completed) activeChatIdsRef.current.delete(chatId);
-      if (completed || (owned && !controller.signal.aborted)) removeRunningChat(chatId);
-      if (attachedStreamRef.current?.controller === controller) attachedStreamRef.current = null;
-      if (owned) {
-        abortRef.current = null;
-        setBusy(false);
+      if (!isAbortError(e) && chatStreamsRef.current.isLive(chatId, controller)) {
+        removeRunningChat(chatId);
+        const message = toErr(e);
+        if (rethrowNetworkErrors && isNetworkError(message)) throw e;
+        if (isVisibleChat(chatId)) setError(message);
+        else setToast("A response failed in another chat");
       }
+    } finally {
+      const wasLiveStream = chatStreamsRef.current.end(chatId, controller);
+      if (wasLiveStream && (completed || !controller.signal.aborted)) removeRunningChat(chatId);
+      if (wasLiveStream && !controller.signal.aborted && isVisibleChat(chatId)) setBusy(false);
     }
   }
-  function markStreamAlive(): void { streamAliveAtRef.current = Date.now(); }
-  function hasLiveStream(chatId: string): boolean { const attached = attachedStreamRef.current; return attached?.chatId === chatId && !attached.controller.signal.aborted; }
-  function attachToActiveResponse(chatId: string): void {
-    void streamChatResponse(chatId, activeResponsePath(chatId), undefined, new AbortController(), "GET", false, true);
+  /** "idle" reports a stream that found no response running, so it is not a completion worth announcing. */
+  async function handleStreamEvent(chatId: string, event: SseEvent, controller: AbortController): Promise<"continue" | "done" | "idle"> {
+    const visible = isVisibleChat(chatId);
+    if (event.event === "snapshot") {
+      if (!visible) return "continue";
+      const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown; usage?: unknown };
+      setBusy(true);
+      setStreamingText(data.text ?? "");
+      setStreamingActivities(readActivities(data.activities));
+      setPendingInteractions(readInteractions(data.interactions));
+      setPendingTurns(readPendingTurns(data.pendingTurns));
+      setLiveUsage(readChatUsage(data.usage));
+      return "continue";
+    }
+    if (event.event === "usage") { if (visible) setLiveUsage(readChatUsage(event.data)); return "continue"; }
+    if (event.event === "pending") { if (visible) { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); } return "continue"; }
+    if (event.event === "message") {
+      await syncChatMessages(chatId, controller);
+      if (isVisibleChat(chatId) && chatStreamsRef.current.isLive(chatId, controller)) { setStreamingText(""); setStreamingActivities([]); }
+      return "continue";
+    }
+    if (event.event === "interaction") { if (visible) { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); } return "continue"; }
+    if (event.event === "activity") { if (visible) { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); } return "continue"; }
+    if (event.event === "delta") { if (visible) { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); } return "continue"; }
+    if (event.event === "artifact") { void refreshState(); if (visible) setToast("Artifact created"); return "continue"; }
+    if (event.event === "error") throw new FatalStreamError((event.data as { message?: string }).message ?? "Message failed");
+    if (event.event === "done") {
+      const data = event.data as { active?: boolean; cancelled?: boolean } | undefined;
+      if (data?.active === false) return "idle";
+      if (data?.cancelled && visible) setToast("Response stopped");
+      if (isVisibleChat(chatId)) { setPendingInteractions([]); setPendingTurns([]); }
+      await syncChatMessages(chatId, controller);
+      return "done";
+    }
+    return "continue";
   }
-  function ensureLiveStream(): void {
-    const chatId = selectedChatIdRef.current;
-    if (!chatId || stoppingChatIdRef.current === chatId) return;
-    if (!hasLiveStream(chatId)) { if (activeChatIdsRef.current.has(chatId)) attachToActiveResponse(chatId); return; }
-    // A frozen tab keeps a dead socket open, so treat a stream with no traffic as lost once heartbeats stop arriving.
-    if (document.visibilityState !== "visible" || Date.now() - streamAliveAtRef.current < STREAM_STALE_MS) return;
-    attachToActiveResponse(chatId);
-  }
-  function wakeStreams(): void {
-    if (document.visibilityState !== "visible") return;
-    void refreshState();
-    ensureLiveStream();
-    // Suspending the app can kill the socket without an EOF, so re-attach unless traffic resumes right after waking.
-    const wokeAt = Date.now();
-    window.clearTimeout(wakeProbeRef.current);
-    wakeProbeRef.current = window.setTimeout(() => {
-      const chatId = selectedChatIdRef.current;
-      if (document.visibilityState !== "visible" || !chatId) return;
-      if (!hasLiveStream(chatId)) { ensureLiveStream(); return; }
-      if (streamAliveAtRef.current < wokeAt) attachToActiveResponse(chatId);
-    }, STREAM_WAKE_PROBE_MS);
-  }
-  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<boolean> { if (event.event === "snapshot") { const data = event.data as { text?: string; activities?: unknown; interactions?: unknown; pendingTurns?: unknown }; setBusy(true); setStreamingText(data.text ?? ""); setStreamingActivities(readActivities(data.activities)); setPendingInteractions(readInteractions(data.interactions)); setPendingTurns(readPendingTurns(data.pendingTurns)); return false; } if (event.event === "pending") { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); return false; } if (event.event === "message") { setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); setStreamingText(""); setStreamingActivities([]); return false; } if (event.event === "interaction") { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); return false; } if (event.event === "activity") { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); return false; } if (event.event === "delta") { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); return false; } if (event.event === "artifact") { void refreshState(); setToast("Artifact created"); return false; } if (event.event === "error") throw new FatalStreamError((event.data as { message?: string }).message ?? "Message failed"); if (event.event === "done") { const data = event.data as { active?: boolean; cancelled?: boolean } | undefined; if (data?.active === false) return true; if (data?.cancelled) setToast("Response stopped"); setPendingInteractions([]); setPendingTurns([]); setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken)); return true; } return false; }
   async function resolveInteraction(interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }): Promise<void> { const chatId = selectedChatIdRef.current; if (!chatId) return; setPendingInteractions((current) => current.filter((item) => item.id !== interaction.id)); await api<void>(`/api/chats/${chatId}/interactions/${interaction.id}`, { method: "POST", body: resolution, raw: true }, apiToken); }
   async function stopActiveResponse(): Promise<void> {
     const chatId = selectedChatIdRef.current;
-    const controller = abortRef.current;
-    stoppingChatIdRef.current = chatId;
-    if (chatId) notifyChatIdsRef.current.delete(chatId);
-    controller?.abort();
-    if (attachedStreamRef.current?.controller === controller) attachedStreamRef.current = null;
+    if (chatId) chatStreamsRef.current.abort(chatId);
     try {
       if (chatId) {
         await api<void>(`/api/chats/${chatId}/active-response`, { method: "DELETE", raw: true }, apiToken);
         removeRunningChat(chatId);
-        if (selectedChatIdRef.current === chatId) setMessages(await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken));
+        await syncChatMessages(chatId);
       }
     } catch (e) {
       setError(toErr(e));
     } finally {
-      stoppingChatIdRef.current = null;
-      if (abortRef.current === controller) abortRef.current = null;
-      // A newer stream may have taken over while the cancel was in flight; its state must survive.
-      if (attachedStreamRef.current === null) {
+      if (selectedChatIdRef.current === chatId) {
         setBusy(false);
-        setStreamingText("");
-        setStreamingActivities([]);
-        setPendingInteractions([]);
-        setPendingTurns([]);
+        clearStreamingView();
       }
     }
   }
-  function turnBody(content: string, chat: Chat, skillIds = selectedSkillIds, attachments: MessageAttachment[] = [], chatSettings?: Chat): Record<string, unknown> { return { content, attachments, projectId: chat.projectId, workspaceId: chat.workspaceId ?? activeWorkspaceId, skillIds, model: chatSettings?.model ?? selectedModel, reasoningEffort: chatSettings?.reasoningEffort ?? reasoningEffort, contextTier: chatSettings?.contextTier ?? contextTier, permissionMode }; }
+  function turnBody(content: string, chat: Chat, skillIds = selectedSkillIds, attachments: MessageAttachment[] = [], chatSettings?: Chat): Record<string, unknown> { return { content, attachments: attachments.map(attachmentForRequest), projectId: chat.projectId, workspaceId: chat.workspaceId ?? activeWorkspaceId, skillIds, model: chatSettings?.model ?? selectedModel, reasoningEffort: chatSettings?.reasoningEffort ?? reasoningEffort, contextTier: chatSettings?.contextTier ?? contextTier, permissionMode }; }
   function initializeSeenChatUpdates(next: AppState): void {
     if (seenInitializedRef.current) return;
     seenInitializedRef.current = true;
@@ -406,15 +518,15 @@ function App(): React.ReactElement {
       const deleted = new Set(result.deletedChatIds);
       setState((current) => current ? { ...current, chats: current.chats.filter((chat) => !deleted.has(chat.id)), archivedChats: current.archivedChats.filter((chat) => !deleted.has(chat.id)) } : current);
       setSeenChatUpdates((current) => { const next = { ...current }; for (const id of deleted) delete next[id]; return writeSeenChatUpdates(next); });
-      setLocalRunningChatIds((current) => current.filter((id) => !deleted.has(id)));
+      setLocalRunningChats((current) => { const next = { ...current }; for (const id of deleted) delete next[id]; return next; });
       if (selectedChatIdRef.current && deleted.has(selectedChatIdRef.current)) setSelectedChatId(null);
     } catch (e) {
       setError(toErr(e));
     }
   }
   async function clearAllData(): Promise<void> {
-    setDialog({ kind: "confirm", title: "Clear local app data?", message: "This deletes chats, projects, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.", confirmLabel: "Clear all data", danger: true, requireText: "CLEAR", onConfirm: async () => {
-      abortRef.current?.abort();
+    setDialog({ kind: "confirm", title: "Clear local app data?", message: "This deletes chats, projects, profile context, saved locations, memories, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.", confirmLabel: "Clear all data", danger: true, requireText: "CLEAR", onConfirm: async () => {
+      chatStreamsRef.current.abortAll();
       await api<void>("/api/data", { method: "DELETE", raw: true }, apiToken);
       selectedChatIdRef.current = null;
       setSelectedChatId(null);
@@ -424,11 +536,8 @@ function App(): React.ReactElement {
       composerRef.current?.clear();
       setDraft("");
       setMessages([]);
-      setStreamingText("");
-      setStreamingActivities([]);
-      setPendingInteractions([]);
-      setPendingTurns([]);
-      setLocalRunningChatIds([]);
+      clearStreamingView();
+      setLocalRunningChats({});
       setSeenChatUpdates(writeSeenChatUpdates({}));
       setBusy(false);
       setError(null);
@@ -437,9 +546,12 @@ function App(): React.ReactElement {
     } });
   }
   async function startGuidedImport(file: File): Promise<void> {
+    let uploaded: MessageAttachment | null = null;
+    let draftCreated = false;
     try {
-      const isZip = file.name.toLowerCase().endsWith(".zip");
-      const draft = await api<ImportDraft>("/api/imports/drafts", { method: "POST", body: { source: "auto", fileName: file.name, content: isZip ? await fileToBase64(file) : await file.text(), encoding: isZip ? "base64" : "text" } }, apiToken);
+      uploaded = await uploadFile(file, apiToken);
+      const draft = await api<ImportDraft>("/api/imports/drafts", { method: "POST", body: { source: "auto", uploadId: uploaded.uploadId } }, apiToken);
+      draftCreated = true;
       const importSkillId = state?.skills.find((skill) => skill.manifest.id === IMPORT_ASSISTANT_SKILL_ID || skill.id === IMPORT_ASSISTANT_SKILL_ID)?.id ?? "";
       const skillIds = importSkillId ? [importSkillId] : [];
       if (importSkillId) setSelectedSkillIds((current) => current.includes(importSkillId) ? current : [...current, importSkillId]);
@@ -447,13 +559,17 @@ function App(): React.ReactElement {
       const chat = await createChat(null, null, { cleanup: false, refresh: false });
       await sendMessage(guidedImportPrompt(draft), { chat, skillIds });
     } catch (e) {
-      setError(toErr(e));
+      let message = toErr(e);
+      if (uploaded && !draftCreated) {
+        try { await discardUploadedFile(uploaded, apiToken); } catch (cleanupError) { message = `${message} Cleanup also failed: ${toErr(cleanupError)}`; }
+      }
+      setError(message);
     }
   }
-  function addRunningChat(chatId: string): void { setLocalRunningChatIds((current) => current.includes(chatId) ? current : [...current, chatId]); }
-  function removeRunningChat(chatId: string): void { setLocalRunningChatIds((current) => current.filter((id) => id !== chatId)); }
+  function addRunningChat(chatId: string): void { setLocalRunningChats((current) => current[chatId] ? current : { ...current, [chatId]: Date.now() }); }
+  function removeRunningChat(chatId: string): void { setLocalRunningChats((current) => current[chatId] ? Object.fromEntries(Object.entries(current).filter(([id]) => id !== chatId)) : current); }
   function selectChat(id: string): void { saveCurrentChatScroll(); selectedChatIdRef.current = id; void cleanupAbandonedEmptyChats(id); markChatSeen(id); setSelectedChatId(id); setError(null); }
-  function selectProject(id: string | null): void { saveCurrentChatScroll(); selectedChatIdRef.current = null; void cleanupAbandonedEmptyChats(null); setActiveProjectId(id); setSelectedChatId(null); setMessages([]); setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); setError(null); }
+  function selectProject(id: string | null): void { saveCurrentChatScroll(); selectedChatIdRef.current = null; void cleanupAbandonedEmptyChats(null); setActiveProjectId(id); setSelectedChatId(null); setMessages([]); clearStreamingView(); setError(null); }
   function activateLiveScroll(): void { liveScrollRef.current = true; setShowJumpToLive(false); }
   function scrollToLive(behavior: ScrollBehavior = "smooth"): void { const scroll = scrollRef.current; if (!scroll) return; scroll.scrollTo({ top: scroll.scrollHeight, behavior }); activateLiveScroll(); }
   function handleThreadScroll(): void { const scroll = scrollRef.current; if (!scroll) return; const atLive = isAtLiveEdge(scroll); if (selectedChatIdRef.current) chatScrollStatesRef.current[selectedChatIdRef.current] = { top: scroll.scrollTop, atLive }; liveScrollRef.current = Boolean(selectedChatIdRef.current) && atLive; const shouldShow = Boolean(selectedChatIdRef.current) && !atLive && scroll.scrollHeight > scroll.clientHeight + LIVE_SCROLL_THRESHOLD; setShowJumpToLive((shown) => shown === shouldShow ? shown : shouldShow); }
@@ -465,17 +581,17 @@ function App(): React.ReactElement {
     {sidebarOpen ? <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} /> : null}
     <Sidebar open={sidebarOpen} chats={chats} projects={projects} selectedChatId={selectedChatId} activeProjectId={activeProjectId} runningChatIds={runningChatIds} unreadChatIds={unreadChatIds} searchQuery={searchQuery} owner={state?.owner.login ?? "Local"} providerLabel={provider.id === "sdk" ? "GitHub Copilot" : provider.label} onSearch={setSearchQuery} onSelectChat={(id) => { selectChat(id); setSidebarOpen(false); }} onNewChat={() => void createChat()} onNewProject={() => void createProjectFromSidebar()} onSelectProject={(id) => { selectProject(id); setSidebarOpen(false); }} onToggleChatFavorite={(chat) => void toggleChatFavorite(chat)} onToggleProjectFavorite={(project) => void toggleProjectFavorite(project)} onRenameProject={(project) => void renameProject(project)} onDeleteProject={(project) => void deleteProject(project)} onRenameChat={(chat) => void renameChat(chat)} onArchiveChat={(chat) => void archiveChat(chat)} onDeleteChat={(chat) => void deleteChat(chat)} onOpenDrawer={(tab) => { setDrawer(tab); setSidebarOpen(false); }} />
     <main className="main">
-      <Header chatTitle={selectedChat?.title ?? "New conversation"} projectName={activeProject?.name ?? null} chatFavorite={selectedChat?.favorite ?? null} projectFavorite={activeProject?.favorite ?? null} provider={provider} model={selectedModelInfo?.id ?? selectedModel} models={providerModels} modelInfo={selectedModelInfo ?? null} effort={reasoningEffort} effortChoices={effortChoices} contextTier={contextTier} context={contextStatus} busy={busy} onModelChange={changeModel} onEffortChange={changeReasoningEffort} onContextTierChange={changeContextTier} onToggleSidebar={() => setSidebarOpen((v) => !v)} onToggleChatFavorite={selectedChat ? () => void toggleChatFavorite(selectedChat) : undefined} onToggleProjectFavorite={activeProject ? () => void toggleProjectFavorite(activeProject) : undefined} onRenameChat={selectedChat ? () => void renameChat(selectedChat) : undefined} onArchiveChat={selectedChat ? () => void archiveChat(selectedChat) : undefined} onDeleteChat={selectedChat ? () => void deleteChat(selectedChat) : undefined} onRenameProject={activeProject ? () => void renameProject(activeProject) : undefined} onDeleteProject={activeProject ? () => void deleteProject(activeProject) : undefined} onOpenTab={setDrawer} onNewChat={() => void createChat()} onOpenShortcuts={() => setShortcutsOpen(true)} />
+      <Header chatTitle={selectedChat?.title ?? "New conversation"} projectName={activeProject?.name ?? null} chatFavorite={selectedChat?.favorite ?? null} projectFavorite={activeProject?.favorite ?? null} provider={provider} model={selectedModelInfo?.id ?? selectedModel} models={providerModels} modelInfo={selectedModelInfo ?? null} effort={reasoningEffort} effortChoices={effortChoices} contextTier={contextTier} context={contextStatus} usage={usageStatus} busy={busy} modelsRefreshing={modelsRefreshing} onModelPickerOpen={() => void refreshModels()} onRefreshModels={() => void refreshModels(true)} onModelChange={changeModel} onEffortChange={changeReasoningEffort} onContextTierChange={changeContextTier} onToggleSidebar={() => setSidebarOpen((v) => !v)} onToggleChatFavorite={selectedChat ? () => void toggleChatFavorite(selectedChat) : undefined} onToggleProjectFavorite={activeProject ? () => void toggleProjectFavorite(activeProject) : undefined} onRenameChat={selectedChat ? () => void renameChat(selectedChat) : undefined} onArchiveChat={selectedChat ? () => void archiveChat(selectedChat) : undefined} onDeleteChat={selectedChat ? () => void deleteChat(selectedChat) : undefined} onRenameProject={activeProject ? () => void renameProject(activeProject) : undefined} onDeleteProject={activeProject ? () => void deleteProject(activeProject) : undefined} onOpenTab={setDrawer} onNewChat={() => void createChat()} onOpenShortcuts={() => setShortcutsOpen(true)} />
       {error ? <ErrorBanner error={error} onDismiss={() => setError(null)} onRetry={() => void refreshState()} /> : null}
       {state && !provider.available ? <SetupBanner details={provider.details} onOpenSettings={() => setDrawer("preferences")} /> : null}
       <div ref={scrollRef} className="scroll" onScroll={handleThreadScroll}>
         {activeProject && !selectedChat && state
-          ? <ProjectHome project={activeProject} state={state} models={providerModels} chats={chats.filter((chat) => chat.projectId === activeProject.id)} onSelectChat={selectChat} onNewChat={() => void createChat(activeProject.id, activeWorkspaceId)} refresh={refreshState} showToast={setToast} />
+          ? <ProjectHome project={activeProject} state={state} models={provider.models} modelsAuthoritative={modelsAuthoritative} chats={chats.filter((chat) => chat.projectId === activeProject.id)} onSelectChat={selectChat} onNewChat={() => void createChat(activeProject.id, activeWorkspaceId)} onOpenContext={() => setDrawer("context")} refresh={refreshState} showToast={setToast} />
           : messages.length === 0 && !streamingText && streamingActivities.length === 0 && pendingTurns.length === 0 && pendingInteractions.length === 0
             ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); composerRef.current?.focus(); }} />
             : <div className="thread">{renderThreadMessages()}<PendingTurns turns={pendingTurns}/>{streamingText || streamingActivities.length > 0 ? <Message streaming activities={streamingActivities} message={{ id: "streaming", chatId: selectedChatId ?? "", role: "assistant", content: streamingText, provider: provider.id, metadata: {}, createdAt: new Date().toISOString() }} /> : null}{busy && !streamingText && streamingActivities.length === 0 ? <Thinking /> : null}<InteractionDock interactions={pendingInteractions} onResolve={(interaction, resolution) => void resolveInteraction(interaction, resolution)} /></div>}
       </div>
-      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onSubmit={(content, attachments) => void (busy ? sendWhileBusy("queue", content, attachments) : sendMessage(content, { attachments }))} onSteer={(content, attachments) => void sendWhileBusy("steer", content, attachments)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
+      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onUploadFile={(file) => uploadFile(file, apiToken)} onDiscardAttachment={(attachment) => discardUploadedFile(attachment, apiToken)} onSubmit={(content, attachments, onAccepted) => busy ? sendWhileBusy("queue", content, attachments, onAccepted) : sendMessage(content, { attachments }, onAccepted)} onSteer={(content, attachments, onAccepted) => sendWhileBusy("steer", content, attachments, onAccepted)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
       {showJumpToLive && selectedChat ? <button className="jump-to-live" aria-label="Jump to live" onClick={() => scrollToLive("smooth")}><IconDownload width={16}/><span>Live</span></button> : null}
     </main>
     {drawer && state ? <Drawer active={drawer} onChangeTab={setDrawer} onClose={() => setDrawer(null)}><DrawerContent tab={drawer} state={state} theme={theme} setTheme={setTheme} textScale={textScale} setTextScale={setTextScale} apiToken={apiToken} setApiToken={(token) => { setApiToken(token); if (token) localStorage.setItem(API_TOKEN_KEY, token); else localStorage.removeItem(API_TOKEN_KEY); }} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} activeProjectId={activeProjectId} onSelectProject={selectProject} activeWorkspaceId={activeWorkspaceId} setActiveWorkspaceId={setActiveWorkspaceId} refresh={refreshState} showToast={setToast} clearAllData={clearAllData} onStartGuidedImport={startGuidedImport} /></Drawer> : null}
@@ -491,7 +607,7 @@ const Sidebar = React.memo(function Sidebar(p: SidebarProps) {
   const menuRef = useDismissablePopup<HTMLDivElement>(Boolean(menuId), () => setMenuId(null));
   const grouped = groupChatsByDate(p.chats.filter((c) => c.title.toLowerCase().includes(p.searchQuery.toLowerCase())));
   function runMenuAction(action: () => void): void { setMenuId(null); action(); }
-  return <aside className={`sidebar${p.open ? " open" : ""}`}><button className="sidebar-brand" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-brand-mark"><IconCopilot width={22} height={22}/></span><span className="sidebar-brand-text"><strong>CopilotChat</strong><small>{p.providerLabel}</small></span></button><button className="sidebar-new" onClick={p.onNewChat}>New chat <IconPlus width={16}/></button><div className="sidebar-search"><IconSearch/><input aria-label="Search chats" value={p.searchQuery} placeholder="Search chats" onChange={(e) => p.onSearch(e.target.value)} /></div><div className="sidebar-scroll"><div className="sidebar-section-label">Projects</div><button className={`sidebar-row${p.activeProjectId === null ? " active" : ""}`} onClick={() => p.onSelectProject(null)}><span className="sidebar-row-title">General chats</span></button>{sortFavoritesFirst(p.projects).map((project) => <SidebarProjectRow key={project.id} project={project} active={p.activeProjectId === project.id} menuOpen={menuId === `project:${project.id}`} menuRef={menuId === `project:${project.id}` ? menuRef : undefined} onMenu={() => setMenuId(menuId === `project:${project.id}` ? null : `project:${project.id}`)} onSelect={() => p.onSelectProject(project.id)} onToggleFavorite={() => runMenuAction(() => p.onToggleProjectFavorite(project))} onRename={() => runMenuAction(() => p.onRenameProject(project))} onDelete={() => runMenuAction(() => p.onDeleteProject(project))} />)}<button className="sidebar-row manage-projects-row" onClick={p.onNewProject}><span className="sidebar-row-title muted">New project…</span></button>{grouped.length === 0 ? <div className="sidebar-empty">No conversations yet.</div> : grouped.map((g) => <React.Fragment key={g.label}><div className="sidebar-section-label">{g.label}</div>{g.chats.map((chat) => { const running = p.runningChatIds.has(chat.id); const unread = p.unreadChatIds.has(chat.id); return <div key={chat.id} data-chat-id={chat.id} className={`sidebar-row${chat.id === p.selectedChatId ? " active" : ""}${running ? " running" : ""}${unread ? " unread" : ""}`} role="button" tabIndex={0} aria-label={`${chat.title}${running ? " generating" : unread ? " new content" : ""}`} onClick={() => p.onSelectChat(chat.id)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelectChat(chat.id); } }}><span className="sidebar-row-title"><SidebarFlags favorite={chat.favorite}/>{chat.title}</span><span className="sidebar-row-meta">{running ? <span className="chat-indicator running" title="Response in progress" aria-label="Response in progress">Live</span> : unread ? <span className="chat-indicator unread" title="New content" aria-label="New content">New</span> : null}</span><div ref={menuId === `chat:${chat.id}` ? menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Chat actions" className="sidebar-row-menu" aria-expanded={menuId === `chat:${chat.id}`} onClick={() => setMenuId(menuId === `chat:${chat.id}` ? null : `chat:${chat.id}`)}><IconMore width={16}/></button>{menuId === `chat:${chat.id}` ? <div className="menu" role="menu" aria-label="Chat actions menu"><button onClick={() => runMenuAction(() => p.onToggleChatFavorite(chat))}>{chat.favorite ? "Unstar" : "Star"}</button><button onClick={() => runMenuAction(() => p.onRenameChat(chat))}>Rename</button><button onClick={() => runMenuAction(() => p.onArchiveChat(chat))}>Archive</button><button className="danger" onClick={() => runMenuAction(() => p.onDeleteChat(chat))}>Delete</button></div> : null}</div></div>; })}</React.Fragment>)}</div><div className="sidebar-footer"><button className="sidebar-row sidebar-preferences-row" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-row-title"><IconSettings width={16}/>Preferences</span></button><button className="sidebar-footer-user" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-footer-avatar">{p.owner.slice(0,2).toUpperCase()}</span><span className="sidebar-footer-text"><strong>{p.owner}</strong><small>Account</small></span></button></div></aside>;
+  return <aside className={`sidebar${p.open ? " open" : ""}`}><button className="sidebar-brand" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-brand-mark"><IconCopilot width={22} height={22}/></span><span className="sidebar-brand-text"><strong>CopilotChat</strong><small>{p.providerLabel}</small></span></button><button className="sidebar-new" onClick={p.onNewChat}>New chat <IconPlus width={16}/></button><div className="sidebar-search"><IconSearch/><input aria-label="Search chats" value={p.searchQuery} placeholder="Search chats" onChange={(e) => p.onSearch(e.target.value)} /></div><div className="sidebar-scroll"><div className="sidebar-section-label">Projects</div><button className={`sidebar-row${p.activeProjectId === null ? " active" : ""}`} onClick={() => p.onSelectProject(null)}><span className="sidebar-row-title">General chats</span></button>{sortFavoritesFirst(p.projects).map((project) => <SidebarProjectRow key={project.id} project={project} active={p.activeProjectId === project.id} menuOpen={menuId === `project:${project.id}`} menuRef={menuId === `project:${project.id}` ? menuRef : undefined} onMenu={() => setMenuId(menuId === `project:${project.id}` ? null : `project:${project.id}`)} onSelect={() => p.onSelectProject(project.id)} onToggleFavorite={() => runMenuAction(() => p.onToggleProjectFavorite(project))} onRename={() => runMenuAction(() => p.onRenameProject(project))} onDelete={() => runMenuAction(() => p.onDeleteProject(project))} />)}<button className="sidebar-row manage-projects-row" onClick={p.onNewProject}><span className="sidebar-row-title muted">New project…</span></button>{grouped.length === 0 ? <div className="sidebar-empty">No conversations yet.</div> : grouped.map((g) => <React.Fragment key={g.label}><div className="sidebar-section-label">{g.label}</div>{g.chats.map((chat) => { const running = p.runningChatIds.has(chat.id); const unread = p.unreadChatIds.has(chat.id); return <div key={chat.id} data-chat-id={chat.id} className={`sidebar-row${chat.id === p.selectedChatId ? " active" : ""}${running ? " running" : ""}${unread ? " unread" : ""}`} role="button" tabIndex={0} aria-label={`${chat.title}${running ? " generating" : unread ? " new content" : ""}`} onClick={() => p.onSelectChat(chat.id)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelectChat(chat.id); } }}><span className="sidebar-row-title"><SidebarFlags favorite={chat.favorite}/>{chat.title}</span><span className="sidebar-row-meta">{running ? <span className="chat-indicator running" title="Response in progress" aria-label="Response in progress">Live</span> : unread ? <span className="chat-indicator unread" title="New content" aria-label="New content">New</span> : null}</span><div ref={menuId === `chat:${chat.id}` ? menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Chat actions" className="sidebar-row-menu" aria-expanded={menuId === `chat:${chat.id}`} onClick={() => setMenuId(menuId === `chat:${chat.id}` ? null : `chat:${chat.id}`)}><IconMore width={16}/></button>{menuId === `chat:${chat.id}` ? <div className="menu" role="menu" aria-label="Chat actions menu"><button onClick={() => runMenuAction(() => p.onToggleChatFavorite(chat))}>{chat.favorite ? "Unstar" : "Star"}</button><button onClick={() => runMenuAction(() => p.onRenameChat(chat))}>Rename</button><button onClick={() => runMenuAction(() => p.onArchiveChat(chat))}>Archive</button><button className="danger" onClick={() => runMenuAction(() => p.onDeleteChat(chat))}>Delete</button></div> : null}</div></div>; })}</React.Fragment>)}</div><div className="sidebar-footer"><button className="sidebar-row sidebar-preferences-row" onClick={() => p.onOpenDrawer("preferences")}><span className="sidebar-row-title"><IconSettings width={16}/>Preferences</span></button><button className="sidebar-footer-user" onClick={() => p.onOpenDrawer("context")}><span className="sidebar-footer-avatar">{p.owner.slice(0,2).toUpperCase()}</span><span className="sidebar-footer-text"><strong>{p.owner}</strong><small>Personal context</small></span></button></div></aside>;
 }, areSidebarPropsEqual);
 function areSidebarPropsEqual(previous: SidebarProps, next: SidebarProps): boolean {
   return previous.open === next.open &&
@@ -509,7 +625,7 @@ function SidebarProjectRow(p: { project: Project; active: boolean; menuOpen: boo
   return <div className={`sidebar-row project-row${p.active ? " active" : ""}`} role="button" tabIndex={0} aria-label={p.project.name} onClick={p.onSelect} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); p.onSelect(); } }}><span className="sidebar-row-title"><SidebarFlags favorite={p.project.favorite}/>{p.project.name}</span><span className="sidebar-row-meta"/><div ref={p.menuOpen ? p.menuRef : undefined} className="menu-wrap" onClick={(e) => e.stopPropagation()}><button aria-label="Project actions" className="sidebar-row-menu" aria-expanded={p.menuOpen} onClick={p.onMenu}><IconMore width={16}/></button>{p.menuOpen ? <div className="menu" role="menu" aria-label="Project actions menu"><button onClick={p.onToggleFavorite}>{p.project.favorite ? "Unstar" : "Star"}</button><button onClick={p.onRename}>Rename</button><button className="danger" onClick={p.onDelete}>Delete</button></div> : null}</div></div>;
 }
 function SidebarFlags(p: { favorite?: boolean }) { return p.favorite ? <span className="sidebar-row-flags"><IconStar width={12} height={12}/></span> : null; }
-function Header(p: { chatTitle: string; projectName: string | null; chatFavorite: boolean | null; projectFavorite: boolean | null; provider: ProviderStatus; model: string; models: ProviderStatus["models"]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; context: ContextStatus; busy: boolean; onModelChange: (v: string) => void; onEffortChange: (v: ReasoningEffort) => void; onContextTierChange: (v: ContextTier) => void; onToggleSidebar: () => void; onToggleChatFavorite?: () => void; onToggleProjectFavorite?: () => void; onRenameChat?: () => void; onArchiveChat?: () => void; onDeleteChat?: () => void; onRenameProject?: () => void; onDeleteProject?: () => void; onOpenTab: (t: Tab) => void; onNewChat: () => void; onOpenShortcuts: () => void }) {
+function Header(p: { chatTitle: string; projectName: string | null; chatFavorite: boolean | null; projectFavorite: boolean | null; provider: ProviderStatus; model: string; models: ProviderStatus["models"]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; context: ContextStatus; usage: UsageStatus; busy: boolean; modelsRefreshing: boolean; onModelPickerOpen: () => void; onRefreshModels: () => void; onModelChange: (v: string) => void; onEffortChange: (v: ReasoningEffort) => void; onContextTierChange: (v: ContextTier) => void; onToggleSidebar: () => void; onToggleChatFavorite?: () => void; onToggleProjectFavorite?: () => void; onRenameChat?: () => void; onArchiveChat?: () => void; onDeleteChat?: () => void; onRenameProject?: () => void; onDeleteProject?: () => void; onOpenTab: (t: Tab) => void; onNewChat: () => void; onOpenShortcuts: () => void }) {
   const [showContext, setShowContext] = useState(false);
   const [showOverflow, setShowOverflow] = useState(false);
   const contextRef = useDismissablePopup<HTMLDivElement>(showContext, () => setShowContext(false));
@@ -522,7 +638,8 @@ function Header(p: { chatTitle: string; projectName: string | null; chatFavorite
       {p.projectName ? <button className="header-pill project-pill" aria-label={`Project: ${p.projectName}`} title={p.projectName}><IconFolder width={18}/><span>{p.projectName}</span></button> : null}
     </div>
     <div className="header-controls">
-      <ModelPicker model={p.model} models={p.models} modelInfo={p.modelInfo} effort={p.effort} effortChoices={p.effortChoices} contextTier={p.contextTier} onModelChange={p.onModelChange} onEffortChange={p.onEffortChange} onContextTierChange={p.onContextTierChange} />
+      <ModelPicker model={p.model} models={p.models} modelInfo={p.modelInfo} effort={p.effort} effortChoices={p.effortChoices} contextTier={p.contextTier} refreshing={p.modelsRefreshing} onOpen={p.onModelPickerOpen} onRefresh={p.onRefreshModels} onModelChange={p.onModelChange} onEffortChange={p.onEffortChange} onContextTierChange={p.onContextTierChange} />
+      {p.usage.reported ? <UsagePill usage={p.usage} busy={p.busy} /> : null}
       <div ref={contextRef} className="context-ring-wrap"><button type="button" className={`context-ring ${p.context.state}`} title={p.context.detail} aria-label={`Context: ${p.context.detail}`} aria-expanded={showContext} aria-controls="context-details" style={{ background: contextRingBackground(p.context) }} onClick={() => setShowContext((value) => !value)}><span>{contextRingLabel(p.context)}</span></button>{showContext ? <div id="context-details" className="context-popover" role="dialog" aria-label="Context details"><strong>Context</strong><span>{p.context.detail}</span><small>{p.context.label}</small></div> : null}</div>
     </div>
     <div className="header-actions">
@@ -539,13 +656,23 @@ function Header(p: { chatTitle: string; projectName: string | null; chatFavorite
     </div>
   </header>;
 }
-function ModelPicker(p: { model: string; models: ProviderModel[]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; onModelChange: (model: string) => void; onEffortChange: (effort: ReasoningEffort) => void; onContextTierChange: (tier: ContextTier) => void }) {
+function UsagePill(p: { usage: UsageStatus; busy: boolean }) {
+  const [open, setOpen] = useState(false);
+  const ref = useDismissablePopup<HTMLDivElement>(open, () => setOpen(false));
+  const chatLabel = `${formatAic(p.usage.chatNanoAiu)} AIC`;
+  return <div ref={ref} className="usage-pill-wrap">
+    <button type="button" className={`header-pill usage-pill${p.busy ? " live" : ""}`} aria-label={`AI credits used in this chat: ${chatLabel}`} title={`${chatLabel} used in this chat`} aria-expanded={open} aria-controls="usage-details" onClick={() => setOpen((value) => !value)}><IconSparkle width={14}/><span>{chatLabel}</span></button>
+    {open ? <div id="usage-details" className="context-popover" role="dialog" aria-label="AI credit usage"><strong>AI credits</strong><span>{chatLabel} used in this chat.</span>{p.usage.turnNanoAiu > 0 ? <span>{formatAic(p.usage.turnNanoAiu)} AIC in the {p.busy ? "current" : "latest"} response.</span> : null}<small>Copilot reports credit usage for every model request, including sub-agents.</small></div> : null}
+  </div>;
+}
+function ModelPicker(p: { model: string; models: ProviderModel[]; modelInfo: ProviderModel | null; effort: ReasoningEffort; effortChoices: ReasoningEffort[]; contextTier: ContextTier; refreshing: boolean; onOpen: () => void; onRefresh: () => void; onModelChange: (model: string) => void; onEffortChange: (effort: ReasoningEffort) => void; onContextTierChange: (tier: ContextTier) => void }) {
   const [open, setOpen] = useState(false);
   const ref = useDismissablePopup<HTMLDivElement>(open, () => setOpen(false));
   const selected = p.modelInfo ?? p.models.find((model) => model.id === p.model) ?? null;
   const supportsEffort = p.effortChoices.length > 1;
   const supportsLongContext = Boolean(selected?.supportsLongContext);
-  return <div ref={ref} className="model-picker-wrap"><button type="button" className="model-picker-trigger" aria-label={`Model picker: ${selected?.name ?? p.model}`} aria-expanded={open} aria-controls="model-picker" onClick={() => setOpen((value) => !value)}><span className="model-picker-trigger-copy"><small>Model</small><strong>{selected?.name ?? p.model}</strong></span><span className="model-picker-trigger-meta">{modelSelectionSummary(selected, p.effort, p.contextTier)}</span></button>{open ? <div id="model-picker" className="model-picker-popover" role="dialog" aria-label="Model picker"><div className="model-picker-head"><strong>Model</strong><span>Choose a model, then tune the options it supports.</span></div><div className="model-picker-list" role="listbox" aria-label="Available models">{p.models.map((model) => { const active = model.id === p.model; return <button type="button" key={model.id} data-model-id={model.id} className={`model-picker-row${active ? " active" : ""}`} role="option" aria-selected={active} onClick={() => p.onModelChange(model.id)}><span className="model-picker-row-copy"><strong>{model.name || model.id}</strong>{model.name !== model.id ? <small>{model.id}</small> : null}</span><span className="model-picker-row-meta">{modelContextLabel(model)}{model.supportsReasoningEffort ? <em>Effort</em> : null}{model.supportsLongContext ? <em>Long context</em> : null}</span>{active ? <IconCheck width={16} height={16}/> : null}</button>; })}</div><div className="model-picker-options"><strong>Options for {selected?.name ?? p.model}</strong>{supportsEffort ? <label className="model-option-field"><span>Reasoning effort</span><select aria-label="Reasoning effort" value={p.effort} onChange={(e) => p.onEffortChange(e.target.value as ReasoningEffort)}>{p.effortChoices.map((effort) => <option key={effort} value={effort}>{effortLabel(effort)}</option>)}</select><small>Higher effort can improve complex answers but may take longer.</small></label> : null}{supportsLongContext ? <label className="model-option-field"><span>Context size</span><select aria-label="Context size" value={p.contextTier} onChange={(e) => p.onContextTierChange(e.target.value as ContextTier)}><option value="default">{contextTierLabel("default", selected)}</option><option value="long_context">{contextTierLabel("long_context", selected)}</option></select><small>Long context keeps more material available and may use more credits.</small></label> : null}{!supportsEffort && !supportsLongContext ? <p>This model uses fixed reasoning and context settings.</p> : null}</div></div> : null}</div>;
+  function toggleOpen(): void { if (!open) p.onOpen(); setOpen(!open); }
+  return <div ref={ref} className="model-picker-wrap"><button type="button" className="model-picker-trigger" aria-label={`Model picker: ${selected?.name ?? p.model}`} aria-expanded={open} aria-controls="model-picker" onClick={toggleOpen}><span className="model-picker-trigger-copy"><small>Model</small><strong>{selected?.name ?? p.model}</strong></span><span className="model-picker-trigger-meta">{modelSelectionSummary(selected, p.effort, p.contextTier)}</span></button>{open ? <div id="model-picker" className="model-picker-popover" role="dialog" aria-label="Model picker"><div className="model-picker-head"><div className="model-picker-head-copy"><strong>Model</strong><span>Choose a model, then tune the options it supports.</span></div><button type="button" className={`model-picker-refresh${p.refreshing ? " refreshing" : ""}`} aria-disabled={p.refreshing} aria-busy={p.refreshing} onClick={() => { if (!p.refreshing) p.onRefresh(); }}><IconRetry width={14} height={14}/><span>{p.refreshing ? "Refreshing…" : "Refresh"}</span></button></div><div className="model-picker-list" role="listbox" aria-label="Available models">{p.models.map((model) => { const active = model.id === p.model; return <button type="button" key={model.id} data-model-id={model.id} className={`model-picker-row${active ? " active" : ""}`} role="option" aria-selected={active} onClick={() => p.onModelChange(model.id)}><span className="model-picker-row-copy"><strong>{model.name || model.id}</strong>{model.name !== model.id ? <small>{model.id}</small> : null}</span><span className="model-picker-row-meta">{modelContextLabel(model)}{model.supportsReasoningEffort ? <em>Effort</em> : null}{model.supportsLongContext ? <em>Long context</em> : null}</span>{active ? <IconCheck width={16} height={16}/> : null}</button>; })}</div><div className="model-picker-options"><strong>Options for {selected?.name ?? p.model}</strong>{supportsEffort ? <label className="model-option-field"><span>Reasoning effort</span><select aria-label="Reasoning effort" value={p.effort} onChange={(e) => p.onEffortChange(e.target.value as ReasoningEffort)}>{p.effortChoices.map((effort) => <option key={effort} value={effort}>{effortLabel(effort)}</option>)}</select><small>Higher effort can improve complex answers but may take longer.</small></label> : null}{supportsLongContext ? <label className="model-option-field"><span>Context size</span><select aria-label="Context size" value={p.contextTier} onChange={(e) => p.onContextTierChange(e.target.value as ContextTier)}><option value="default">{contextTierLabel("default", selected)}</option><option value="long_context">{contextTierLabel("long_context", selected)}</option></select><small>Long context keeps more material available and may use more credits.</small></label> : null}{!supportsEffort && !supportsLongContext ? <p>This model uses fixed reasoning and context settings.</p> : null}</div></div> : null}</div>;
 }
 function SetupBanner(p: { details: string; onOpenSettings: () => void }) { return <div className="setup-banner" role="status"><div className="setup-banner-main"><strong>Copilot needs authentication in this terminal.</strong><span>{p.details || "No Copilot provider is available yet."}</span></div><button className="btn btn-sm" onClick={p.onOpenSettings}>Fix setup</button></div>; }
 function ErrorBanner(p: { error: string; onDismiss: () => void; onRetry: () => void }) { const error = friendlyError(p.error); return <section className="error-banner" role="alert" aria-live="assertive"><div className="error-banner-copy"><strong>{error.title}</strong><span>{error.message}</span></div><div className="error-banner-actions"><button className="btn btn-sm" onClick={p.onRetry}>{error.action}</button><button className="icon-button" aria-label="Dismiss error" onClick={p.onDismiss}><IconClose/></button></div></section>; }
@@ -572,12 +699,12 @@ function ShortcutsDialog(p: { onClose: () => void }) { return <><div className="
 function ConfirmButton(p: { className?: string; label: string; confirmLabel?: string; disabled?: boolean; onConfirm: () => void | Promise<void> }) { const [confirming, setConfirming] = useState(false); const [working, setWorking] = useState(false); async function click(): Promise<void> { if (p.disabled || working) return; if (!confirming) { setConfirming(true); window.setTimeout(() => setConfirming(false), 3000); return; } setWorking(true); try { await p.onConfirm(); } finally { setWorking(false); setConfirming(false); } } return <button type="button" className={p.className ?? "btn btn-sm btn-danger"} disabled={p.disabled || working} onClick={() => void click()}>{working ? "Working…" : confirming ? p.confirmLabel ?? "Confirm" : p.label}</button>; }
 function FormField(p: { label: string; hint?: string; children: React.ReactElement<{ id?: string; "aria-describedby"?: string }> }) { const id = useMemo(() => `field-${slugify(p.label)}-${Math.random().toString(36).slice(2, 7)}`, [p.label]); const hintId = `${id}-hint`; return <label className="form-field" htmlFor={id}><span>{p.label}</span>{React.cloneElement(p.children, { id, "aria-describedby": p.hint ? hintId : undefined })}{p.hint ? <small id={hintId}>{p.hint}</small> : null}</label>; }
 function Welcome(p: { userName: string; project: Project | null; onPrompt: (v: string) => void }) { const name = cleanName(p.userName); return <div className="welcome"><div className="welcome-inner"><div className="welcome-mark"><IconCopilot width={46} height={46}/></div><h1>{p.project ? `Ready in ${p.project.name}` : name ? `Back at it, ${name}` : "Back at it"}</h1><p className="welcome-sub">{p.project ? "Project instructions will be included with every turn in this conversation." : "Start a focused chat, connect tools, or work against a local folder."}</p><div className="welcome-grid">{STARTERS.map(([title, body, prompt]) => <button className="welcome-card" key={title} onClick={() => p.onPrompt(prompt)}><strong>{title}</strong><span>{body}</span><em>Start</em></button>)}</div></div></div>; }
-function ProjectHome(p: { project: Project; state: AppState; models: ProviderStatus["models"]; chats: Chat[]; onSelectChat: (id: string) => void; onNewChat: () => void; refresh: () => Promise<void>; showToast: (s: string) => void }) {
+function ProjectHome(p: { project: Project; state: AppState; models: ProviderStatus["models"]; modelsAuthoritative: boolean; chats: Chat[]; onSelectChat: (id: string) => void; onNewChat: () => void; onOpenContext: () => void; refresh: () => Promise<void>; showToast: (s: string) => void }) {
   const [editor, setEditor] = useState<ProjectEditorState | null>(null);
+  const projectMemories = p.state.memoryStats.projects[p.project.id] ?? { total: 0, enabled: 0, contextLength: 0 };
   const references = p.state.projectReferences.filter((reference) => reference.projectId === p.project.id);
   const chatReferences = p.state.projectChatReferences.filter((reference) => reference.projectId === p.project.id);
   async function saveEditor(next: ProjectEditorState): Promise<void> {
-    if (next.kind === "memory") await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { memory: next.value } });
     if (next.kind === "instructions") await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { instructions: next.value } });
     if (next.kind === "reference") {
       if (next.referenceId) await api<ProjectReference>(`/api/project-references/${next.referenceId}`, { method: "PATCH", body: { title: next.referenceTitle, content: next.value } });
@@ -588,15 +715,26 @@ function ProjectHome(p: { project: Project; state: AppState; models: ProviderSta
     await p.refresh();
   }
   async function saveDefaultModel(defaultModel: string): Promise<void> { await api<Project>(`/api/projects/${p.project.id}`, { method: "PATCH", body: { defaultModel: defaultModel || null } }); p.showToast(defaultModel ? "Project default model saved" : "Project default model cleared"); await p.refresh(); }
-  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={() => setEditor({ kind: "memory", title: "Edit memory", value: p.project.memory ?? "", placeholder: "Facts and decisions every chat in this project should remember." })}><div className="card-h"><strong>Memory</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.memory, "No shared memory yet.")}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
+  return <section className="project-home"><div className="project-title-block"><h1>{p.project.name}</h1></div><div className="project-summary-grid"><ProjectDefaultModelCard project={p.project} models={p.models} modelsAuthoritative={p.modelsAuthoritative} onChange={(model) => void saveDefaultModel(model)} /><button className="project-summary-card wide editable" onClick={p.onOpenContext}><div className="card-h"><strong>Memories</strong><span className="btn btn-sm">Manage</span></div><p>{projectMemories.total > 0 ? `${projectMemories.enabled} active of ${projectMemories.total} saved memories.${p.project.memory ? " A shared project note is also included." : ""}` : p.project.memory ? "A shared project note is included. Add individual memories to keep facts easier to browse." : "No project memories yet."}</p></button><button className="project-summary-card editable" onClick={() => setEditor({ kind: "instructions", title: "Edit custom instructions", value: p.project.instructions ?? "", placeholder: "Describe how the assistant should behave for this project." })}><div className="card-h"><strong>Custom instructions</strong><span className="btn btn-sm">Edit</span></div><p>{previewText(p.project.instructions, "No custom instructions yet.")}</p></button></div><section className="project-knowledge-section"><div className="card-h"><h2>Project knowledge</h2><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Add reference material", referenceTitle: "", value: "" })}>Add reference</button></div><div className="project-reference-list">{references.length === 0 ? <p className="section-help">No reference materials yet.</p> : references.map((reference) => <div className="mini-card" key={reference.id}><strong>{reference.title}</strong><p>{reference.content.slice(0,180)}</p><div className="card-actions"><button className="btn btn-sm" onClick={() => setEditor({ kind: "reference", title: "Edit reference material", referenceId: reference.id, referenceTitle: reference.title, value: reference.content })}>Edit</button><button className="btn btn-sm btn-danger" onClick={async()=>{await api<void>(`/api/project-references/${reference.id}`,{method:"DELETE",raw:true}); await p.refresh();}}>Remove</button></div></div>)}</div><ProjectChatReferences project={p.project} state={p.state} refresh={p.refresh} showToast={p.showToast}/>{chatReferences.length > 0 ? <p className="section-help">{chatReferences.length} referenced chat {chatReferences.length === 1 ? "excerpt" : "excerpts"}</p> : null}</section><section className="recent-chats"><div className="card-h"><h2>Recent chats</h2><button className="btn btn-sm btn-primary" onClick={p.onNewChat}><IconPlus width={14}/>Start a new chat</button></div>{p.chats.length === 0 ? <p className="section-help">No chats in this project yet.</p> : <div className="recent-chat-list">{p.chats.map((chat) => <button key={chat.id} className="recent-chat-row" onClick={() => p.onSelectChat(chat.id)}><strong>{chat.title}</strong><span>{formatProjectDate(chat.updatedAt)}</span></button>)}</div>}</section>{editor ? <ProjectEditorModal editor={editor} onClose={() => setEditor(null)} onSave={(next) => void saveEditor(next)} /> : null}</section>;
 }
-function ProjectDefaultModelCard(p: { project: Project; models: ProviderStatus["models"]; onChange: (model: string) => void }) { return <div className="project-summary-card project-model-card"><div className="card-h"><strong>Default model</strong><span className="tag">{p.project.defaultModel ? "Project" : "App default"}</span></div><p>New chats in this project start with this model unless the chat is changed later.</p><select aria-label="Project default model" value={p.project.defaultModel ?? ""} onChange={(e) => p.onChange(e.currentTarget.value)}><option value="">Use app default</option>{p.models.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>)}</select></div>; }
+function ProjectDefaultModelCard(p: { project: Project; models: ProviderStatus["models"]; modelsAuthoritative: boolean; onChange: (model: string) => void }) {
+  const configuredModel = p.project.defaultModel;
+  const modelAvailable = Boolean(configuredModel && p.modelsAuthoritative && p.models.some((model) => model.id === configuredModel));
+  const modelUnverified = Boolean(configuredModel && !p.modelsAuthoritative);
+  const status = !configuredModel ? "App default" : modelAvailable ? "Project" : modelUnverified ? "Not verified" : "Unavailable";
+  const description = !configuredModel || modelAvailable
+    ? "New chats in this project start with this model unless the chat is changed later."
+    : modelUnverified
+      ? "Model discovery is unavailable. New chats use the app default until the model list refreshes."
+      : `${configuredModel} is no longer available. New chats use the app default until you choose a replacement.`;
+  return <div className="project-summary-card project-model-card"><div className="card-h"><strong>Default model</strong><span className={`tag${configuredModel && !modelAvailable ? " warning" : ""}`}>{status}</span></div><p>{description}</p><select aria-label="Project default model" value={configuredModel ?? ""} onChange={(e) => p.onChange(e.currentTarget.value)}><option value="">Use app default</option>{configuredModel && !modelAvailable ? <option value={configuredModel}>{configuredModel} ({modelUnverified ? "not verified" : "unavailable"})</option> : null}{p.modelsAuthoritative ? p.models.map((model) => <option key={model.id} value={model.id}>{model.name || model.id}</option>) : null}</select></div>;
+}
 function ProjectEditorModal(p: { editor: ProjectEditorState; onClose: () => void; onSave: (next: ProjectEditorState) => void }) {
   const [value, setValue] = useState(p.editor.value);
   const [referenceTitle, setReferenceTitle] = useState(p.editor.kind === "reference" ? p.editor.referenceTitle : "");
   useEffect(() => { setValue(p.editor.value); setReferenceTitle(p.editor.kind === "reference" ? p.editor.referenceTitle : ""); }, [p.editor]);
   function save(): void { if (p.editor.kind === "reference") p.onSave({ ...p.editor, referenceTitle, value }); else p.onSave({ ...p.editor, value }); }
-  return <><div className="modal-scrim" onClick={p.onClose}/><section className="editor-modal" role="dialog" aria-label={p.editor.title}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "memory" ? "Memory" : p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></section></>;
+  return <><div className="modal-scrim" onClick={p.onClose}/><section className="editor-modal" role="dialog" aria-label={p.editor.title}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></section></>;
 }
 const Markdown = React.memo(function Markdown(p: { children: string }) { const parts = useMemo(() => splitMarkdownTaskLists(p.children), [p.children]); if (parts.length === 1 && parts[0]?.kind === "markdown") return <MarkdownText>{p.children}</MarkdownText>; return <>{parts.map((part, index) => part.kind === "tasks" ? <TaskListCard key={index} items={part.items} /> : <MarkdownText key={index}>{part.content}</MarkdownText>)}</>; });
 const MarkdownText = React.memo(function MarkdownText(p: { children: string }) { return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={markdownComponents}>{p.children}</ReactMarkdown>; });
@@ -613,8 +751,9 @@ const Message = React.memo(function Message(p: MessageProps) {
   const activities = !isUser ? (p.activities ?? readActivities(p.message.metadata.activities)) : [];
   const attachments = messageAttachments(p.message);
   const intent = p.streaming ? currentReportIntent(activities) : null;
+  const nanoAiu = !isUser ? messageNanoAiu(p.message) : 0;
   const actions = !p.streaming ? <div className="msg-actions"><button aria-label={isUser ? "Copy message" : "Copy response"} title="Copy" className="msg-action-button" onClick={() => void copyText(p.message.content)}><IconCopy width={18}/></button>{isUser ? <button aria-label="Edit message" title="Edit" className="msg-action-button" disabled={!p.canEdit} onClick={() => p.onEditStart?.(p.message)}><IconEdit width={18}/></button> : <button aria-label="Retry response" title="Retry" className="msg-action-button" disabled={!p.canRetry} onClick={() => p.onRetry?.(p.message)}><IconRetry width={18}/></button>}</div> : null;
-  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{!p.editing ? actions : null}</div></article>;
+  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{nanoAiu > 0 ? <span className="msg-usage" title={`This response used ${formatAic(nanoAiu)} AI credits`}>{formatAic(nanoAiu)} AIC</span> : null}{!p.editing ? actions : null}</div></article>;
 }, areMessagePropsEqual);
 function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<MessageProps>): boolean {
   return prev.message === next.message &&
@@ -626,7 +765,8 @@ function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<Messa
     prev.canRetry === next.canRetry;
 }
 function PendingTurns(p: { turns: PendingTurn[] }) { const visible = p.turns.filter((turn) => turn.status !== "done"); if (visible.length === 0) return null; return <div className="pending-turns">{visible.map((turn) => <article key={turn.id} className={`pending-turn ${turn.mode} ${turn.status}`}><span className="pending-label">{turn.mode === "steer" ? "Steer" : "Queued"}</span><span className="pending-content">{turn.content}</span><span className="pending-status">{turn.status === "running" ? "Running next" : turn.status === "sent" ? "Sent live" : turn.status}</span></article>)}</div>; }
-const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock> };
+const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock>, a: (props) => <MarkdownLink {...props} /> };
+function MarkdownLink(props: React.ComponentPropsWithoutRef<"a"> & { node?: unknown }) { const anchor: React.ComponentPropsWithoutRef<"a"> & { node?: unknown } = { ...props }; delete anchor.node; return <a {...anchor} {...externalLinkProps(props.href)} />; }
 function CodeBlock(p: { children?: React.ReactNode }) { const code = textFromNode(p.children).replace(/\n$/, ""); return <div className="code-block"><button type="button" className="code-copy" aria-label="Copy code block" title="Copy code" onClick={() => void copyText(code)}><IconCopy width={15}/></button><pre>{p.children}</pre></div>; }
 type MarkdownTaskPart = { kind: "markdown"; content: string } | { kind: "tasks"; items: TaskListItem[] };
 function splitMarkdownTaskLists(markdown: string): MarkdownTaskPart[] {
@@ -748,7 +888,8 @@ function parseJsonValue(value: string): unknown {
   try { return JSON.parse(value); } catch { return null; }
 }
 function humanizeFieldName(value: string): string { return value.replace(/[_-]+/g, " ").replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/\b\w/g, (char) => char.toUpperCase()); }
-function SubagentActivity(p: { activity: AssistantActivity }) { const detail = p.activity.details && Object.keys(p.activity.details).length > 0 ? formatActivityValue(p.activity.details) : ""; return <div className="subagent-activity">{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function SubagentActivity(p: { activity: AssistantActivity }) { const nanoAiu = readNanoAiu(p.activity.details?.nanoAiu); const detailRecord = subagentDetailRecord(p.activity.details); const detail = Object.keys(detailRecord).length > 0 ? formatActivityValue(detailRecord) : ""; return <div className="subagent-activity">{nanoAiu > 0 ? <p className="subagent-usage">{formatAic(nanoAiu)} AIC used by this subagent</p> : null}{detail ? <pre className="subagent-detail">{detail}</pre> : null}{p.activity.content?.trim() ? <Markdown>{p.activity.content}</Markdown> : null}{p.activity.error ? <div><strong>Error</strong><CodeBlock><code>{p.activity.error}</code></CodeBlock></div> : null}{p.activity.steps?.length ? <ActivityList activities={p.activity.steps} streaming={false} nested /> : null}{!detail && nanoAiu === 0 && !p.activity.content && !p.activity.error && !p.activity.steps?.length ? <p>Subagent is running…</p> : null}</div>; }
+function subagentDetailRecord(details: Record<string, unknown> | undefined): Record<string, unknown> { if (!details) return {}; return Object.fromEntries(Object.entries(details).filter(([key]) => key !== "nanoAiu")); }
 function TaskListActivity(p: { activity: AssistantActivity }) { const items = p.activity.items?.length ? p.activity.items : parseTaskListItems(p.activity.content ?? ""); return items.length ? <TaskListCard title={p.activity.title} items={items} source={typeof p.activity.details?.source === "string" ? p.activity.details.source : undefined} /> : <Markdown>{p.activity.content ?? ""}</Markdown>; }
 function InteractionDock(p: { interactions: PendingInteraction[]; onResolve: (interaction: PendingInteraction, resolution: { action: string; answer?: string; wasFreeform?: boolean; content?: unknown }) => void }) {
   if (p.interactions.length === 0) return null;
@@ -809,12 +950,14 @@ function RunningActionButton(p: { label: string; tooltip: string; icon: React.Re
   return <button type="button" aria-label={p.label} className={`composer-running-button ${p.variant ?? "primary"}${showLongPressTooltip ? " show-tooltip" : ""}`} disabled={p.disabled} onClick={click} onPointerDown={startLongPress} onPointerUp={finishLongPress} onPointerCancel={finishLongPress} onPointerLeave={finishLongPress}><span className="running-button-icon">{p.icon}</span><span className="running-button-label">{p.label.replace(" response", "").replace(" message", "")}</span><span className="composer-action-tooltip" role="tooltip"><strong>{p.label}</strong><span>{p.tooltip}</span></span></button>;
 }
 type ComposerPicker = "menu" | "project" | "skills" | "workspace" | "permissions";
-const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onSubmit: (content: string, attachments: MessageAttachment[]) => void; onSteer: (content: string, attachments: MessageAttachment[]) => void; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
+const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onUploadFile: (file: File) => Promise<MessageAttachment>; onDiscardAttachment: (attachment: MessageAttachment) => Promise<void>; onSubmit: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onSteer: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
+  const [pendingUploads, setPendingUploads] = useState(0);
+  const [submitting, setSubmitting] = useState(false);
   const [openPicker, setOpenPicker] = useState<ComposerPicker | null>(null);
   const [slashIndex, setSlashIndex] = useState(0);
   const pickerRef = useDismissablePopup<HTMLDivElement>(Boolean(openPicker), () => setOpenPicker(null));
@@ -835,16 +978,23 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   function openNestedPicker(next: ComposerPicker): void { setOpenPicker(next); }
   function updateValue(next: string): void { setValue(next); }
   function clearValue(): void { setValue(""); setAttachments([]); setAttachmentError(null); p.onDraftPreviewChange(""); }
+  async function discardValue(): Promise<void> { const discarded = attachments; clearValue(); const results = await Promise.allSettled(discarded.map(p.onDiscardAttachment)); const failed = results.filter((result) => result.status === "rejected"); if (failed.length > 0) setAttachmentError(`${failed.length} attachment${failed.length === 1 ? "" : "s"} could not be discarded.`); }
   async function addFiles(files: FileList | File[]): Promise<void> {
     setAttachmentError(null);
     const nextFiles = [...files];
+    if (nextFiles.length === 0) return;
+    setPendingUploads((current) => current + nextFiles.length);
     try {
-      setAttachments([...attachments, ...(await Promise.all(nextFiles.map(fileToAttachment)))]);
-    } catch (e) {
-      setAttachmentError(toErr(e));
+      const results = await Promise.allSettled(nextFiles.map(p.onUploadFile));
+      const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      const failed = results.flatMap((result) => result.status === "rejected" ? [toErr(result.reason)] : []);
+      if (uploaded.length > 0) setAttachments((current) => [...current, ...uploaded]);
+      if (failed.length > 0) setAttachmentError(failed.length === 1 ? failed[0]! : `${failed.length} files failed to upload. ${failed[0]}`);
+    } finally {
+      setPendingUploads((current) => Math.max(0, current - nextFiles.length));
     }
   }
-  function removeAttachment(id: string): void { setAttachments((current) => current.filter((attachment) => attachment.id !== id)); }
+  function removeAttachment(id: string): void { const attachment = attachments.find((item) => item.id === id); setAttachments((current) => current.filter((item) => item.id !== id)); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); }
   function paste(e: React.ClipboardEvent<HTMLTextAreaElement>): void {
     const files = [...e.clipboardData.files];
     if (files.length === 0) return;
@@ -858,15 +1008,16 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
       if (e.key === "ArrowDown") { e.preventDefault(); setSlashIndex((index) => (index + 1) % slashMatches.length); return; }
       if (e.key === "ArrowUp") { e.preventDefault(); setSlashIndex((index) => (index - 1 + slashMatches.length) % slashMatches.length); return; }
       if (e.key === "Tab" || submitOnEnter) { e.preventDefault(); const command = slashMatches[slashIndex]; if (command) chooseSlash(command); return; }
-      if (e.key === "Escape") { e.preventDefault(); clearValue(); return; }
+      if (e.key === "Escape") { e.preventDefault(); void discardValue(); return; }
     }
-    if (submitOnEnter) { e.preventDefault(); submitMessage(); }
+    if (submitOnEnter) { e.preventDefault(); void submitMessage(); }
   }
-  function submitSteer(): void { const content = value.trim(); if (!content && attachments.length === 0) return; const submittedAttachments = attachments; clearValue(); p.onSteer(content, submittedAttachments); }
-  function submitMessage(): void { const content = value.trim(); if (!content && attachments.length === 0) return; const submittedAttachments = attachments; clearValue(); p.onSubmit(content, submittedAttachments); }
-  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected" : ""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} /> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? "Steer or queue a follow-up" : "Ask CopilotChat"} rows={1} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={!value.trim() && attachments.length === 0} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={!value.trim() && attachments.length === 0} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={!value.trim() && attachments.length === 0}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
+  async function submit(action: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>): Promise<void> { const content = value.trim(); if (submitting || pendingUploads > 0 || (!content && attachments.length === 0)) return; const submittedAttachments = attachments; setSubmitting(true); setAttachmentError(null); let accepted = false; const onAccepted = () => { if (accepted) return; accepted = true; clearValue(); setSubmitting(false); }; try { await action(content, submittedAttachments, onAccepted); } catch (error) { setAttachmentError(toErr(error)); } finally { setSubmitting(false); } }
+  function submitSteer(): void { void submit(p.onSteer); }
+  function submitMessage(): void { void submit(p.onSubmit); }
+  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? "Steer or queue a follow-up" : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
 });
-function AttachmentTray(p: { attachments: MessageAttachment[]; onRemove?: (id: string) => void }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => { const src = isImageAttachment(attachment) ? attachmentDataUrl(attachment) : null; return <div key={attachment.id} className={`attachment-chip${isImageAttachment(attachment) ? " image" : ""}`}>{src ? <img alt="" src={src} /> : <span className="attachment-file-icon"><IconUpload width={15}/></span>}<span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.mimeType} · {formatBytes(attachment.size)}</small></span>{p.onRemove ? <button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => p.onRemove?.(attachment.id)}><IconClose width={14}/></button> : null}</div>; })}</div>; }
+function AttachmentTray(p: { attachments: MessageAttachment[]; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => { const src = isImageAttachment(attachment) ? attachmentDataUrl(attachment) : null; return <div key={attachment.id} className={`attachment-chip${isImageAttachment(attachment) ? " image" : ""}`}>{src ? <img alt="" src={src} /> : <span className="attachment-file-icon"><IconUpload width={15}/></span>}<span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.mimeType} · {formatBytes(attachment.size)}</small></span>{p.onRemove ? <button type="button" aria-label={`Remove ${attachment.name}`} disabled={p.removeDisabled} onClick={() => p.onRemove?.(attachment.id)}><IconClose width={14}/></button> : null}</div>; })}</div>; }
 function composerPickerTitle(picker: ComposerPicker): string { return picker === "menu" ? "Composer options" : picker === "project" ? "Choose project" : picker === "skills" ? "Choose skills" : picker === "workspace" ? "Choose workspace" : "Tool permissions"; }
 function ComposerPickerContent(p: { picker: ComposerPicker; busy: boolean; projects: Project[]; activeProjectId: string | null; workspaces: Workspace[]; activeWorkspaceId: string | null; skills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; selectedSkillCount: number; activeProjectName: string | null; activeWorkspaceName: string | null; onAttach: () => void; onOpenPicker: (picker: ComposerPicker) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onToggleSkill: (id: string) => void; onPermissionMode: (mode: PermissionMode) => void; onManage: (tab: Tab) => void }) {
   if (p.picker === "menu") return <><div className="picker-head"><strong>Composer options</strong></div><div className="picker-list"><button type="button" className="picker-option" onClick={p.onAttach}><span>Attach files or images</span><small>{p.busy ? "Attach context for steering or the next queued message." : "Upload files, images, screenshots, or paste images into the composer."}</small></button><button type="button" className="picker-option" disabled={p.busy} onClick={() => p.onOpenPicker("project")}><span>Project</span><small>{p.busy ? "Project context is locked while this response runs." : p.activeProjectName ?? "General chat, no project context"}</small></button><button type="button" className="picker-option" onClick={() => p.onOpenPicker("skills")}><span>Skills</span><small>{p.selectedSkillCount ? `${p.selectedSkillCount} selected for the next turn` : "Choose reusable behavior for the next turn"}</small></button><button type="button" className="picker-option" disabled={p.busy} onClick={() => p.onOpenPicker("workspace")}><span>Workspace</span><small>{p.busy ? "Workspace context is locked while this response runs." : p.activeWorkspaceName ?? "No local folder attached"}</small></button><button type="button" className="picker-option" onClick={() => p.onOpenPicker("permissions")}><span>Tool permissions</span><small>{p.permissionMode === "yolo" ? "Auto-approve is on" : "Ask before tool use"}</small></button></div></>;
@@ -876,7 +1027,223 @@ function ComposerPickerContent(p: { picker: ComposerPicker; busy: boolean; proje
   return <><strong>Tool permissions</strong><p>Controls how this chat handles tool approval requests.</p><div className="settings-note"><p><strong>Auto-approve is powerful.</strong> Use it only for trusted chats and workspaces; shell and write permissions can change local files.</p></div><div className="segmented-control vertical"><button type="button" aria-label="Ask before each tool use" className={p.permissionMode === "ask" ? "on" : ""} onClick={() => p.onPermissionMode("ask")}><strong>Ask each time</strong><span>Review every tool request inline.</span></button><button type="button" aria-label="Auto-approve tool requests" className={p.permissionMode === "yolo" ? "on danger-mode" : ""} onClick={() => p.onPermissionMode("yolo")}><strong>Auto-approve tools</strong><span>Allow upcoming tool requests without another prompt.</span></button></div></>;
 }
 function Drawer(p: { active: Tab; onChangeTab: (t: Tab) => void; onClose: () => void; children: React.ReactNode }) { const activeTab = TABS.find((t) => t.id === p.active); function key(e: React.KeyboardEvent<HTMLButtonElement>, i: number) { if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return; e.preventDefault(); const n = (i + (e.key === "ArrowRight" ? 1 : -1) + TABS.length) % TABS.length; const tab = TABS[n]; if (!tab) return; p.onChangeTab(tab.id); window.requestAnimationFrame(() => e.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[n]?.focus()); } return <><div className="scrim" onClick={p.onClose}/><aside className="drawer" role="dialog" aria-modal="true" aria-label={activeTab?.label}><div className="drawer-head"><div><h2>{activeTab?.label}</h2><p>{DRAWER_DESCRIPTIONS[p.active]}</p></div><button className="icon-button" aria-label="Close" onClick={p.onClose}><IconClose/></button></div><div className="drawer-tabs" role="tablist">{TABS.map((tab,i) => <button key={tab.id} role="tab" aria-selected={tab.id===p.active} tabIndex={tab.id===p.active?0:-1} className={`drawer-tab${tab.id===p.active?" active":""}`} onClick={() => p.onChangeTab(tab.id)} onKeyDown={(e)=>key(e,i)}>{tab.icon}<span>{tab.label}</span></button>)}</div><div className="drawer-body">{p.children}</div></aside></>; }
-function DrawerContent(p: { tab: Tab; state: AppState; theme: Theme; setTheme: (t: Theme) => void; textScale: number; setTextScale: (scale: number) => void; apiToken: string; setApiToken: (t: string) => void; selectedSkillIds: string[]; setSelectedSkillIds: (ids: string[]) => void; activeProjectId: string | null; onSelectProject: (id: string | null) => void; activeWorkspaceId: string | null; setActiveWorkspaceId: (id: string | null) => void; refresh: () => Promise<void>; showToast: (s: string) => void; clearAllData: () => Promise<void>; onStartGuidedImport: (file: File) => Promise<void> }) { if (p.tab === "skills") return <SkillsPanel {...p}/>; if (p.tab === "tools") return <McpPanel servers={p.state.mcpServers} refresh={p.refresh} showToast={p.showToast}/>; if (p.tab === "code") return <WorkspacesPanel workspaces={p.state.workspaces} activeWorkspaceId={p.activeWorkspaceId} setActiveWorkspaceId={p.setActiveWorkspaceId} refresh={p.refresh} showToast={p.showToast}/>; return <PreferencesPanel provider={p.state.provider} authMode={p.state.authMode} owner={p.state.owner.login} archivedChats={p.state.archivedChats} theme={p.theme} setTheme={p.setTheme} textScale={p.textScale} setTextScale={p.setTextScale} apiToken={p.apiToken} setApiToken={p.setApiToken} refresh={p.refresh} showToast={p.showToast} clearAllData={p.clearAllData} onStartGuidedImport={p.onStartGuidedImport}/>; }
+function DrawerContent(p: { tab: Tab; state: AppState; theme: Theme; setTheme: (t: Theme) => void; textScale: number; setTextScale: (scale: number) => void; apiToken: string; setApiToken: (t: string) => void; selectedSkillIds: string[]; setSelectedSkillIds: (ids: string[]) => void; activeProjectId: string | null; onSelectProject: (id: string | null) => void; activeWorkspaceId: string | null; setActiveWorkspaceId: (id: string | null) => void; refresh: () => Promise<void>; showToast: (s: string) => void; clearAllData: () => Promise<void>; onStartGuidedImport: (file: File) => Promise<void> }) {
+  if (p.tab === "context") return <ContextPanel state={p.state} activeProjectId={p.activeProjectId} refresh={p.refresh} showToast={p.showToast}/>;
+  if (p.tab === "skills") return <SkillsPanel {...p}/>;
+  if (p.tab === "tools") return <McpPanel servers={p.state.mcpServers} refresh={p.refresh} showToast={p.showToast}/>;
+  if (p.tab === "code") return <WorkspacesPanel workspaces={p.state.workspaces} activeWorkspaceId={p.activeWorkspaceId} setActiveWorkspaceId={p.setActiveWorkspaceId} refresh={p.refresh} showToast={p.showToast}/>;
+  return <PreferencesPanel provider={p.state.provider} authMode={p.state.authMode} owner={p.state.owner.login} archivedChats={p.state.archivedChats} theme={p.theme} setTheme={p.setTheme} textScale={p.textScale} setTextScale={p.setTextScale} apiToken={p.apiToken} setApiToken={p.setApiToken} refresh={p.refresh} showToast={p.showToast} clearAllData={p.clearAllData} onStartGuidedImport={p.onStartGuidedImport}/>;
+}
+function ContextPanel(p: { state: AppState; activeProjectId: string | null; refresh: () => Promise<void>; showToast: (message: string) => void }) {
+  const [profile, setProfile] = useState(p.state.userContext.profile);
+  const [locationLevel, setLocationLevel] = useState<LocationLevel>(p.state.userContext.locationLevel);
+  const [scope, setScope] = useState(p.activeProjectId ?? "user");
+  const [projectNote, setProjectNote] = useState("");
+  const [newTitle, setNewTitle] = useState("");
+  const [newContent, setNewContent] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState("");
+  const [editContent, setEditContent] = useState("");
+  const [memories, setMemories] = useState<Memory[]>([]);
+  const [memoryTotal, setMemoryTotal] = useState(0);
+  const [nextMemoryOffset, setNextMemoryOffset] = useState<number | null>(null);
+  const [memoriesLoading, setMemoriesLoading] = useState(false);
+  const [working, setWorking] = useState<string | null>(null);
+  const [panelError, setPanelError] = useState<string | null>(null);
+  const selectedProject = scope === "user" ? null : p.state.projects.find((project) => project.id === scope) ?? null;
+  const memoryScopeKey = selectedProject?.id ?? "user";
+  const memoryScopeRef = useRef(memoryScopeKey);
+  const memoryRequestVersionRef = useRef(0);
+  memoryScopeRef.current = memoryScopeKey;
+  const currentLocation = p.state.userContext.location;
+  const locationSaveIsNoop = locationLevel === "off" && p.state.userContext.locationLevel === "off" && currentLocation === null;
+  useEffect(() => { setProfile(p.state.userContext.profile); }, [p.state.userContext.profile]);
+  useEffect(() => { setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.locationLevel]);
+  useEffect(() => {
+    if (p.activeProjectId && p.state.projects.some((project) => project.id === p.activeProjectId)) setScope(p.activeProjectId);
+  }, [p.activeProjectId]);
+  useEffect(() => {
+    setEditingId(null);
+    setNewTitle("");
+    setNewContent("");
+  }, [selectedProject?.id]);
+  useEffect(() => { setProjectNote(selectedProject?.memory ?? ""); }, [selectedProject?.id, selectedProject?.memory]);
+  useEffect(() => {
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    const requestVersion = ++memoryRequestVersionRef.current;
+    let cancelled = false;
+    setMemories([]);
+    setMemoryTotal(0);
+    setNextMemoryOffset(null);
+    setMemoriesLoading(true);
+    setPanelError(null);
+    void api<MemoryPage>(memoryPageUrl(requestedProjectId, 0)).then((page) => {
+      if (cancelled || memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
+      setMemories(page.items);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    }).catch((error) => {
+      if (!cancelled && memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setPanelError(toErr(error));
+    }).finally(() => {
+      if (!cancelled && memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [selectedProject?.id]);
+  async function reloadMemories(): Promise<void> {
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    if (memoryScopeRef.current !== requestedScope) return;
+    const requestVersion = ++memoryRequestVersionRef.current;
+    setMemoriesLoading(true);
+    try {
+      const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, 0));
+      if (memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
+      setMemories(page.items);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    } catch (error) {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) throw error;
+    } finally {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
+    }
+  }
+  async function loadMoreMemories(): Promise<void> {
+    if (nextMemoryOffset === null || memoriesLoading) return;
+    const requestedProjectId = selectedProject?.id ?? null;
+    const requestedScope = requestedProjectId ?? "user";
+    const requestedOffset = nextMemoryOffset;
+    const requestVersion = memoryRequestVersionRef.current;
+    setMemoriesLoading(true);
+    setPanelError(null);
+    try {
+      const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, requestedOffset));
+      if (memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
+      setMemories((current) => [...current, ...page.items.filter((item) => !current.some((existing) => existing.id === item.id))]);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    } catch (error) {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setPanelError(toErr(error));
+    } finally {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
+    }
+  }
+  async function perform(key: string, task: () => Promise<void>, message?: string): Promise<void> {
+    setWorking(key);
+    setPanelError(null);
+    try {
+      await task();
+      await p.refresh();
+      if (message) p.showToast(message);
+    } catch (error) {
+      setPanelError(toErr(error));
+    } finally {
+      setWorking(null);
+    }
+  }
+  async function saveProfile(): Promise<void> {
+    await perform("profile", async () => { await api("/api/user-context", { method: "PATCH", body: { profile } }); }, "Profile context saved");
+  }
+  async function saveLocation(): Promise<void> {
+    await perform("location", async () => {
+      const location = locationLevel === "off" ? null : await requestBrowserLocation(locationLevel);
+      await api("/api/user-context", { method: "PATCH", body: { locationLevel, location } });
+    }, locationLevel === "off" ? "Location sharing turned off" : `${locationLevel === "coarse" ? "Coarse" : "Fine"} location updated`);
+  }
+  async function saveProjectNote(): Promise<void> {
+    if (!selectedProject) return;
+    await perform("project-note", async () => { await api(`/api/projects/${selectedProject.id}`, { method: "PATCH", body: { memory: projectNote } }); }, "Shared project note saved");
+  }
+  async function createMemory(): Promise<void> {
+    if (!newTitle.trim() || !newContent.trim()) return;
+    await perform("new-memory", async () => {
+      await api<Memory>("/api/memories", { method: "POST", body: { projectId: selectedProject?.id ?? null, title: newTitle, content: newContent, enabled: true } });
+      setNewTitle("");
+      setNewContent("");
+      await reloadMemories();
+    }, "Memory saved");
+  }
+  function startEditing(memory: Memory): void { setEditingId(memory.id); setEditTitle(memory.title); setEditContent(memory.content); }
+  async function saveMemory(memory: Memory): Promise<void> {
+    if (!editTitle.trim() || !editContent.trim()) return;
+    await perform(`edit-${memory.id}`, async () => {
+      await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { title: editTitle, content: editContent } });
+      setEditingId(null);
+      await reloadMemories();
+    }, "Memory updated");
+  }
+  async function toggleMemory(memory: Memory): Promise<void> {
+    await perform(`toggle-${memory.id}`, async () => { await api<Memory>(`/api/memories/${memory.id}`, { method: "PATCH", body: { enabled: !memory.enabled } }); await reloadMemories(); }, memory.enabled ? "Memory paused" : "Memory included");
+  }
+  async function deleteMemory(memory: Memory): Promise<void> {
+    await perform(`delete-${memory.id}`, async () => { await api(`/api/memories/${memory.id}`, { method: "DELETE", raw: true }); await reloadMemories(); }, "Memory deleted");
+  }
+  return <div className="settings-panel context-settings">
+    <div className="settings-note context-privacy-note"><strong>You stay in control.</strong><p>Only saved profile text, enabled memories, and the location precision you choose are added to future chats. Fine location can be sensitive; turn it off whenever it is not needed.</p></div>
+    {panelError ? <p className="field-error" role="alert">{panelError}</p> : null}
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Profile</strong><span>Background that helps responses fit you without repeating it in every chat.</span></div></div>
+      <form className="settings-card context-profile-form" onSubmit={(event) => { event.preventDefault(); void saveProfile(); }}>
+        <FormField label="About you" hint="Add details such as your role, communication preferences, accessibility needs, units, or recurring goals.">
+          <textarea rows={6} maxLength={20_000} placeholder="I am a staff engineer. Prefer concise answers, metric units, and TypeScript examples." value={profile} onChange={(event) => setProfile(event.currentTarget.value)}/>
+        </FormField>
+        <div className="settings-actions"><button className="btn btn-primary" disabled={working === "profile" || profile === p.state.userContext.profile}>{working === "profile" ? "Saving…" : "Save profile"}</button></div>
+      </form>
+    </section>
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Location</strong><span>Share no location, an approximate area, or browser-reported fine coordinates.</span></div></div>
+      <div className="settings-card location-card">
+        <div className="segmented-control vertical location-level-control" role="radiogroup" aria-label="Location precision">
+          <button type="button" role="radio" aria-checked={locationLevel === "off"} className={locationLevel === "off" ? "on" : ""} onClick={() => setLocationLevel("off")}><strong>Off</strong><span>No location is stored or included.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "coarse"} className={locationLevel === "coarse" ? "on" : ""} onClick={() => setLocationLevel("coarse")}><strong>Coarse</strong><span>Rounded to roughly a city or region, about 10 km.</span></button>
+          <button type="button" role="radio" aria-checked={locationLevel === "fine"} className={locationLevel === "fine" ? "on" : ""} onClick={() => setLocationLevel("fine")}><strong>Fine</strong><span>Uses browser-reported coordinates and accuracy.</span></button>
+        </div>
+        <div className="location-summary">
+          <div><strong>Saved location</strong><span>{currentLocation ? locationSummary(currentLocation) : "No location saved."}</span></div>
+          <span className={`tag${p.state.userContext.locationLevel === "off" ? "" : " success"}`}>{locationLevelLabel(p.state.userContext.locationLevel)}</span>
+        </div>
+        <div className="settings-actions"><button type="button" className="btn btn-primary" disabled={working === "location" || locationSaveIsNoop} onClick={() => void saveLocation()}>{working === "location" ? "Requesting location…" : locationLevel === "off" ? "Turn off location" : "Save current location"}</button></div>
+      </div>
+    </section>
+    <section className="settings-section">
+      <div className="settings-section-title"><div><strong>Memories</strong><span>Browse and edit durable facts for every chat or one project.</span></div><span className="tag">{memoryTotal}</span></div>
+      <div className="settings-card memory-scope-card">
+        <FormField label="Memory scope" hint={selectedProject ? `Only chats in ${selectedProject.name} receive these memories.` : "User memories are available in general and project chats."}>
+          <select value={scope} onChange={(event) => setScope(event.currentTarget.value)}>
+            <option value="user">Your user profile</option>
+            {p.state.projects.map((project) => <option key={project.id} value={project.id}>Project: {project.name}</option>)}
+          </select>
+        </FormField>
+      </div>
+      {selectedProject ? <form className="settings-card project-note-form" onSubmit={(event) => { event.preventDefault(); void saveProjectNote(); }}>
+        <FormField label="Shared project note" hint="This existing freeform note is included alongside individual project memories.">
+          <textarea rows={4} placeholder="A broad shared note for this project." value={projectNote} onChange={(event) => setProjectNote(event.currentTarget.value)}/>
+        </FormField>
+        <div className="settings-actions"><button className="btn" disabled={working === "project-note" || projectNote === (selectedProject.memory ?? "")}>{working === "project-note" ? "Saving…" : "Save project note"}</button></div>
+      </form> : null}
+      <form className="settings-card memory-editor" onSubmit={(event) => { event.preventDefault(); void createMemory(); }}>
+        <div className="card-h"><strong>New {selectedProject ? "project" : "user"} memory</strong><span className="tag">{selectedProject ? selectedProject.name : "All chats"}</span></div>
+        <FormField label="Title"><input maxLength={120} placeholder="Preferred response style" value={newTitle} onChange={(event) => setNewTitle(event.currentTarget.value)}/></FormField>
+        <FormField label="What should CopilotChat remember?"><textarea rows={4} maxLength={20_000} placeholder="Prefer a short recommendation first, followed by tradeoffs." value={newContent} onChange={(event) => setNewContent(event.currentTarget.value)}/></FormField>
+        <div className="settings-actions"><button className="btn btn-primary" disabled={working === "new-memory" || !newTitle.trim() || !newContent.trim()}>{working === "new-memory" ? "Saving…" : "Add memory"}</button></div>
+      </form>
+      <div className="memory-list">
+        {memoriesLoading && memories.length === 0 ? <div className="settings-note"><strong>Loading memories…</strong><p>Fetching this scope only while the context manager is open.</p></div> : memories.length === 0 ? <div className="settings-note"><strong>No memories in this scope</strong><p>Add a durable preference, decision, or fact above. You can pause it without deleting it later.</p></div> : memories.map((memory) => editingId === memory.id
+          ? <form key={memory.id} className="memory-card memory-editor" onSubmit={(event) => { event.preventDefault(); void saveMemory(memory); }}>
+              <FormField label="Title"><input maxLength={120} value={editTitle} onChange={(event) => setEditTitle(event.currentTarget.value)}/></FormField>
+              <FormField label="Memory"><textarea rows={5} maxLength={20_000} value={editContent} onChange={(event) => setEditContent(event.currentTarget.value)}/></FormField>
+              <div className="card-actions"><button type="button" className="btn" onClick={() => setEditingId(null)}>Cancel</button><button className="btn btn-primary" disabled={working === `edit-${memory.id}` || !editTitle.trim() || !editContent.trim()}>{working === `edit-${memory.id}` ? "Saving…" : "Save changes"}</button></div>
+            </form>
+          : <article key={memory.id} className={`memory-card${memory.enabled ? "" : " paused"}`}>
+              <div className="memory-card-head"><div><strong>{memory.title}</strong><span>{formatProjectDate(memory.updatedAt)}</span></div><span className={`tag${memory.enabled ? " success" : " warning"}`}>{memory.enabled ? "Included" : "Paused"}</span></div>
+              <p>{memory.content}</p>
+              <div className="card-actions"><button className="btn btn-sm" onClick={() => startEditing(memory)}><IconEdit width={14}/>Edit</button><button className="btn btn-sm" disabled={working === `toggle-${memory.id}`} onClick={() => void toggleMemory(memory)}>{memory.enabled ? "Pause" : "Include"}</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" disabled={working === `delete-${memory.id}`} onConfirm={() => deleteMemory(memory)}/></div>
+            </article>)}
+      </div>
+      {nextMemoryOffset !== null ? <div className="settings-actions"><button type="button" className="btn" disabled={memoriesLoading} onClick={() => void loadMoreMemories()}>{memoriesLoading ? "Loading…" : `Load more (${memories.length} of ${memoryTotal})`}</button></div> : null}
+    </section>
+  </div>;
+}
 function ProjectChatReferences(p:{project:Project;state:AppState;refresh:()=>Promise<void>;showToast:(s:string)=>void}) {
   const [query,setQuery]=useState(""),[results,setResults]=useState<ProjectChatSearchResult[]>([]);
   const refs=p.state.projectChatReferences.filter((reference)=>reference.projectId===p.project.id);
@@ -897,9 +1264,9 @@ function ImportsPanel(p:{onStartGuidedImport:(file:File)=>Promise<void>}){const[
 function PreferencesPanel(p:{provider:ProviderStatus;authMode:AppState["authMode"];owner:string;archivedChats:Chat[];theme:Theme;setTheme:(t:Theme)=>void;textScale:number;setTextScale:(scale:number)=>void;apiToken:string;setApiToken:(t:string)=>void;refresh:()=>Promise<void>;showToast:(s:string)=>void;clearAllData:()=>Promise<void>;onStartGuidedImport:(file:File)=>Promise<void>}) {
   const [token,setToken]=useState(p.apiToken);
   const textPercent = Math.round(p.textScale * 100);
-  return <div className="settings-panel"><AuthSetupCard provider={p.provider} authMode={p.authMode}/><section className="settings-section"><div className="settings-section-title"><div><strong>Preferences</strong><span>Personal app behavior and display choices.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Theme</strong><span>Choose a color scheme or follow your system setting.</span></div><div className="segmented-control"><button className={p.theme==="system"?"on":""} onClick={()=>p.setTheme("system")}>System</button><button className={p.theme==="light"?"on":""} onClick={()=>p.setTheme("light")}>Light</button><button className={p.theme==="dark"?"on":""} onClick={()=>p.setTheme("dark")}>Dark</button></div></div></div><div className="settings-card"><label className="text-scale-control"><span>Text size <strong>{textPercent}%</strong></span><input aria-label="Text size" type="range" min="85" max="120" step="5" value={textPercent} onChange={(e)=>p.setTextScale(clampTextScale(Number(e.currentTarget.value) / 100))}/></label><div className="settings-actions"><button className="btn btn-sm" onClick={()=>p.setTextScale(DEFAULT_TEXT_SCALE)}>Reset text size</button></div></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Account & provider</strong><span>Authentication and provider-level connection state.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Signed in as {p.owner}</strong><span>{p.provider.details}</span></div><span className={`tag${p.provider.available?" success":" warning"}`}>{p.provider.id}</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>API token</strong><span>Optional token used for remote installs and authenticated API calls.</span></div><button className="btn btn-sm" onClick={()=>{p.setApiToken(token);p.showToast("API token saved");}}>Save</button></div><FormField label="API token"><input placeholder="Optional token for remote installs" value={token} onChange={e=>setToken(e.target.value)}/></FormField></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Import data</strong><span>Bring in conversations and project context from other assistants.</span></div></div><ImportsPanel onStartGuidedImport={p.onStartGuidedImport}/></section><section className="settings-section"><div className="settings-section-title"><div><strong>Local app data</strong><span>Device-level browser permissions and chat history maintenance.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Notifications</strong><span>Allow local browser notifications for long-running work.</span></div><button className="btn btn-sm" onClick={()=>void Notification.requestPermission().then(s=>p.showToast(`Notifications: ${s}`))}><IconBell width={14}/>Enable</button></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Archived chats</strong><span>Restore or permanently delete archived conversations.</span></div><span className="tag">{p.archivedChats.length}</span></div>{p.archivedChats.length===0?<p className="section-help">No archived chats.</p>:<div className="archive-list">{p.archivedChats.map(c=><div className="archive-row" key={c.id}><strong>{c.title}</strong><div className="card-actions"><button className="btn btn-sm" onClick={async()=>{await api<Chat>(`/api/chats/${c.id}`,{method:"PATCH",body:{archived:false}},p.apiToken); await p.refresh();}}>Restore</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" onConfirm={async()=>{await api<void>(`/api/chats/${c.id}`,{method:"DELETE",raw:true},p.apiToken); await p.refresh();}}/></div></div>)}</div>}</div><div className="settings-card danger-zone"><div className="settings-row"><div className="settings-row-main"><strong>Clear all local data</strong><span>Deletes chats, projects, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.</span></div><button className="btn btn-sm btn-danger" onClick={()=>void p.clearAllData()}>Clear all data</button></div></div></section></div>;
+  return <div className="settings-panel"><AuthSetupCard provider={p.provider} authMode={p.authMode}/><section className="settings-section"><div className="settings-section-title"><div><strong>Preferences</strong><span>Personal app behavior and display choices.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Theme</strong><span>Choose a color scheme or follow your system setting.</span></div><div className="segmented-control"><button className={p.theme==="system"?"on":""} onClick={()=>p.setTheme("system")}>System</button><button className={p.theme==="light"?"on":""} onClick={()=>p.setTheme("light")}>Light</button><button className={p.theme==="dark"?"on":""} onClick={()=>p.setTheme("dark")}>Dark</button></div></div></div><div className="settings-card"><label className="text-scale-control"><span>Text size <strong>{textPercent}%</strong></span><input aria-label="Text size" type="range" min="85" max="120" step="5" value={textPercent} onChange={(e)=>p.setTextScale(clampTextScale(Number(e.currentTarget.value) / 100))}/></label><div className="settings-actions"><button className="btn btn-sm" onClick={()=>p.setTextScale(DEFAULT_TEXT_SCALE)}>Reset text size</button></div></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Account & provider</strong><span>Authentication and provider-level connection state.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Signed in as {p.owner}</strong><span>{p.provider.details}</span></div><span className={`tag${p.provider.available?" success":" warning"}`}>{p.provider.id}</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>API token</strong><span>Optional token used for remote installs and authenticated API calls.</span></div><button className="btn btn-sm" onClick={()=>{p.setApiToken(token);p.showToast("API token saved");}}>Save</button></div><FormField label="API token"><input placeholder="Optional token for remote installs" value={token} onChange={e=>setToken(e.target.value)}/></FormField></div></section><section className="settings-section"><div className="settings-section-title"><div><strong>Import data</strong><span>Bring in conversations and project context from other assistants.</span></div></div><ImportsPanel onStartGuidedImport={p.onStartGuidedImport}/></section><section className="settings-section"><div className="settings-section-title"><div><strong>Local app data</strong><span>Device-level browser permissions and chat history maintenance.</span></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Notifications</strong><span>Allow local browser notifications for long-running work.</span></div><button className="btn btn-sm" onClick={()=>void Notification.requestPermission().then(s=>p.showToast(`Notifications: ${s}`))}><IconBell width={14}/>Enable</button></div></div><div className="settings-card"><div className="settings-row"><div className="settings-row-main"><strong>Archived chats</strong><span>Restore or permanently delete archived conversations.</span></div><span className="tag">{p.archivedChats.length}</span></div>{p.archivedChats.length===0?<p className="section-help">No archived chats.</p>:<div className="archive-list">{p.archivedChats.map(c=><div className="archive-row" key={c.id}><strong>{c.title}</strong><div className="card-actions"><button className="btn btn-sm" onClick={async()=>{await api<Chat>(`/api/chats/${c.id}`,{method:"PATCH",body:{archived:false}},p.apiToken); await p.refresh();}}>Restore</button><ConfirmButton label="Delete" confirmLabel="Confirm delete" onConfirm={async()=>{await api<void>(`/api/chats/${c.id}`,{method:"DELETE",raw:true},p.apiToken); await p.refresh();}}/></div></div>)}</div>}</div><div className="settings-card danger-zone"><div className="settings-row"><div className="settings-row-main"><strong>Clear all local data</strong><span>Deletes chats, projects, profile context, saved locations, memories, artifacts, skills, MCP servers, workspaces, tool history, and isolated chat workspaces. Account/auth setup is kept.</span></div><button className="btn btn-sm btn-danger" onClick={()=>void p.clearAllData()}>Clear all data</button></div></div></section></div>;
 }
-function AuthSetupCard(p:{provider:ProviderStatus;authMode:AppState["authMode"]}){const command="copilot login\n# or\ngh auth login\n# then restart the dev server\npnpm dev"; const infinite=p.provider.capabilities.includes("infinite-sessions"); const localSetup=p.authMode==="local"; const githubReauth=p.authMode==="github"&&p.provider.id==="sdk"; return <div className={`card auth-card${p.provider.available?" ready":" warning"}`}><div className="card-h"><strong>{p.provider.available?"Copilot is connected":"Connect Copilot"}</strong><span className={`tag${p.provider.available?" success":" warning"}`}>{p.provider.available?"ready":"setup needed"}</span></div><p className="section-help">{p.provider.available?`Dynamic model discovery is working${infinite?", and SDK infinite chats are enabled.":"."}`:p.provider.details||"No Copilot provider is available yet."}</p>{!p.provider.available&&localSetup?<pre className="command-block"><code>{command}</code></pre>:null}{!p.provider.available&&githubReauth?<div className="settings-actions"><a className="btn btn-primary" href="/api/auth/github/login">Sign in again</a></div>:null}</div>;}
+function AuthSetupCard(p:{provider:ProviderStatus;authMode:AppState["authMode"]}){const command="copilot login\n# or\ngh auth login\n# then restart the dev server\npnpm dev"; const infinite=p.provider.capabilities.includes("infinite-sessions"); const localSetup=p.authMode==="local"; const githubReauth=p.authMode==="github"&&p.provider.id==="sdk"; const discovery=p.provider.modelsAuthoritative; const detail=!p.provider.available?p.provider.details||"No Copilot provider is available yet.":discovery?`Dynamic model discovery is working${infinite?", and SDK infinite chats are enabled.":"."}`:p.provider.id==="cli"?"The CLI bridge does not expose dynamic model discovery, so CopilotChat uses configured model choices.":"The provider is connected, but its current model list is a configured fallback. Refresh models to retry discovery."; return <div className={`card auth-card${p.provider.available?" ready":" warning"}`}><div className="card-h"><strong>{p.provider.available?"Copilot is connected":"Connect Copilot"}</strong><span className={`tag${p.provider.available&&discovery?" success":" warning"}`}>{p.provider.available?discovery?"ready":"fallback models":"setup needed"}</span></div><p className="section-help">{detail}</p>{!p.provider.available&&localSetup?<pre className="command-block"><code>{command}</code></pre>:null}{!p.provider.available&&githubReauth?<div className="settings-actions"><a className="btn btn-primary" href="/api/auth/github/login">Sign in again</a></div>:null}</div>;}
 function Toast(p:{text:string;onDone:()=>void}){useEffect(()=>{const id=setTimeout(p.onDone,2200);return()=>clearTimeout(id);},[p]);return <div className="toast">{p.text}</div>;}
 type LatestRef<T> = { current: T };
 type BackGuardOptions = { drawerRef: LatestRef<Tab | null>; sidebarOpenRef: LatestRef<boolean>; busyRef: LatestRef<boolean>; stopResponseRef: LatestRef<() => void>; currentPath: () => string; closeDrawer: () => void; closeSidebar: () => void; toast: (text: string) => void };
@@ -938,29 +1305,8 @@ function routeSegment(path: string, prefix: string): string | null { const segme
 function appPathForSelection(chatId: string | null, projectId: string | null): string { if (chatId) return `${CHAT_ROUTE_PREFIX}${encodeURIComponent(chatId)}`; return projectId ? `${PROJECT_ROUTE_PREFIX}${encodeURIComponent(projectId)}` : "/"; }
 function syncAppUrl(path: string): void { if (location.pathname === path) return; history.replaceState({ copilotChatBackGuard: true }, "", path); }
 async function api<T>(url:string,init:{method?:string;body?:unknown;raw?:boolean}={},token=localStorage.getItem(API_TOKEN_KEY)??""):Promise<T>{const method=init.method??"GET";const headers:Record<string,string>={};if(init.body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:init.body!==undefined?JSON.stringify(init.body):undefined});if(!res.ok)throw new Error(httpErrorMessage(res.status,await res.text()));return init.raw?undefined as T:await res.json() as T;}
-async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",hooks:StreamHooks={}):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new FatalStreamError(httpErrorMessage(res.status,await res.text()));hooks.onOpen?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";try{while(true){const{done,value}=await reader.read();if(done)break;hooks.onChunk?.();buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}finally{void reader.cancel().catch(()=>undefined);}}
+async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",onAccepted?:()=>void,hooks:StreamHooks={}):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new FatalStreamError(httpErrorMessage(res.status,await res.text()));onAccepted?.();hooks.onOpen?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";try{while(true){const{done,value}=await reader.read();if(done)break;hooks.onChunk?.();buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}finally{void reader.cancel().catch(()=>undefined);}}
 function parseSse(chunk:string):SseEvent|null{const lines=chunk.split("\n");const event=lines.find(l=>l.startsWith("event:"))?.slice(6).trim();const data=lines.find(l=>l.startsWith("data:"))?.slice(5).trim();return event&&data?{event,data:JSON.parse(data) as unknown}:null;}
-class FatalStreamError extends Error { constructor(message: string) { super(message); this.name = "FatalStreamError"; } }
-function isFatalStreamError(e: unknown): boolean { return e instanceof Error && e.name === "FatalStreamError"; }
-function isAbortError(e: unknown): boolean { return e instanceof Error && e.name === "AbortError"; }
-function activeResponsePath(chatId: string): string { return `/api/chats/${chatId}/active-response`; }
-function waitBeforeReconnect(delayMs: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) { resolve(); return; }
-    const finish = (): void => { window.clearTimeout(timer); signal.removeEventListener("abort", finish); window.removeEventListener("online", finish); resolve(); };
-    const timer = window.setTimeout(finish, delayMs);
-    signal.addEventListener("abort", finish);
-    window.addEventListener("online", finish);
-  });
-}
-function waitUntilOnline(signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted || navigator.onLine) { resolve(); return; }
-    const finish = (): void => { signal.removeEventListener("abort", finish); window.removeEventListener("online", finish); resolve(); };
-    signal.addEventListener("abort", finish);
-    window.addEventListener("online", finish);
-  });
-}
 function readTheme(): Theme { const saved = localStorage.getItem("copilotchat.theme"); return saved === "system" || saved === "light" || saved === "dark" ? saved : "system"; }
 function readSystemTheme(): ResolvedTheme { return window.matchMedia(SYSTEM_THEME_QUERY).matches ? "dark" : "light"; }
 function readContextTier(): ContextTier { return localStorage.getItem(CONTEXT_TIER_KEY) === "long_context" ? "long_context" : "default"; }
@@ -972,7 +1318,23 @@ function writeSeenChatUpdates(value: Record<string, string>): Record<string, str
 async function registerServiceWorker(){if("serviceWorker" in navigator)try{await navigator.serviceWorker.register("/sw.js");}catch{return;}}
 function notify(title:string,body:string){if(typeof Notification==="undefined"||Notification.permission!=="granted"||document.visibilityState!=="hidden")return;if(navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:"notify",title,body});else new Notification(title,{body});}
 function fileToBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error("Failed to read file."));r.onload=()=>typeof r.result==="string"?resolve(r.result.slice(r.result.indexOf(",")+1)):reject(new Error("Failed to read file."));r.readAsDataURL(file);});}
-async function fileToAttachment(file: File): Promise<MessageAttachment> { return { id: crypto.randomUUID(), name: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: file.size, data: await fileToBase64(file) }; }
+async function uploadFile(file: File, token: string): Promise<MessageAttachment> {
+  const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
+  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+  if (token) headers.Authorization = ["Bearer", token].join(" ");
+  const response = await fetch(`/api/uploads?${query.toString()}`, { method: "POST", headers, body: file });
+  if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
+  const attachment = await response.json() as MessageAttachment;
+  if (file.type.startsWith("image/") && file.size <= 1024 * 1024) {
+    try { attachment.data = await fileToBase64(file); } catch { /* The uploaded image remains usable without an inline preview. */ }
+  }
+  return attachment;
+}
+async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {
+  if (!attachment.uploadId) return;
+  await api<void>(`/api/uploads/${encodeURIComponent(attachment.uploadId)}`, { method: "DELETE", raw: true }, token);
+}
+function attachmentForRequest(attachment: MessageAttachment): MessageAttachment { return { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, ...(attachment.uploadId ? { uploadId: attachment.uploadId } : attachment.data ? { data: attachment.data } : attachment.filePath ? { filePath: attachment.filePath } : {}) }; }
 function messageAttachments(message: ChatMessage): MessageAttachment[] { const value = message.metadata.attachments; if (!Array.isArray(value)) return []; return value.filter(isMessageAttachment); }
 function isMessageAttachment(value: unknown): value is MessageAttachment { return isObjectRecord(value) && typeof value.id === "string" && typeof value.name === "string" && typeof value.mimeType === "string" && typeof value.size === "number" && (value.data === undefined || typeof value.data === "string"); }
 function isImageAttachment(attachment: MessageAttachment): boolean { return attachment.mimeType.startsWith("image/"); }
@@ -987,6 +1349,10 @@ function readTaskListItems(value: unknown): TaskListItem[] | undefined { if (!Ar
 function readInteractions(value: unknown): PendingInteraction[] { if (!Array.isArray(value)) return []; return value.map(readInteraction).filter((interaction): interaction is PendingInteraction => Boolean(interaction)); }
 function readInteraction(value: unknown, index: number): PendingInteraction | null { if (!isObjectRecord(value)) return null; const kind = value.kind === "permission" || value.kind === "user-input" || value.kind === "elicitation" ? value.kind : null; if (!kind) return null; const choices = Array.isArray(value.choices) ? value.choices.map(String) : undefined; return { id: typeof value.id === "string" && value.id ? value.id : `${kind}-${index}`, kind, title: typeof value.title === "string" ? value.title : kind === "permission" ? "Permission request" : "Agent request", message: typeof value.message === "string" ? value.message : "", choices, allowFreeform: value.allowFreeform !== false, request: value.request, requestedSchema: value.requestedSchema }; }
 function readPendingTurns(value: unknown): PendingTurn[] { if (!Array.isArray(value)) return []; return value.map(readPendingTurn).filter((turn): turn is PendingTurn => Boolean(turn)); }
+function readChatUsage(value: unknown): ChatUsage { if (!isObjectRecord(value)) return emptyChatUsage; return { turnNanoAiu: readNanoAiu(value.turnNanoAiu), chatNanoAiu: readNanoAiu(value.chatNanoAiu) }; }
+function readNanoAiu(value: unknown): number { return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0; }
+function messageNanoAiu(message: ChatMessage): number { const usage = message.metadata.usage; return isObjectRecord(usage) ? readNanoAiu(usage.nanoAiu) : 0; }
+function latestResponseNanoAiu(messages: ChatMessage[]): number { const latest = [...messages].reverse().find((message) => message.role === "assistant"); return latest ? messageNanoAiu(latest) : 0; }
 function readPendingTurn(value: unknown, index: number): PendingTurn | null { if (!isObjectRecord(value)) return null; const mode = value.mode === "steer" ? "steer" : value.mode === "queue" ? "queue" : null; if (!mode) return null; const status = value.status === "sent" || value.status === "running" || value.status === "done" || value.status === "failed" ? value.status : "queued"; return { id: typeof value.id === "string" && value.id ? value.id : `${mode}-${index}`, mode, content: typeof value.content === "string" ? value.content : "", status, createdAt: typeof value.createdAt === "string" ? value.createdAt : new Date().toISOString() }; }
 function upsertPendingTurn(turns: PendingTurn[], next: PendingTurn): PendingTurn[] { return turns.some((turn) => turn.id === next.id) ? turns.map((turn) => turn.id === next.id ? next : turn) : [...turns, next]; }
 function formatActivityValue(value: unknown): string { if (typeof value === "string") return value; return JSON.stringify(value, null, 2) ?? String(value); }
@@ -1038,6 +1404,36 @@ function buildSlashCommands(skills: Skill[]): SlashCommand[] {
 }
 function slashCommandSlug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "command"; }
 function toErr(e:unknown){return e instanceof Error?e.message:String(e);}
+/** A failure the server reported itself, so retrying the transport would only repeat it. */
+class FatalStreamError extends Error {}
+function isAbortError(e: unknown): boolean { return e instanceof Error && e.name === "AbortError"; }
+function isNetworkError(message: string): boolean { return /network\s*(?:request\s*)?(?:error|failed)|network connection (?:was )?lost|failed to fetch|fetch failed|load failed|offline|internet connection/i.test(message); }
+function waitUntilOnline(signal: AbortSignal, timeout: number): Promise<void> {
+  if (navigator.onLine || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("online", done);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = window.setTimeout(done, timeout);
+    window.addEventListener("online", done, { once: true });
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+function waitForRetry(delay: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timeout);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timeout = window.setTimeout(done, delay);
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 function httpErrorMessage(status: number, body: string): string {
   const text = readableErrorText(body);
   if (status === 401) return text.includes("Login required") ? "Login required" : "Unauthorized. Check your CopilotChat API token or sign in again.";
@@ -1073,6 +1469,7 @@ function friendlyError(raw: string): { title: string; message: string; action: s
 }
 function isEditableTarget(target: EventTarget | null): boolean { return target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)); }
 function effortLabel(id: ReasoningEffort): string { return id === "default" ? "Auto" : id.charAt(0).toUpperCase() + id.slice(1); }
+function fallbackProviderModel(id: string): ProviderModel { return { id, name: id, supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false, contextWindowTokens: 128000, maxPromptTokens: 128000 }; }
 function reasoningEffortChoices(model: ProviderModel | null | undefined): ReasoningEffort[] { if (!model?.supportsReasoningEffort) return ["default"]; const supported = model.supportedReasoningEfforts.filter((effort): effort is ReasoningEffort => EFFORT_OPTIONS.includes(effort as ReasoningEffort)); return Array.from(new Set<ReasoningEffort>(["default", ...supported])); }
 function contextTierLabel(tier: ContextTier, model: ProviderModel | null): string { const tokens = tier === "long_context" ? model?.longContextMaxPromptTokens : model?.maxPromptTokens ?? model?.contextWindowTokens; const label = tier === "long_context" ? "Long" : "Standard"; return tokens ? `${label} (${formatTokens(tokens)})` : label; }
 function modelContextLabel(model: ProviderModel): string { const standard = model.maxPromptTokens ?? model.contextWindowTokens; if (!standard) return "Context limit unavailable"; return model.supportsLongContext && model.longContextMaxPromptTokens ? `${formatTokens(standard)} / ${formatTokens(model.longContextMaxPromptTokens)}` : `${formatTokens(standard)} context`; }
@@ -1083,7 +1480,32 @@ function useDismissablePopup<T extends HTMLElement>(active: boolean, onDismiss: 
 function resizeComposerTextarea(textarea: HTMLTextAreaElement | null): void { if (!textarea) return; textarea.style.height = "0px"; textarea.style.height = `${Math.min(Math.max(textarea.scrollHeight, 44), 180)}px`; }
 function isAtLiveEdge(element: HTMLElement): boolean { return element.scrollHeight - element.scrollTop - element.clientHeight <= LIVE_SCROLL_THRESHOLD; }
 function cleanName(s:string){const t=s.trim();return !t||t.toLowerCase()==="local"||t.toLowerCase()==="local user"?"":t.split(/\s+/)[0]??"";}
-function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],model:ProviderModel|null,tier:ContextTier):ContextStatus{const contextText=[...messages.map(m=>m.content),streamingText,draft,project?.instructions??"",workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil(contextText.length/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
+function memoryPageUrl(projectId: string | null, offset: number): string { const query = new URLSearchParams({ offset: String(offset), limit: "20" }); if (projectId) query.set("projectId", projectId); return `/api/memories?${query.toString()}`; }
+function requestBrowserLocation(level: Exclude<LocationLevel, "off">): Promise<UserLocation> {
+  if (!navigator.geolocation) return Promise.reject(new Error("Location is not available in this browser."));
+  return new Promise((resolve, reject) => {
+    navigator.geolocation.getCurrentPosition((position) => {
+      const digits = level === "coarse" ? 1 : 5;
+      resolve({
+        latitude: Number(position.coords.latitude.toFixed(digits)),
+        longitude: Number(position.coords.longitude.toFixed(digits)),
+        accuracy: level === "coarse" ? Math.max(10_000, position.coords.accuracy) : position.coords.accuracy,
+        capturedAt: new Date(position.timestamp || Date.now()).toISOString(),
+        precision: level,
+      });
+    }, (error) => {
+      const message = error.code === error.PERMISSION_DENIED ? "Location permission was denied." : error.code === error.TIMEOUT ? "Location lookup timed out." : "The browser could not determine your location.";
+      reject(new Error(message));
+    }, { enableHighAccuracy: level === "fine", timeout: 15_000, maximumAge: 5 * 60_000 });
+  });
+}
+function locationLevelLabel(level: LocationLevel): string { return level === "coarse" ? "Coarse" : level === "fine" ? "Fine" : "Off"; }
+function locationSummary(location: UserLocation): string {
+  const digits = location.precision === "coarse" ? 1 : 5;
+  const accuracy = location.accuracy >= 1000 ? `${trimNumber(location.accuracy / 1000)} km` : `${Math.round(location.accuracy)} m`;
+  return `${location.latitude.toFixed(digits)}, ${location.longitude.toFixed(digits)} · about ${accuracy} · ${formatProjectDate(location.capturedAt)}`;
+}
+function buildContextStatus(messages:ChatMessage[],streamingText:string,draft:string,project:Project|null,workspace:Workspace|null,skills:Skill[],profile:string,location:UserLocation|null,memoryContextLength:number,model:ProviderModel|null,tier:ContextTier):ContextStatus{const contextText=[...messages.map(m=>m.content),streamingText,draft,profile,location?`${location.latitude},${location.longitude}`:"",project?.instructions??"",project?.memory??"",workspace?.rootPath??"",...skills.map(s=>`${s.manifest.name}\n${s.manifest.description}\n${s.manifest.instructions}`)].filter(Boolean).join("\n\n");const estimatedTokens=Math.max(0,Math.ceil((contextText.length+memoryContextLength)/4));const displayTokens=estimatedTokens===0?0:Math.max(1000,estimatedTokens);const limitTokens=tier==="long_context"?(model?.longContextMaxPromptTokens??model?.maxPromptTokens??model?.contextWindowTokens):(model?.maxPromptTokens??model?.contextWindowTokens);const tierLabel=tier==="long_context"?"Long context":"Standard context";if(!limitTokens)return{estimatedTokens,limitTokens:null,percent:null,label:`${formatTokens(displayTokens)} used`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} tokens. The limit is not reported for this model.`,state:"unknown"};const actualPercent=(estimatedTokens/limitTokens)*100;const percent=Math.min(100,Math.round(actualPercent));const state=percent>=85?"full":percent>=65?"warn":"ok";return{estimatedTokens,limitTokens,percent,label:`${formatTokens(displayTokens)} / ${formatTokens(limitTokens)}`,detail:`${tierLabel}. Estimated ${estimatedTokens.toLocaleString()} of ${limitTokens.toLocaleString()} context tokens used (${formatPercent(actualPercent)}).`,state};}
 function formatTokens(value:number):string{if(value>=1000000)return`${trimNumber(value/1000000)}M`;if(value>=1000)return`${trimNumber(value/1000)}k`;return String(value);}
 function trimNumber(value:number):string{return value>=10?String(Math.round(value)):value.toFixed(1).replace(/\.0$/,"");}
 function formatPercent(value:number):string{return value>0&&value<1?"<1%":`${trimNumber(Math.min(100,value))}%`;}

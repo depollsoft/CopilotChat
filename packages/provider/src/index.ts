@@ -5,7 +5,9 @@ import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest
 import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, MCPServerConfig, MessageOptions, ModelInfo, PermissionHandler, SessionConfig, SessionEvent, SessionFsFileInfo, SessionFsProvider, Tool } from "@github/copilot-sdk";
 
-export interface ProviderAttachment { type: "blob"; data: string; mimeType: string; displayName?: string }
+export type ProviderAttachment =
+  | { type: "file"; path: string; displayName?: string; size?: number }
+  | { type: "blob"; data: string; mimeType: string; displayName?: string; size?: number };
 export interface ProviderMessage { role: ChatRole; content: string; attachments?: ProviderAttachment[] }
 export interface ProviderTool { name: string; description: string; parameters: Record<string, unknown>; skipPermission?: boolean; handler: (args: unknown) => unknown }
 export type ProviderPermissionRequest = { kind: string; toolCallId?: string | null; toolName?: string | null; fileName?: string | null; fullCommandText?: string | null; url?: string | null; details?: Record<string, unknown>; raw: unknown };
@@ -20,7 +22,7 @@ export type ProviderInteractionHandlers = {
   requestElicitation?: (request: ProviderElicitationRequest) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, ProviderElicitationValue> }>;
 };
 export type ProviderChatControls = { onSteer: (handler: (message: ProviderMessage) => void | Promise<void>) => () => void };
-export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; contextTier?: "default" | "long_context"; permissionMode?: PermissionMode; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
+export interface ProviderChatRequest { messages: ProviderMessage[]; sessionId?: string | null; resumeSession?: boolean; model: string; reasoningEffort?: "default" | "none" | "low" | "medium" | "high" | "xhigh" | "max"; contextTier?: "default" | "long_context"; permissionMode?: PermissionMode; userContext?: string | null; projectContext?: string | null; artifactContext?: string | null; skills?: SkillManifest[]; mcpServers?: McpServer[]; tools?: ProviderTool[]; titleTool?: ProviderTitleTool; interactions?: ProviderInteractionHandlers; controls?: ProviderChatControls; gitHubToken?: string | null; workingDirectory?: string | null; abortSignal?: AbortSignal }
 export type ProviderEvent =
   | { type: "delta"; text: string }
   | { type: "reasoning-delta"; text: string }
@@ -37,6 +39,7 @@ export type ProviderEvent =
   | { type: "tool-call"; id?: string | null; toolName: string; input?: unknown }
   | { type: "tool-result"; id?: string | null; toolName: string; output?: unknown; error?: string | null; status: "succeeded" | "failed" }
   | { type: "artifact"; title: string; kind: string; content: string; language?: string | null }
+  | { type: "usage"; nanoAiu: number; model?: string | null; agentId?: string | null }
   | { type: "done"; usage?: Record<string, unknown> };
 export interface CopilotProvider { id: string; label: string; status(): Promise<ProviderStatus>; streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> }
 export interface ProviderFactoryOptions { provider: "auto" | "sdk" | "http" | "cli" | "echo"; apiBaseUrl?: string; apiToken?: string; model: string; cliCommand?: string; sdkCliPath?: string; gitHubToken?: string }
@@ -52,7 +55,7 @@ export function createCopilotProvider(options: ProviderFactoryOptions): CopilotP
   if (options.provider === "http" || (options.provider === "auto" && options.apiBaseUrl)) return new HttpCopilotProvider(options);
   if (options.provider === "cli" || (options.provider === "auto" && options.cliCommand)) return new CliCopilotProvider(options);
   if (options.provider === "sdk" || options.provider === "auto") return new SdkCopilotProvider(options);
-  return new EchoProvider(options.model);
+  return new EchoProvider(options.model, { reportUsage: true });
 }
 
 class SdkCopilotProvider implements CopilotProvider {
@@ -72,6 +75,7 @@ class SdkCopilotProvider implements CopilotProvider {
         details: "Using @github/copilot-sdk. Model list is loaded from Copilot.",
         capabilities,
         models: mapped,
+        modelsAuthoritative: true,
         defaultModel: mapped.find((model) => model.id === "auto")?.id ?? mapped[0]?.id ?? this.options.model,
       };
     } catch (error) {
@@ -82,6 +86,7 @@ class SdkCopilotProvider implements CopilotProvider {
         details: sdkFailureDetails(error, this.options),
         capabilities,
         models: fallbackModels(this.options.model),
+        modelsAuthoritative: false,
         defaultModel: this.options.model,
       };
     } finally {
@@ -91,21 +96,35 @@ class SdkCopilotProvider implements CopilotProvider {
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     const fallback = new EchoProvider(this.options.model);
     try {
-      yield* this.streamWithSdk(request);
+      yield* this.streamWithSessionRecovery(request);
     } catch (error) {
       yield { type: "delta", text: `Copilot SDK was unavailable (${(error as Error).message}). Falling back to local development provider.\n\n` };
       yield* fallback.streamChat(request);
     }
   }
+  private async *streamWithSessionRecovery(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
+    let streamedContent = false;
+    try {
+      for await (const event of this.streamWithSdk(request)) {
+        if (event.type !== "session") streamedContent = true;
+        yield event;
+      }
+      return;
+    } catch (error) {
+      if (streamedContent || !request.resumeSession || !request.sessionId || !isLostSessionError(error)) throw error;
+    }
+    yield* this.streamWithSdk({ ...request, resumeSession: false });
+  }
   private async *streamWithSdk(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
-    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory));
+    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory, request.sessionId));
     const queue = new AsyncEventQueue<ProviderEvent>();
     const lastUserMessage = [...request.messages].reverse().find((message) => message.role === "user");
     const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), contextTier: sdkContextTier(request.contextTier), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
     if (request.workingDirectory) sessionOptions.workingDirectory = request.workingDirectory;
     if (request.workingDirectory) sessionOptions.createSessionFsProvider = () => new RootBoundSessionFsProvider(request.workingDirectory!);
-    const mcpServers = mapMcpServers(request.mcpServers ?? []);
+    const mcpServers = buildSdkMcpServers(request, this.options.gitHubToken);
     if (Object.keys(mcpServers).length > 0) sessionOptions.mcpServers = mcpServers;
+    if (request.workingDirectory) await pruneSdkSessionState(request.workingDirectory, request.sessionId);
     let sessionData: { session: CopilotSession; resumed: boolean };
     try { sessionData = await createOrResumeSdkSession(client, sessionOptions, Boolean(request.resumeSession && request.sessionId)); }
     catch (error) { await client.stop().catch(() => []); throw error; }
@@ -130,11 +149,12 @@ class SdkCopilotProvider implements CopilotProvider {
       return { truncated: next.truncated };
     };
     session.on((event: SessionEvent) => {
-      const eventType = String(event.type);
-      const agentId = eventAgentId(event);
+      const sdkEvent = event as unknown as SdkSessionEvent;
+      const eventType = sdkEvent.type;
+      const agentId = eventAgentId(sdkEvent);
       if (eventType === "assistant.message_delta") {
         if (!agentId || subagentTextClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(sdkEvent.data, ["deltaContent"]);
         if (text) {
           sawSubagentDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -144,7 +164,7 @@ class SdkCopilotProvider implements CopilotProvider {
       }
       if (eventType === "assistant.reasoning_delta") {
         if (!agentId || subagentReasoningClosed.has(agentId)) return;
-        const text = readNestedString(event.data, ["deltaContent"]);
+        const text = readNestedString(sdkEvent.data, ["deltaContent"]);
         if (text) {
           sawSubagentReasoningDelta.add(agentId);
           const next = pushCappedText(text, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -153,7 +173,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.message") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(sdkEvent.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-delta", id: agentId, text: chunk }), getProviderTextState(subagentText, agentId), false, providerValueStringLimit);
@@ -164,7 +184,7 @@ class SdkCopilotProvider implements CopilotProvider {
         return;
       }
       if (eventType === "assistant.reasoning") {
-        const content = readNestedString(event.data, ["content"]);
+        const content = readNestedString(sdkEvent.data, ["content"]);
         if (content && agentId) {
           if (sawSubagentReasoningDelta.has(agentId)) return;
           pushCappedText(content, (chunk) => ({ type: "subagent-reasoning-delta", id: agentId, text: chunk }), getProviderTextState(subagentReasoningText, agentId), false, providerValueStringLimit);
@@ -173,24 +193,30 @@ class SdkCopilotProvider implements CopilotProvider {
         }
         return;
       }
-      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), input: limitProviderValue(eventToolInput(event.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
-      if (eventType === "tool.execution_complete") { const error = eventToolError(event.data); const tool = { toolCallId: eventId(event.data), toolName: eventToolName(event.data), output: limitProviderValue(eventToolOutput(event.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
-      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(event.data, ["agentDescription"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, toolCallId: readNestedString(event.data, ["toolCallId"]) }); return; }
-      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
-      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(event), name: readNestedString(event.data, ["agentName"]) ?? "subagent", displayName: readNestedString(event.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(event.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(event.data, ["durationMs"]) ?? undefined, model: readNestedString(event.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(event.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(event.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "tool.execution_start") { const tool = { toolCallId: eventId(sdkEvent.data), toolName: eventToolName(sdkEvent.data), input: limitProviderValue(eventToolInput(sdkEvent.data)) }; queue.push(agentId ? { type: "subagent-tool-call", id: agentId, ...tool } : { type: "tool-call", id: tool.toolCallId, toolName: tool.toolName, input: tool.input }); return; }
+      if (eventType === "tool.execution_complete") { const error = eventToolError(sdkEvent.data); const tool = { toolCallId: eventId(sdkEvent.data), toolName: eventToolName(sdkEvent.data), output: limitProviderValue(eventToolOutput(sdkEvent.data)), error: error ? truncateProviderString(error) : null, status: error ? "failed" as const : "succeeded" as const }; queue.push(agentId ? { type: "subagent-tool-result", id: agentId, ...tool } : { type: "tool-result", id: tool.toolCallId, toolName: tool.toolName, output: tool.output, error: tool.error, status: tool.status }); return; }
+      if (eventType === "subagent.started") { queue.push({ type: "subagent-start", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", description: readNestedString(sdkEvent.data, ["agentDescription"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, toolCallId: readNestedString(sdkEvent.data, ["toolCallId"]) }); return; }
+      if (eventType === "subagent.completed") { queue.push({ type: "subagent-complete", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
+      if (eventType === "subagent.failed") { queue.push({ type: "subagent-failed", id: subagentEventId(sdkEvent), name: readNestedString(sdkEvent.data, ["agentName"]) ?? "subagent", displayName: readNestedString(sdkEvent.data, ["agentDisplayName"]) ?? "Subagent", error: readNestedString(sdkEvent.data, ["error"]) ?? "Subagent failed.", durationMs: readNestedNumber(sdkEvent.data, ["durationMs"]) ?? undefined, model: readNestedString(sdkEvent.data, ["model"]) ?? undefined, totalTokens: readNestedNumber(sdkEvent.data, ["totalTokens"]) ?? undefined, totalToolCalls: readNestedNumber(sdkEvent.data, ["totalToolCalls"]) ?? undefined }); return; }
       if (eventType === "session.plan_changed") { void session.rpc.plan.read().then((plan) => { const items = parseTaskListItems(plan.content ?? ""); if (items.length > 0) queue.push({ type: "task-list", id: "session-plan", title: "Session plan", source: "plan.md", content: plan.content, items }); }).catch(() => undefined); return; }
+      if (eventType === "assistant.usage") { const nanoAiu = readSdkUsageNanoAiu(sdkEvent.data); if (nanoAiu !== null) queue.push({ type: "usage", nanoAiu, model: readNestedString(sdkEvent.data, ["model"]), agentId }); return; }
       if (eventType === "session.idle") { queue.push({ type: "done", usage: { provider: this.id } }); queue.close(); return; }
-      if (eventType === "session.error") queue.fail(new Error(readNestedString(event.data, ["message"]) ?? "Copilot SDK session failed."));
+      if (eventType === "session.error") queue.fail(new Error(readNestedString(sdkEvent.data, ["message"]) ?? "Copilot SDK session failed."));
     });
-    void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
-    try { yield* queue; } finally { unregisterSteer?.(); await session.disconnect(); await client.stop().catch(() => []); }
+    const abortSession = () => { void session.abort().then(() => queue.close()).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error)))); };
+    if (request.abortSignal?.aborted) abortSession();
+    else {
+      request.abortSignal?.addEventListener("abort", abortSession, { once: true });
+      void session.send({ prompt: resumed ? (lastUserMessage?.content ?? "") : buildSdkPrompt(request, lastUserMessage?.content ?? ""), attachments: sdkAttachments(lastUserMessage) }).catch((error: unknown) => queue.fail(error instanceof Error ? error : new Error(String(error))));
+    }
+    try { yield* queue; } finally { request.abortSignal?.removeEventListener("abort", abortSession); unregisterSteer?.(); await session.disconnect(); await client.stop().catch(() => []); }
   }
 }
 
 class EchoProvider implements CopilotProvider {
   id = "echo"; label = "Local development provider";
-  constructor(private readonly model: string) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), defaultModel: this.model }); }
+  constructor(private readonly model: string, private readonly options: { reportUsage?: boolean } = {}) {}
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: true, details: "Using local echo provider. Configure Copilot SDK/auth, HTTP, or CLI provider for real model responses.", capabilities: ["streaming", "markdown", "artifacts:synthetic"], models: developmentModels(this.model), modelsAuthoritative: true, defaultModel: this.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (request.sessionId) yield { type: "session", sessionId: request.sessionId, workspacePath: null, resumed: Boolean(request.resumeSession), infinite: false };
     const lastUser = [...request.messages].reverse().find((message) => message.role === "user");
@@ -199,7 +225,9 @@ class EchoProvider implements CopilotProvider {
     const enabledSkills = request.skills?.map((skill) => skill.name).join(", ") || "none";
     const attachmentSummary = summarizeAttachments(lastUser?.attachments);
     const priorMessages = request.messages.slice(0, -1);
+    const userContext = summarizeInline(request.userContext);
     const projectContext = summarizeInline(request.projectContext);
+    if (this.options.reportUsage) yield { type: "usage", nanoAiu: 120_000_000, model: request.model };
     const shouldShowActivity = /thinking|reasoning|tool|search|workspace|file|artifact/i.test(lastUser?.content ?? "");
     if (shouldShowActivity) {
       yield { type: "tool-call", id: "echo-report-intent", toolName: "report_intent", input: { intent: "Inspecting context" } };
@@ -239,6 +267,7 @@ class EchoProvider implements CopilotProvider {
       await delay(12);
       yield { type: "subagent-delta", id: "echo-subagent", text: "Found shared project context and recent chat references." };
       await delay(12);
+      if (this.options.reportUsage) yield { type: "usage", nanoAiu: 80_000_000, model: request.model, agentId: "echo-subagent" };
       yield { type: "subagent-complete", id: "echo-subagent", name: "research-helper", displayName: "Research helper", durationMs: 42, model: request.model, totalTokens: 128, totalToolCalls: 1 };
       await delay(12);
     }
@@ -286,6 +315,7 @@ class EchoProvider implements CopilotProvider {
       "- Messages in context: " + request.messages.length + ".",
       request.sessionId ? "- Provider session: " + request.sessionId + (request.resumeSession ? " (resume)" : " (new)") + "." : "",
       priorMessages.length > 0 ? "- Previous context: " + summarizeInline(priorMessages.map((message) => `${message.role}: ${message.content}`).join(" | ")) : "",
+      userContext ? "- Personal context: " + userContext : "",
       projectContext ? "- Project context: " + projectContext : "",
       "- Enabled skills: " + enabledSkills + ".",
       attachmentSummary ? "- Attachments: " + attachmentSummary + "." : "",
@@ -305,6 +335,7 @@ class EchoProvider implements CopilotProvider {
     while (steeringNotes.length > 0) yield { type: "delta", text: echoSteeringText(steeringNotes.shift()) };
     unregisterSteer?.();
     if (/artifact/i.test(lastUser?.content ?? "")) yield { type: "artifact", title: "Generated artifact", kind: "markdown", content: `# Artifact\n\n${lastUser?.content ?? ""}` };
+    if (this.options.reportUsage) yield { type: "usage", nanoAiu: 310_000_000, model: request.model };
     yield { type: "done", usage: { provider: this.id } };
   }
 }
@@ -315,17 +346,26 @@ class HttpCopilotProvider implements CopilotProvider {
   async status(): Promise<ProviderStatus> {
     const available = Boolean(this.options.apiBaseUrl && this.options.apiToken);
     let models = fallbackModels(this.options.model);
+    let modelsAuthoritative = false;
     if (available) {
       try {
         const response = await withTimeout(fetch(`${this.options.apiBaseUrl!.replace(/\/$/, "")}/models`, { headers: { Authorization: `Bearer ${this.options.apiToken}` } }), 3000);
         if (response.ok) {
           const body = await response.json() as { data?: Array<{ id?: string; name?: string }> };
           const listed = body.data?.map((model) => ({ id: model.id ?? model.name ?? "", name: model.name ?? model.id ?? "", supportsReasoningEffort: true, supportedReasoningEfforts: ["none", "low", "medium", "high", "xhigh"], defaultReasoningEffort: "medium", supportsLongContext: false })).filter((model) => model.id);
-          if (listed && listed.length > 0) models = listed;
+          if (listed) {
+            models = listed;
+            modelsAuthoritative = true;
+          }
         }
       } catch { /* keep configured model */ }
     }
-    return { id: this.id, label: this.label, available, details: available ? `Using HTTP provider at ${this.options.apiBaseUrl}` : "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN.", capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, defaultModel: models[0]?.id ?? this.options.model };
+    const details = !available
+      ? "Set COPILOT_API_BASE_URL and COPILOT_API_TOKEN."
+      : modelsAuthoritative
+        ? `Using HTTP provider at ${this.options.apiBaseUrl}`
+        : `Connected to HTTP provider at ${this.options.apiBaseUrl}, but model discovery failed.`;
+    return { id: this.id, label: this.label, available, details, capabilities: ["streaming", "markdown", "tools:provider-dependent"], models, modelsAuthoritative, defaultModel: models[0]?.id ?? this.options.model };
   }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.apiBaseUrl || !this.options.apiToken) throw new Error("HTTP provider is missing COPILOT_API_BASE_URL or COPILOT_API_TOKEN.");
@@ -341,7 +381,7 @@ class HttpCopilotProvider implements CopilotProvider {
 class CliCopilotProvider implements CopilotProvider {
   id = "cli"; label = "Local CLI bridge";
   constructor(private readonly options: ProviderFactoryOptions) {}
-  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), defaultModel: this.options.model }); }
+  status(): Promise<ProviderStatus> { return Promise.resolve({ id: this.id, label: this.label, available: Boolean(this.options.cliCommand), details: this.options.cliCommand ? `Using CLI bridge: ${this.options.cliCommand}` : "Set COPILOT_CLI_COMMAND.", capabilities: ["markdown", "local-cli-auth", "streaming:stdout"], models: fallbackModels(this.options.model), modelsAuthoritative: false, defaultModel: this.options.model }); }
   async *streamChat(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
     if (!this.options.cliCommand) throw new Error("CLI provider is missing COPILOT_CLI_COMMAND.");
     const child = spawn(this.options.cliCommand, [], { cwd: request.workingDirectory ?? process.cwd(), shell: true, stdio: ["pipe", "pipe", "pipe"], signal: request.abortSignal });
@@ -353,16 +393,37 @@ class CliCopilotProvider implements CopilotProvider {
   }
 }
 
-function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null): CopilotClientOptions | undefined {
+function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null, sessionId?: string | null): CopilotClientOptions | undefined {
   if (!gitHubToken && !cliPath && !sandboxRoot) return undefined;
   const options: CopilotClientOptions = {};
   if (cliPath) options.connection = RuntimeConnection.forStdio({ path: cliPath });
-  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: ".copilotchat-session", conventions: process.platform === "win32" ? "windows" : "posix" };
+  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: sdkSessionStatePath(sessionId), conventions: process.platform === "win32" ? "windows" : "posix" };
   if (gitHubToken) {
     options.gitHubToken = gitHubToken;
     options.useLoggedInUser = false;
   }
   return options;
+}
+
+const sdkSessionStateRoot = ".copilotchat-session";
+const sdkSessionStateRetention = 8;
+export function sdkSessionStatePath(sessionId?: string | null): string {
+  const scoped = sdkSessionStateSegment(sessionId);
+  return scoped ? `${sdkSessionStateRoot}/${scoped}` : sdkSessionStateRoot;
+}
+function sdkSessionStateSegment(sessionId?: string | null): string { return (sessionId ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/\.{2,}/g, ".").replace(/^\.+/, ""); }
+export async function pruneSdkSessionState(workspaceRoot: string, keepSessionId?: string | null, retention = sdkSessionStateRetention): Promise<string[]> {
+  const root = path.resolve(workspaceRoot, sdkSessionStateRoot);
+  const keep = sdkSessionStateSegment(keepSessionId);
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true });
+    const directories = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+    if (directories.length <= retention) return [];
+    const dated = await Promise.all(directories.map(async (name) => ({ name, modifiedAt: await fs.stat(path.join(root, name)).then((stat) => stat.mtimeMs).catch(() => 0) })));
+    const stale = dated.sort((left, right) => right.modifiedAt - left.modifiedAt).slice(retention).filter((entry) => entry.name !== keep);
+    await Promise.all(stale.map((entry) => fs.rm(path.join(root, entry.name), { recursive: true, force: true }).catch(() => undefined)));
+    return stale.map((entry) => entry.name);
+  } catch { return []; }
 }
 
 async function createOrResumeSdkSession(client: CopilotClient, config: SessionConfig, preferResume: boolean): Promise<{ session: CopilotSession; resumed: boolean }> {
@@ -373,13 +434,14 @@ async function createOrResumeSdkSession(client: CopilotClient, config: SessionCo
   }
   try { return { session: await client.createSession(config), resumed: false }; }
   catch (error) {
-    if (preferResume && sessionId && isExistingSessionError(error)) return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
-    throw error;
+    if (!isExistingSessionError(error) || !sessionId) throw error;
+    return { session: await client.resumeSession(sessionId, resumeConfig), resumed: true };
   }
 }
 
 function isMissingSessionError(error: unknown): boolean { return /not found|does not exist|no session/i.test(error instanceof Error ? error.message : String(error)); }
-function isExistingSessionError(error: unknown): boolean { return /already exists|exists|duplicate/i.test(error instanceof Error ? error.message : String(error)); }
+function isLostSessionError(error: unknown): boolean { return /session (?:was |is |has )?(?:not found|gone|expired|closed|deleted)|session (?:does not|doesn't) exist|no (?:such |matching |active )?session|unknown session|session no longer/i.test(error instanceof Error ? error.message : String(error)); }
+function isExistingSessionError(error: unknown): boolean { return /session (?:id )?(?:already )?exists|already exists|duplicate session|session (?:id )?(?:is )?(?:already )?(?:in use|taken)/i.test(error instanceof Error ? error.message : String(error)); }
 function materializeMessages(request: ProviderChatRequest): ProviderMessage[] { const system = buildSystemContext(request); return system ? [{ role: "system", content: system }, ...request.messages] : request.messages; }
 function buildCliPrompt(request: ProviderChatRequest): string { return materializeMessages(request).map((message) => `${message.role.toUpperCase()}:\n${message.content}${message.attachments?.length ? `\nAttachments: ${summarizeAttachments(message.attachments)}` : ""}`).join("\n\n"); }
 function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string): string {
@@ -392,15 +454,15 @@ function buildSdkPrompt(request: ProviderChatRequest, latestUserMessage: string)
     latestUserMessage,
   ].filter(Boolean).join("\n\n");
 }
-function sdkAttachments(message?: ProviderMessage): MessageOptions["attachments"] | undefined { return message?.attachments?.map((attachment) => ({ type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.displayName })); }
-function summarizeAttachments(attachments?: ProviderAttachment[]): string { return attachments?.map((attachment) => `${attachment.displayName ?? "attachment"} (${attachment.mimeType}, ${formatBytes(attachment.data.length * 0.75)})`).join(", ") ?? ""; }
+function sdkAttachments(message?: ProviderMessage): MessageOptions["attachments"] | undefined { return message?.attachments?.map((attachment) => attachment.type === "file" ? { type: "file" as const, path: attachment.path, displayName: attachment.displayName } : { type: "blob" as const, data: attachment.data, mimeType: attachment.mimeType, displayName: attachment.displayName }); }
+function summarizeAttachments(attachments?: ProviderAttachment[]): string { return attachments?.map((attachment) => `${attachment.displayName ?? "attachment"} (${attachment.type === "file" ? "file" : attachment.mimeType}, ${formatBytes(attachment.size ?? (attachment.type === "blob" ? attachment.data.length * 0.75 : 0))})${attachment.type === "file" ? ` at ${attachment.path}` : ""}`).join(", ") ?? ""; }
 function echoSteeringText(message?: ProviderMessage): string {
   if (!message) return "";
   const attachmentSummary = summarizeAttachments(message.attachments);
   return `\n\nSteering received: ${message.content || "(no text)"}${attachmentSummary ? `\n\nSteering attachments: ${attachmentSummary}.` : ""}`;
 }
 function formatBytes(value: number): string { if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; if (value >= 1024) return `${Math.round(value / 1024)} KB`; return `${Math.max(0, Math.round(value))} B`; }
-function buildSystemContext(request: ProviderChatRequest): string { return [request.projectContext ? `Project context:\n${request.projectContext}` : "", request.workingDirectory ? `Active workspace: ${request.workingDirectory}\nSandbox: local filesystem and tool access must stay inside this workspace. Do not use paths outside it.` : "", request.titleTool ? `Conversation title: ${request.titleTool.currentTitle}\n${request.titleTool.required ? "You must call set_conversation_title after this first user message." : "Use the set_conversation_title tool whenever the conversation title should substantively change."} Titles must be concise, specific, and six words maximum. Do not mention that you are setting the title.` : "", request.artifactContext ?? "", ...(request.skills ?? []).map((skill) => [`Skill: ${skill.name}`, skill.description, skill.instructions, skill.workflow.length > 0 ? `Workflow:\n${skill.workflow.join("\n")}` : ""].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n"); }
+function buildSystemContext(request: ProviderChatRequest): string { return [request.userContext ? `Personal context shared by the user:\n${request.userContext}` : "", request.projectContext ? `Project context:\n${request.projectContext}` : "", request.workingDirectory ? `Active workspace: ${request.workingDirectory}\nSandbox: local filesystem and tool access must stay inside this workspace. Do not use paths outside it.` : "", request.titleTool ? `Conversation title: ${request.titleTool.currentTitle}\n${request.titleTool.required ? "You must call set_conversation_title after this first user message." : "Use the set_conversation_title tool whenever the conversation title should substantively change."} Titles must be concise, specific, and six words maximum. Do not mention that you are setting the title.` : "", request.artifactContext ?? "", ...(request.skills ?? []).map((skill) => [`Skill: ${skill.name}`, skill.description, skill.instructions, skill.workflow.length > 0 ? `Workflow:\n${skill.workflow.join("\n")}` : ""].filter(Boolean).join("\n"))].filter(Boolean).join("\n\n"); }
 async function maybeRunEchoImportPreview(request: ProviderChatRequest, content: string): Promise<string> {
   const draftId = /Import draft ID:\s*([a-zA-Z0-9_.-]+)/i.exec(content)?.[1];
   const previewTool = request.tools?.find((tool) => tool.name === "preview_import_draft");
@@ -428,6 +490,15 @@ function buildTitleTool(request: ProviderChatRequest): Tool | null {
       return { title: await request.titleTool!.setTitle(title) };
     },
   };
+}
+export const webSearchMcpServerName = "copilot";
+export const webSearchMcpServerUrl = "https://api.githubcopilot.com/mcp/x/web_search";
+export const webSearchToolName = "web_search";
+export function buildSdkMcpServers(request: ProviderChatRequest, fallbackGitHubToken?: string | null): Record<string, MCPServerConfig> {
+  const servers = mapMcpServers(request.mcpServers ?? []);
+  const gitHubToken = request.gitHubToken ?? fallbackGitHubToken;
+  if (gitHubToken && !servers[webSearchMcpServerName]) servers[webSearchMcpServerName] = { type: "http", url: webSearchMcpServerUrl, tools: [webSearchToolName], headers: { Authorization: `Bearer ${gitHubToken}` } };
+  return servers;
 }
 function mapMcpServers(servers: McpServer[]): Record<string, MCPServerConfig> { const mapped: Record<string, MCPServerConfig> = {}; for (const server of servers.filter((s) => s.enabled && s.tools.length > 0)) { if (server.transport === "stdio") { if (!server.command) throw new Error(`MCP server ${server.name} is missing a command.`); mapped[server.name] = { type: "stdio", command: server.command, args: server.args, tools: server.tools }; } else { if (!server.url) throw new Error(`MCP server ${server.name} is missing a URL.`); mapped[server.name] = { type: server.transport, url: server.url, tools: server.tools }; } } return mapped; }
 function buildPermissionHandler(request: ProviderChatRequest): PermissionHandler {
@@ -558,7 +629,7 @@ async function nearestExistingParent(start: string): Promise<string> { let curre
 function isPathInside(root: string, target: string): boolean { const relative = path.relative(path.resolve(root), path.resolve(target)); return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)); }
 function sandboxError(message: string): Error { const error = new Error(message) as NodeJS.ErrnoException; error.code = "EACCES"; return error; }
 function isEnoent(error: unknown): boolean { return typeof error === "object" && error !== null && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT"; }
-class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { if (this.error) return Promise.reject(this.error); const value = this.values.shift(); if (value) return Promise.resolve({ value, done: false }); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
+class AsyncEventQueue<T> implements AsyncIterable<T> { private readonly values: T[] = []; private readonly waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: Error) => void }> = []; private closed = false; private error: Error | null = null; push(value: T): void { if (this.closed) return; const waiter = this.waiters.shift(); if (waiter) { waiter.resolve({ value, done: false }); return; } this.values.push(value); } close(): void { this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.resolve({ value: undefined, done: true }); } fail(error: Error): void { this.error = error; this.closed = true; while (this.waiters.length > 0) this.waiters.shift()?.reject(error instanceof Error ? error : new Error(String(error))); } [Symbol.asyncIterator](): AsyncIterator<T> { return { next: () => { const value = this.values.shift(); if (value !== undefined) return Promise.resolve({ value, done: false }); if (this.error) return Promise.reject(this.error); if (this.closed) return Promise.resolve({ value: undefined, done: true }); return new Promise<IteratorResult<T>>((resolve, reject) => this.waiters.push({ resolve, reject })); } }; } }
 function getProviderTextState(map: Map<string, ProviderTextState>, id: string): ProviderTextState {
   let state = map.get(id);
   if (!state) {
@@ -622,6 +693,11 @@ function extractOpenAiDelta(payload: string): string | null { try { const parsed
 function readNestedString(value: unknown, path: string[]): string | null { let cursor = value; for (const segment of path) { if (!isRecord(cursor)) return null; cursor = cursor[segment]; } return typeof cursor === "string" ? cursor : null; }
 function readNestedNumber(value: unknown, path: string[]): number | null { let cursor = value; for (const segment of path) { if (!isRecord(cursor)) return null; cursor = cursor[segment]; } return typeof cursor === "number" ? cursor : null; }
 function readNestedValue(value: unknown, path: string[]): unknown { let cursor = value; for (const segment of path) { if (!isRecord(cursor)) return null; cursor = cursor[segment]; } return cursor; }
+export function readSdkUsageNanoAiu(data: unknown): number | null {
+  const nanoAiu = readNestedNumber(data, ["copilotUsage", "totalNanoAiu"]);
+  if (nanoAiu === null || !Number.isFinite(nanoAiu) || nanoAiu <= 0) return null;
+  return nanoAiu;
+}
 function readFirstString(value: unknown, paths: string[][]): string | null { for (const path of paths) { const result = readNestedString(value, path); if (result) return result; } return null; }
 function parseTaskListItems(markdown: string): ProviderTaskListItem[] {
   return markdown.split(/\r?\n/).map((line): ProviderTaskListItem | null => {
@@ -660,8 +736,9 @@ function eventToolError(value: unknown): string | null {
   if (isRecord(error) && typeof error.message === "string") return error.message;
   return readFirstString(value, [["errorMessage"], ["error_message"]]);
 }
-function eventAgentId(event: SessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
-function subagentEventId(event: SessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
+type SdkSessionEvent = { type: string; data: unknown; agentId?: string; id: string };
+function eventAgentId(event: SdkSessionEvent): string | null { return typeof event.agentId === "string" && event.agentId ? event.agentId : null; }
+function subagentEventId(event: SdkSessionEvent): string { return eventAgentId(event) ?? readNestedString(event.data, ["toolCallId"]) ?? event.id; }
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function formatToolOutput(value: unknown): string { try { return JSON.stringify(value); } catch { return String(value); } }
 function summarizeInline(value?: string | null): string { const normalized = value?.replace(/\s+/g, " ").trim() ?? ""; return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized; }

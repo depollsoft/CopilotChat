@@ -4,10 +4,14 @@ import JSZip from "jszip";
 type UnknownRecord = Record<string, unknown>;
 type AssistantActivity = { id: string; type: "reasoning" | "tool" | "subagent" | "task-list"; title: string; status: "running" | "succeeded" | "failed"; content?: string; input?: unknown; output?: unknown; error?: string | null; details?: Record<string, unknown>; steps?: AssistantActivity[] };
 type ClaudeProjectHint = { sourceId: string; name: string; normalizedName: string; isStarterProject: boolean; topicPhrases: string[]; negativePhrases: string[] };
+type ArchiveReadState = { totalBytes: number; maxBytes: number };
+export type ImportPayloadLimits = { archiveEntryLimit?: number; archiveUncompressedLimit?: number };
 const importedContentLimit = 20_000;
 const importedValueDepthLimit = 5;
 const importedValueArrayLimit = 80;
 const importedValueObjectKeyLimit = 80;
+const archiveEntryLimit = 10_000;
+const archiveUncompressedLimit = 256 * 1024 * 1024;
 
 export function previewImport(requestedSource: ImportSource, fileName: string, content: string): ImportPreview {
   const json = parseJson(content);
@@ -18,18 +22,27 @@ export function previewImport(requestedSource: ImportSource, fileName: string, c
   throw new Error(`Unsupported import source: ${String(source)}`);
 }
 
-export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string, encoding: "text" | "base64" = "text"): Promise<ImportPreview> {
-  if (!fileName.toLowerCase().endsWith(".zip")) return previewImport(requestedSource, fileName, content);
+export async function previewImportPayload(requestedSource: ImportSource, fileName: string, content: string | Uint8Array, encoding: "text" | "base64" = "text", limits: ImportPayloadLimits = {}): Promise<ImportPreview> {
+  if (!fileName.toLowerCase().endsWith(".zip")) {
+    if (encoding !== "text") throw new Error("Non-ZIP imports must use text encoding.");
+    return previewImport(requestedSource, fileName, typeof content === "string" ? content : new TextDecoder().decode(content));
+  }
   if (encoding !== "base64") throw new Error("ZIP imports must be uploaded as base64 payloads.");
-  const zip = await JSZip.loadAsync(base64ToBytes(content));
+  const entryLimit = limits.archiveEntryLimit ?? archiveEntryLimit;
+  const uncompressedLimit = limits.archiveUncompressedLimit ?? archiveUncompressedLimit;
+  const archiveBytes = typeof content === "string" ? base64ToBytes(content) : content;
+  validateZipEntryCount(archiveBytes, entryLimit);
+  const zip = await JSZip.loadAsync(archiveBytes);
+  validateImportArchive(zip, entryLimit, uncompressedLimit);
+  const archiveReadState: ArchiveReadState = { totalBytes: 0, maxBytes: uncompressedLimit };
   if (requestedSource === "auto" || requestedSource === "claude") {
-    const claudeArchive = await parseClaudeArchive(zip);
+    const claudeArchive = await parseClaudeArchive(zip, archiveReadState);
     if (claudeArchive) return claudeArchive;
   }
   const previews: ImportPreview[] = [];
   for (const entry of Object.values(zip.files)) {
     if (entry.dir || !isSupportedArchiveEntry(entry.name)) continue;
-    previews.push(previewImport(requestedSource, entry.name, await entry.async("text")));
+    previews.push(previewImport(requestedSource, entry.name, await readArchiveEntryText(entry, archiveReadState)));
   }
   if (previews.length === 0) throw new Error("Archive did not contain a supported ChatGPT, Claude, or Gemini export file.");
   return { source: requestedSource === "auto" ? previews[0]?.source ?? "chatgpt" : requestedSource, conversations: previews.flatMap((p) => p.conversations), projects: previews.flatMap((p) => p.projects), warnings: previews.flatMap((p) => p.warnings) };
@@ -40,22 +53,22 @@ function detectSource(fileName: string, json: unknown): Exclude<ImportSource, "a
 function parseChatGpt(json: unknown): ImportPreview { const warnings: string[] = []; const conversations = asArray(json).map((record, index): ImportedConversation => { const item = asRecord(record); const messages = orderChatGptMessages(asRecord(item.mapping), stringOrNull(item.current_node)).map((message) => { const author = asRecord(message.author); const content = asRecord(message.content); const metadata = asRecord(message.metadata); const role = stringFromUnknown(author.role, "user"); if (shouldSkipChatGptMessage(role, content, metadata)) return null; return { role: normalizeRole(role), content: normalizeContent(content), createdAt: numberToIso(message.create_time), metadata: { sourceStatus: message.status, sourceRecipient: message.recipient, model: metadata.model_slug } }; }).filter((m): m is NonNullable<typeof m> => m !== null).filter((m) => m.content.trim()); if (messages.length === 0) warnings.push(`ChatGPT conversation ${index + 1} had no readable messages.`); return { source: "chatgpt", sourceId: stringOrNull(item.id), projectSourceId: null, title: stringFromUnknown(item.title, `Imported ChatGPT chat ${index + 1}`), createdAt: numberToIso(item.create_time), updatedAt: numberToIso(item.update_time), messages, artifacts: [], reusableHelpers: extractReusableHelpers(item, "chatgpt"), metadata: { sourceFileShape: "chatgpt-conversations" } }; }); return { source: "chatgpt", conversations, projects: [], warnings }; }
 function parseClaude(json: unknown): ImportPreview { const records = asArray(isRecord(json) && Array.isArray(json.conversations) ? json.conversations : json); const warnings: string[] = []; const conversations = parseClaudeConversations(records, warnings); return { source: "claude", conversations, projects: [], warnings }; }
 function parseGemini(json: unknown): ImportPreview { const root = asRecord(json); const records = asArray(root.conversations ?? root.ordered_conversation ?? json); if (records.some(isGeminiActivityRecord)) return parseGeminiActivity(records); const warnings: string[] = []; const conversations = records.map((record, index): ImportedConversation => { const item = asRecord(record); const messages = asArray(item.messages ?? item.turns ?? item.entries).map((message) => { const value = asRecord(message); return { role: normalizeRole(stringFromUnknown(value.role ?? value.author ?? value.speaker, "user")), content: normalizeContent(value.content ?? value.text ?? value.parts), createdAt: stringOrNull(value.created_at ?? value.createdAt ?? value.timestamp), metadata: { sourceId: value.id } }; }).filter((m) => m.content.trim()); if (messages.length === 0) warnings.push(`Gemini conversation ${index + 1} had no readable messages.`); return { source: "gemini", sourceId: stringOrNull(item.id ?? item.conversation_id), projectSourceId: null, title: stringFromUnknown(item.title ?? item.name, `Imported Gemini chat ${index + 1}`), createdAt: stringOrNull(item.created_at ?? item.createdAt), updatedAt: stringOrNull(item.updated_at ?? item.updatedAt), messages, artifacts: [], reusableHelpers: extractReusableHelpers(item, "gemini"), metadata: { sourceFileShape: "gemini-takeout" } }; }); return { source: "gemini", conversations, projects: [], warnings }; }
-async function parseClaudeArchive(zip: JSZip): Promise<ImportPreview | null> {
+async function parseClaudeArchive(zip: JSZip, archiveReadState: ArchiveReadState): Promise<ImportPreview | null> {
   const conversationsEntry = zip.file(/(^|\/)conversations\.json$/i)[0];
   const projectEntries = zip.file(/^projects\/[^/]+\.json$/i);
   const memoriesEntry = zip.file(/(^|\/)memories\.json$/i)[0];
   if (!conversationsEntry && projectEntries.length === 0 && !memoriesEntry) return null;
   const warnings: string[] = [];
   const projects: ImportedProject[] = [];
-  for (const entry of projectEntries) projects.push(parseClaudeProject(parseJson(await entry.async("text")), entry.name));
+  for (const entry of projectEntries) projects.push(parseClaudeProject(parseJson(await readArchiveEntryText(entry, archiveReadState)), entry.name));
   if (memoriesEntry) {
-    const memoryProject = parseClaudeMemoryProject(parseJson(await memoriesEntry.async("text")));
+    const memoryProject = parseClaudeMemoryProject(parseJson(await readArchiveEntryText(memoriesEntry, archiveReadState)));
     if (memoryProject) {
       applyClaudeMemoryToProjects(projects, memoryProject);
       projects.push(memoryProject);
     }
   }
-  const conversations = conversationsEntry ? parseClaudeConversations(asArray(parseJson(await conversationsEntry.async("text"))), warnings, projects) : [];
+  const conversations = conversationsEntry ? parseClaudeConversations(asArray(parseJson(await readArchiveEntryText(conversationsEntry, archiveReadState))), warnings, projects) : [];
   if (!conversationsEntry) warnings.push("Claude archive did not contain conversations.json; imported project/memory data only.");
   if (projects.length > 0 && conversations.length > 0) {
     const associated = conversations.filter((conversation) => conversation.projectSourceId).length;
@@ -254,6 +267,92 @@ function extractReusableHelpers(item: UnknownRecord, source: "chatgpt" | "claude
 function normalizeRole(role: string): "user" | "assistant" | "system" | "tool" { const lower = role.toLowerCase(); if (lower.includes("assistant") || lower.includes("bot") || lower.includes("claude")) return "assistant"; if (lower.includes("system")) return "system"; if (lower.includes("tool")) return "tool"; return "user"; }
 function normalizeContent(value: unknown): string { if (typeof value === "string") return value; if (Array.isArray(value)) return value.map(normalizeContent).filter(Boolean).join("\n\n"); if (!isRecord(value)) return ""; if (value.type === "image" && typeof value.url === "string") return `![Imported image](${value.url})`; if (typeof value.language === "string" && typeof value.text === "string") return `\`\`\`${value.language}\n${value.text}\n\`\`\``; if (typeof value.text === "string") return value.text; if (typeof value.result === "string") return value.result; if (Array.isArray(value.parts)) return value.parts.map(normalizeContent).filter(Boolean).join("\n\n"); return ""; }
 function isSupportedArchiveEntry(name: string): boolean { const n = name.replaceAll("\\", "/").toLowerCase(); return n.endsWith("conversations.json") || n.endsWith("myactivity.json") || (n.includes("/design_chats/") && n.endsWith(".json")); }
+function validateZipEntryCount(bytes: Uint8Array, entryLimit: number): void {
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const minimumOffset = Math.max(0, buffer.length - 65_557);
+  for (let offset = buffer.length - 22; offset >= minimumOffset; offset -= 1) {
+    if (buffer.readUInt32LE(offset) !== 0x06054b50) continue;
+    const commentLength = buffer.readUInt16LE(offset + 20);
+    if (offset + 22 + commentLength !== buffer.length) continue;
+    const diskNumber = buffer.readUInt16LE(offset + 4);
+    const centralDirectoryDisk = buffer.readUInt16LE(offset + 6);
+    const entriesOnDisk = buffer.readUInt16LE(offset + 8);
+    const entries = buffer.readUInt16LE(offset + 10);
+    const centralDirectorySize = buffer.readUInt32LE(offset + 12);
+    const centralDirectoryOffset = buffer.readUInt32LE(offset + 16);
+    if (diskNumber !== 0 || centralDirectoryDisk !== 0 || entriesOnDisk !== entries || centralDirectoryOffset + centralDirectorySize !== offset) continue;
+    if (entries === 0xffff) throw new Error("Import archive contains too many files (ZIP64).");
+    let cursor = centralDirectoryOffset;
+    let actualEntries = 0;
+    while (cursor < offset) {
+      if (cursor + 4 > offset) throw new Error("Import archive has an invalid central directory.");
+      const signature = buffer.readUInt32LE(cursor);
+      if (signature === 0x02014b50) {
+        if (cursor + 46 > offset) throw new Error("Import archive has a truncated central directory entry.");
+        const recordLength = 46 + buffer.readUInt16LE(cursor + 28) + buffer.readUInt16LE(cursor + 30) + buffer.readUInt16LE(cursor + 32);
+        if (cursor + recordLength > offset) throw new Error("Import archive has an invalid central directory entry.");
+        actualEntries += 1;
+        if (actualEntries > entryLimit) throw new Error(`Import archive contains too many files (${actualEntries}).`);
+        cursor += recordLength;
+        continue;
+      }
+      if (signature === 0x05054b50) {
+        if (cursor + 6 > offset) throw new Error("Import archive has a truncated central directory signature.");
+        cursor += 6 + buffer.readUInt16LE(cursor + 4);
+        continue;
+      }
+      throw new Error("Import archive has an invalid central directory record.");
+    }
+    if (cursor !== offset || actualEntries !== entries) throw new Error("Import archive entry count does not match its central directory.");
+    return;
+  }
+  throw new Error("Import archive is missing a valid end-of-central-directory record.");
+}
+function validateImportArchive(zip: JSZip, entryLimit: number, uncompressedLimit: number): void {
+  const allEntries = Object.values(zip.files);
+  if (allEntries.length > entryLimit) throw new Error(`Import archive contains too many files (${allEntries.length}).`);
+  const entries = allEntries.filter((entry) => !entry.dir && isImportArchiveEntry(entry.name));
+  let total = 0;
+  for (const entry of entries) {
+    const size = (entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize;
+    if (typeof size !== "number") continue;
+    total += size;
+    if (total > uncompressedLimit) throw new Error(`Import archive expands beyond the ${formatArchiveLimit(uncompressedLimit)} safety limit.`);
+  }
+}
+function isImportArchiveEntry(name: string): boolean {
+  const normalized = name.replaceAll("\\", "/").toLowerCase();
+  return isSupportedArchiveEntry(normalized) || normalized.endsWith("/memories.json") || normalized === "memories.json" || /^projects\/[^/]+\.json$/.test(normalized);
+}
+async function readArchiveEntryText(entry: JSZip.JSZipObject, state: ArchiveReadState): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let entryBytes = 0;
+    let settled = false;
+    const stream = entry.nodeStream("nodebuffer");
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      stream.pause();
+      reject(error);
+    };
+    stream.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      entryBytes += chunk.byteLength;
+      state.totalBytes += chunk.byteLength;
+      if (entryBytes > state.maxBytes) { fail(new Error(`Import archive entry ${entry.name} expands beyond the ${formatArchiveLimit(state.maxBytes)} safety limit.`)); return; }
+      if (state.totalBytes > state.maxBytes) { fail(new Error(`Import archive expands beyond the ${formatArchiveLimit(state.maxBytes)} safety limit.`)); return; }
+      chunks.push(chunk);
+    });
+    stream.on("error", (error: Error) => fail(error));
+    stream.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks, entryBytes).toString("utf8"));
+    });
+  });
+}
+function formatArchiveLimit(value: number): string { return value >= 1024 * 1024 ? `${Math.round(value / 1024 / 1024)} MB` : `${value} byte`; }
 function base64ToBytes(value: string): Uint8Array { return Uint8Array.from(Buffer.from(value, "base64")); }
 function asArray(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
 function asRecord(value: unknown): UnknownRecord { return isRecord(value) ? value : {}; }
