@@ -574,6 +574,54 @@ test("stale memory mutations cannot invalidate a new scope load", async ({ page,
   await expect(drawer.getByText("Mutation A memory")).toHaveCount(0);
 });
 
+test("superseded memory reload errors stay hidden", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers overlapping memory mutations.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const project = await (await request.post("/api/projects", { headers, data: { name: "Overlapping mutation scope", description: "", instructions: "", memory: "" } })).json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Overlap memory A", content: "A", enabled: true } });
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Overlap memory B", content: "B", enabled: true } });
+  let memoryPageRequests = 0;
+  let releaseStaleReload!: () => void;
+  let markStaleReload!: () => void;
+  const staleReloadGate = new Promise<void>((resolve) => { releaseStaleReload = resolve; });
+  const staleReloadRequested = new Promise<void>((resolve) => { markStaleReload = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") !== project.id || url.searchParams.get("offset") !== "0") {
+      await route.continue();
+      return;
+    }
+    memoryPageRequests += 1;
+    if (memoryPageRequests === 2) {
+      markStaleReload();
+      await staleReloadGate;
+      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "stale reload failure" }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(project.id);
+  const memoryA = drawer.locator(".memory-card").filter({ hasText: "Overlap memory A" });
+  const memoryB = drawer.locator(".memory-card").filter({ hasText: "Overlap memory B" });
+  await expect(memoryA).toBeVisible();
+  await expect(memoryB).toBeVisible();
+  await memoryA.getByRole("button", { name: "Pause" }).click();
+  await staleReloadRequested;
+  await memoryB.getByRole("button", { name: "Pause" }).click();
+  await expect(memoryA.getByText("Paused", { exact: true })).toBeVisible();
+  await expect(memoryB.getByText("Paused", { exact: true })).toBeVisible();
+  const staleResponsePromise = page.waitForResponse((response) => response.status() === 500 && response.url().includes("/api/memories?"));
+  releaseStaleReload();
+  await staleResponsePromise;
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(drawer.locator(".field-error")).toHaveCount(0);
+  await expect(drawer.getByText("Loading memories…")).toHaveCount(0);
+});
+
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers sidebar cleanup.");
   await page.goto("/");

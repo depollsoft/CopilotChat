@@ -971,6 +971,8 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
       setMemories(page.items);
       setMemoryTotal(page.total);
       setNextMemoryOffset(page.nextOffset);
+    } catch (error) {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) throw error;
     } finally {
       if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
     }
