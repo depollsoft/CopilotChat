@@ -356,6 +356,7 @@ test("personal context and coarse location are included in chats", async ({ page
   await drawer.getByLabel("What should CopilotChat remember?").fill("Lead with the recommendation.");
   await drawer.getByRole("button", { name: "Add memory" }).click();
   let memoryCard = drawer.locator(".memory-card").filter({ hasText: "Response style" });
+  await expect(memoryCard).toBeVisible();
   const serializedState = await page.evaluate(async () => JSON.stringify(await (await fetch("/api/state")).json()));
   expect(serializedState).not.toContain("Lead with the recommendation.");
   await memoryCard.getByRole("button", { name: "Edit" }).click();
@@ -406,6 +407,7 @@ test("personal context and coarse location are included in chats", async ({ page
   await locationDrawer.getByRole("button", { name: "Turn off location" }).click();
   await expect(locationDrawer.locator(".location-summary")).toContainText("No location saved.");
   await expect(offLocation).toHaveAttribute("aria-checked", "true");
+  await expect(locationDrawer.getByRole("button", { name: "Turn off location" })).toBeDisabled();
   await locationDrawer.getByRole("button", { name: "Close" }).click();
   await page.locator(".sidebar-new").click();
   await page.getByPlaceholder(/Ask CopilotChat/).fill("Check disabled location context.");
@@ -428,17 +430,14 @@ test("stale memory pages cannot cross scopes", async ({ page, request }, testInf
   await request.post("/api/memories", { headers, data: { projectId: projectB.id, title: "Only B memory", content: "Belongs to scope B.", enabled: true } });
   let releasePage!: () => void;
   let markRequested!: () => void;
-  let markFinished!: () => void;
   const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
   const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
-  const pageFinished = new Promise<void>((resolve) => { markFinished = resolve; });
   await page.route("**/api/memories?*", async (route) => {
     const url = new URL(route.request().url());
     if (url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20") {
       markRequested();
       await pageGate;
       await route.continue();
-      markFinished();
       return;
     }
     await route.continue();
@@ -449,14 +448,62 @@ test("stale memory pages cannot cross scopes", async ({ page, request }, testInf
   const drawer = page.getByRole("dialog", { name: "Personal context" });
   await drawer.getByLabel("Memory scope").selectOption(projectA.id);
   await expect(drawer.getByText("Recent A memory 20")).toBeVisible();
+  const delayedResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/memories" && url.searchParams.get("projectId") === projectA.id && url.searchParams.get("offset") === "20";
+  });
   await drawer.getByRole("button", { name: /Load more/ }).click();
   await pageRequested;
   await drawer.getByLabel("Memory scope").selectOption(projectB.id);
   await expect(drawer.getByText("Only B memory")).toBeVisible();
   releasePage();
-  await pageFinished;
+  const delayedResponse = await delayedResponsePromise;
+  await delayedResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect(drawer.getByText("Delayed A memory")).toHaveCount(0);
   await expect(drawer.getByText("Only B memory")).toBeVisible();
+});
+
+test("stale memory pages cannot overwrite same-scope reloads", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const projectResponse = await request.post("/api/projects", { headers, data: { name: "Memory reload scope", description: "", instructions: "", memory: "" } });
+  const project = await projectResponse.json() as { id: string };
+  await request.post("/api/memories", { headers, data: { projectId: project.id, title: "Delayed reload memory", content: "Must not return after reload.", enabled: true } });
+  for (let index = 1; index <= 20; index += 1) await request.post("/api/memories", { headers, data: { projectId: project.id, title: `Reload memory ${index}`, content: `Reload ${index}`, enabled: true } });
+  let releasePage!: () => void;
+  let markRequested!: () => void;
+  const pageGate = new Promise<void>((resolve) => { releasePage = resolve; });
+  const pageRequested = new Promise<void>((resolve) => { markRequested = resolve; });
+  await page.route("**/api/memories?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("projectId") === project.id && url.searchParams.get("offset") === "20") {
+      markRequested();
+      await pageGate;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/");
+  await page.locator(".sidebar-footer-user").click();
+  const drawer = page.getByRole("dialog", { name: "Personal context" });
+  await drawer.getByLabel("Memory scope").selectOption(project.id);
+  const visibleMemory = drawer.locator(".memory-card").filter({ hasText: "Reload memory 20" });
+  await expect(visibleMemory).toBeVisible();
+  const delayedResponsePromise = page.waitForResponse((response) => {
+    const url = new URL(response.url());
+    return url.pathname === "/api/memories" && url.searchParams.get("projectId") === project.id && url.searchParams.get("offset") === "20";
+  });
+  await drawer.getByRole("button", { name: /Load more/ }).click();
+  await pageRequested;
+  await visibleMemory.getByRole("button", { name: "Pause" }).click();
+  await expect(visibleMemory.getByText("Paused", { exact: true })).toBeVisible();
+  releasePage();
+  const delayedResponse = await delayedResponsePromise;
+  await delayedResponse.finished();
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(drawer.getByText("Delayed reload memory")).toHaveCount(0);
+  await expect(visibleMemory.getByText("Paused", { exact: true })).toBeVisible();
 });
 
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {

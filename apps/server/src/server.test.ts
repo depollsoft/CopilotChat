@@ -149,6 +149,22 @@ describe("chat provider context", () => {
     expect(db.getUserContext(owner.id).location).toMatchObject({ latitude: 47.6, longitude: -122.3, accuracy: 10_000, precision: "coarse" });
   });
 
+  it("does not invalidate provider sessions for no-op user context updates", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "No-op context", projectId: null, workspaceId: null });
+    db.setChatProviderSession(owner.id, chat.id, { providerSessionId: "active-session", providerSessionWorkspacePath: "/tmp/active" });
+    const contextBefore = db.getUserContext(owner.id);
+    const input = { locationLevel: "off" as const, location: null };
+
+    expect(db.userContextWouldChange(owner.id, input)).toBe(false);
+    const contextAfter = db.updateUserContext(owner.id, input);
+
+    expect(contextAfter.updatedAt).toBe(contextBefore.updatedAt);
+    expect(db.getChat(owner.id, chat.id)).toMatchObject({ providerSessionId: "active-session", providerSessionWorkspacePath: "/tmp/active" });
+    expect(db.userContextWouldChange(owner.id, { profile: "Changed" })).toBe(true);
+  });
+
   it("bounds enabled memory context and reports omitted content", () => {
     const db = createTestDb();
     const owner = db.getOwner();

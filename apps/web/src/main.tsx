@@ -922,8 +922,10 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
   const selectedProject = scope === "user" ? null : p.state.projects.find((project) => project.id === scope) ?? null;
   const memoryScopeKey = selectedProject?.id ?? "user";
   const memoryScopeRef = useRef(memoryScopeKey);
+  const memoryRequestVersionRef = useRef(0);
   memoryScopeRef.current = memoryScopeKey;
   const currentLocation = p.state.userContext.location;
+  const locationSaveIsNoop = locationLevel === "off" && p.state.userContext.locationLevel === "off" && currentLocation === null;
   useEffect(() => { setProfile(p.state.userContext.profile); }, [p.state.userContext.profile]);
   useEffect(() => { setLocationLevel(p.state.userContext.locationLevel); }, [p.state.userContext.locationLevel]);
   useEffect(() => {
@@ -938,6 +940,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
   useEffect(() => {
     const requestedProjectId = selectedProject?.id ?? null;
     const requestedScope = requestedProjectId ?? "user";
+    const requestVersion = ++memoryRequestVersionRef.current;
     let cancelled = false;
     setMemories([]);
     setMemoryTotal(0);
@@ -945,43 +948,50 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
     setMemoriesLoading(true);
     setPanelError(null);
     void api<MemoryPage>(memoryPageUrl(requestedProjectId, 0)).then((page) => {
-      if (cancelled || memoryScopeRef.current !== requestedScope) return;
+      if (cancelled || memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
       setMemories(page.items);
       setMemoryTotal(page.total);
       setNextMemoryOffset(page.nextOffset);
     }).catch((error) => {
-      if (!cancelled && memoryScopeRef.current === requestedScope) setPanelError(toErr(error));
+      if (!cancelled && memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setPanelError(toErr(error));
     }).finally(() => {
-      if (!cancelled && memoryScopeRef.current === requestedScope) setMemoriesLoading(false);
+      if (!cancelled && memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
     });
     return () => { cancelled = true; };
   }, [selectedProject?.id]);
   async function reloadMemories(): Promise<void> {
     const requestedProjectId = selectedProject?.id ?? null;
     const requestedScope = requestedProjectId ?? "user";
-    const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, 0));
-    if (memoryScopeRef.current !== requestedScope) return;
-    setMemories(page.items);
-    setMemoryTotal(page.total);
-    setNextMemoryOffset(page.nextOffset);
+    const requestVersion = ++memoryRequestVersionRef.current;
+    setMemoriesLoading(true);
+    try {
+      const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, 0));
+      if (memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
+      setMemories(page.items);
+      setMemoryTotal(page.total);
+      setNextMemoryOffset(page.nextOffset);
+    } finally {
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
+    }
   }
   async function loadMoreMemories(): Promise<void> {
     if (nextMemoryOffset === null || memoriesLoading) return;
     const requestedProjectId = selectedProject?.id ?? null;
     const requestedScope = requestedProjectId ?? "user";
     const requestedOffset = nextMemoryOffset;
+    const requestVersion = memoryRequestVersionRef.current;
     setMemoriesLoading(true);
     setPanelError(null);
     try {
       const page = await api<MemoryPage>(memoryPageUrl(requestedProjectId, requestedOffset));
-      if (memoryScopeRef.current !== requestedScope) return;
+      if (memoryScopeRef.current !== requestedScope || memoryRequestVersionRef.current !== requestVersion) return;
       setMemories((current) => [...current, ...page.items.filter((item) => !current.some((existing) => existing.id === item.id))]);
       setMemoryTotal(page.total);
       setNextMemoryOffset(page.nextOffset);
     } catch (error) {
-      if (memoryScopeRef.current === requestedScope) setPanelError(toErr(error));
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setPanelError(toErr(error));
     } finally {
-      if (memoryScopeRef.current === requestedScope) setMemoriesLoading(false);
+      if (memoryScopeRef.current === requestedScope && memoryRequestVersionRef.current === requestVersion) setMemoriesLoading(false);
     }
   }
   async function perform(key: string, task: () => Promise<void>, message?: string): Promise<void> {
@@ -1058,7 +1068,7 @@ function ContextPanel(p: { state: AppState; activeProjectId: string | null; refr
           <div><strong>Saved location</strong><span>{currentLocation ? locationSummary(currentLocation) : "No location saved."}</span></div>
           <span className={`tag${p.state.userContext.locationLevel === "off" ? "" : " success"}`}>{locationLevelLabel(p.state.userContext.locationLevel)}</span>
         </div>
-        <div className="settings-actions"><button type="button" className="btn btn-primary" disabled={working === "location"} onClick={() => void saveLocation()}>{working === "location" ? "Requesting location…" : locationLevel === "off" ? "Turn off location" : "Save current location"}</button></div>
+        <div className="settings-actions"><button type="button" className="btn btn-primary" disabled={working === "location" || locationSaveIsNoop} onClick={() => void saveLocation()}>{working === "location" ? "Requesting location…" : locationLevel === "off" ? "Turn off location" : "Save current location"}</button></div>
       </div>
     </section>
     <section className="settings-section">
