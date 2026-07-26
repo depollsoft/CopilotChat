@@ -3,7 +3,7 @@ import { CopilotClient } from "@github/copilot-sdk";
 import type { CopilotSession, ModelInfo, SessionEvent } from "@github/copilot-sdk";
 import http from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createCopilotProvider, mapSdkModelInfo, readSdkUsageNanoAiu, summarizeSdkFailureMessage } from "./index.js";
+import { createCopilotProvider, mapSdkModelInfo, readSdkUsageNanoAiu, sdkSessionStatePath, summarizeSdkFailureMessage } from "./index.js";
 
 afterEach(() => { vi.restoreAllMocks(); });
 
@@ -254,6 +254,16 @@ describe("createCopilotProvider", () => {
     expect(events.filter((event) => event.type === "delta").map((event) => event.text).join("")).toContain("Copilot SDK was unavailable");
     expect(events.filter((event) => event.type === "usage")).toEqual([]);
   }, 20_000);
+  it("gives each SDK session its own workspace session-state directory", () => {
+    const first = sdkSessionStatePath("copilotchat-github-id-1-chat-a-b37dabfc-4444-4ee5-8d38-824cce18c13e");
+    const second = sdkSessionStatePath("copilotchat-github-id-1-chat-a-2b1cf0f4-1111-4222-8333-444455556666");
+
+    expect(first).toBe(".copilotchat-session/copilotchat-github-id-1-chat-a-b37dabfc-4444-4ee5-8d38-824cce18c13e");
+    expect(second).not.toBe(first);
+    expect(sdkSessionStatePath(null)).toBe(".copilotchat-session");
+    expect(sdkSessionStatePath("../../escape")).toBe(".copilotchat-session/-.-escape");
+    expect(sdkSessionStatePath("../../escape").split("/")).toHaveLength(2);
+  });
   it("recovers with a new SDK session when the resumed session no longer exists", async () => {
     vi.spyOn(CopilotClient.prototype, "stop").mockResolvedValue([]);
     const resume = vi.spyOn(CopilotClient.prototype, "resumeSession").mockImplementation((sessionId: string) => Promise.resolve(fakeSdkSession(sessionId, () => Promise.reject(new Error(`Request session.send failed with message: Session not found for sessionId: ${sessionId}`)))));

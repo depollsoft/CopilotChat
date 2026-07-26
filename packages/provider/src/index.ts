@@ -115,7 +115,7 @@ class SdkCopilotProvider implements CopilotProvider {
     yield* this.streamWithSdk({ ...request, resumeSession: false });
   }
   private async *streamWithSdk(request: ProviderChatRequest): AsyncIterable<ProviderEvent> {
-    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory));
+    const client = new CopilotClient(copilotClientOptions(request.gitHubToken ?? this.options.gitHubToken, this.options.sdkCliPath, request.workingDirectory, request.sessionId));
     const queue = new AsyncEventQueue<ProviderEvent>();
     const lastUserMessage = [...request.messages].reverse().find((message) => message.role === "user");
     const sessionOptions: SessionConfig = { clientName: "CopilotChat", sessionId: request.sessionId ?? undefined, model: request.model, reasoningEffort: sdkReasoningEffort(request.reasoningEffort), contextTier: sdkContextTier(request.contextTier), streaming: true, includeSubAgentStreamingEvents: true, infiniteSessions: { enabled: true, backgroundCompactionThreshold: 0.8, bufferExhaustionThreshold: 0.95 }, gitHubToken: request.gitHubToken ?? this.options.gitHubToken, onPermissionRequest: buildPermissionHandler(request), onUserInputRequest: buildUserInputHandler(request), onElicitationRequest: buildElicitationHandler(request), hooks: buildSandboxHooks(request), tools: buildTools(request), systemMessage: { mode: "append", content: buildSystemContext(request) } };
@@ -384,16 +384,22 @@ class CliCopilotProvider implements CopilotProvider {
   }
 }
 
-function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null): CopilotClientOptions | undefined {
+function copilotClientOptions(gitHubToken?: string | null, cliPath?: string, sandboxRoot?: string | null, sessionId?: string | null): CopilotClientOptions | undefined {
   if (!gitHubToken && !cliPath && !sandboxRoot) return undefined;
   const options: CopilotClientOptions = {};
   if (cliPath) options.connection = RuntimeConnection.forStdio({ path: cliPath });
-  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: ".copilotchat-session", conventions: process.platform === "win32" ? "windows" : "posix" };
+  if (sandboxRoot) options.sessionFs = { initialCwd: path.resolve(sandboxRoot), sessionStatePath: sdkSessionStatePath(sessionId), conventions: process.platform === "win32" ? "windows" : "posix" };
   if (gitHubToken) {
     options.gitHubToken = gitHubToken;
     options.useLoggedInUser = false;
   }
   return options;
+}
+
+const sdkSessionStateRoot = ".copilotchat-session";
+export function sdkSessionStatePath(sessionId?: string | null): string {
+  const scoped = (sessionId ?? "").replace(/[^a-zA-Z0-9_.-]/g, "-").replace(/\.{2,}/g, ".").replace(/^\.+/, "");
+  return scoped ? `${sdkSessionStateRoot}/${scoped}` : sdkSessionStateRoot;
 }
 
 async function createOrResumeSdkSession(client: CopilotClient, config: SessionConfig, preferResume: boolean): Promise<{ session: CopilotSession; resumed: boolean }> {
