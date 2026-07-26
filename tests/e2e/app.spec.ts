@@ -418,6 +418,33 @@ test("personal context and coarse location are included in chats", async ({ page
   await expect(response).not.toContainText("47.6, -122.3");
 });
 
+test("no-op user context updates preserve active responses", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers active response context mutations.");
+  const headers = { "X-CopilotChat-CSRF": "1" };
+  const baseline = { profile: "No-op context baseline", locationLevel: "off", location: null };
+  await request.patch("/api/user-context", { headers, data: baseline });
+  await page.goto("/");
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`No-op context response ${"keep streaming ".repeat(1200)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  const chatId = page.url().split("/").pop() ?? "";
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+  const noOpResponse = await request.patch("/api/user-context", { headers, data: baseline });
+  expect(noOpResponse.ok()).toBe(true);
+  await expect.poll(async () => {
+    const state = await (await request.get("/api/state")).json() as { activeChatIds: string[] };
+    return state.activeChatIds.includes(chatId);
+  }).toBe(true);
+
+  const changedResponse = await request.patch("/api/user-context", { headers, data: { ...baseline, profile: "Changed context baseline" } });
+  expect(changedResponse.ok()).toBe(true);
+  await expect.poll(async () => {
+    const state = await (await request.get("/api/state")).json() as { activeChatIds: string[] };
+    return state.activeChatIds.includes(chatId);
+  }).toBe(false);
+});
+
 test("stale memory pages cannot cross scopes", async ({ page, request }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers paginated memory management.");
   const headers = { "X-CopilotChat-CSRF": "1" };
