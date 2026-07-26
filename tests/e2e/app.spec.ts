@@ -1463,3 +1463,34 @@ test("chat viewport follows live updates and can jump back to live", async ({ pa
   await expect.poll(distanceFromBottom).toBeLessThan(120);
   await expect(page.getByRole("button", { name: "Jump to live" })).toHaveCount(0);
 });
+
+test("a backgrounded response never streams into the visible chat", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers concurrent chat streaming.");
+  await page.goto("/");
+  await page.locator(".sidebar-new").click();
+  await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ALPHAMARKER. ${"Keep streaming this response. ".repeat(750)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toContainText("I am running with the local development provider");
+  const alphaChatId = page.url().split("/").pop() ?? "";
+
+  await page.locator(".sidebar-new").click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  await expect(page.locator(`.sidebar-row[data-chat-id="${alphaChatId}"] .chat-indicator.running`)).toBeVisible();
+  await expect(page.locator(".thread .msg")).toHaveCount(0);
+  await page.waitForTimeout(1500);
+  await expect(page.locator(".thread .msg")).toHaveCount(0);
+
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("BETAMARKER stays alone in this chat.");
+  await page.getByRole("button", { name: "Send" }).click();
+  const betaResponse = page.locator(".msg.assistant .msg-body").last();
+  await expect(betaResponse).toContainText("BETAMARKER stays alone in this chat.");
+  await expect(betaResponse).not.toContainText("Keep streaming this response.");
+  await expect(page.locator(".msg.user")).toHaveCount(1);
+
+  await page.locator(`.sidebar-row[data-chat-id="${alphaChatId}"]`).click();
+  await expect(page.locator(".msg.user").filter({ hasText: "ALPHAMARKER" })).toBeVisible();
+  const alphaResponse = page.locator(".msg.assistant .msg-body").last();
+  await expect(alphaResponse).toContainText("Keep streaming this response.", { timeout: 30000 });
+  await expect(alphaResponse).not.toContainText("BETAMARKER");
+  await expect(page.locator(".msg.user")).toHaveCount(1);
+});
