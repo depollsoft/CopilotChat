@@ -49,14 +49,18 @@ export class AppDatabase {
   getState(provider: ProviderStatus, activeChatIds: string[] = [], ownerId = this.getOwner().id, authMode: AppState["authMode"] = "local"): AppState { const owner = this.getOwnerById(ownerId); return { owner, authMode, userContext: this.getUserContext(owner.id), memoryStats: this.getMemoryStats(owner.id), projects: this.listProjects(owner.id), projectReferences: this.listProjectReferences(owner.id), projectChatReferences: this.listProjectChatReferences(owner.id), chats: this.listChats(owner.id), archivedChats: this.listArchivedChats(owner.id), artifacts: this.listArtifactSummaries(owner.id), skills: this.listSkills(owner.id), mcpServers: this.listMcpServers(owner.id), workspaces: this.listWorkspaces(owner.id), provider, activeChatIds }; }
 
   getUserContext(ownerId: string): UserContext { this.getOwnerById(ownerId); this.ensureUserContext(ownerId, iso()); return mapUserContext(this.db.prepare("SELECT * FROM user_contexts WHERE owner_id = ?").get(ownerId) as Row); }
+  userContextWouldChange(ownerId: string, input: UpdateUserContextRequest): boolean {
+    const current = this.getUserContext(ownerId);
+    const next = resolveUserContextUpdate(current, input);
+    return next.profile !== current.profile || next.locationLevel !== current.locationLevel || JSON.stringify(next.location) !== JSON.stringify(current.location);
+  }
   updateUserContext(ownerId: string, input: UpdateUserContextRequest): UserContext {
     const current = this.getUserContext(ownerId);
-    const locationLevel = input.locationLevel ?? current.locationLevel;
-    const location = normalizedLocation(input.location === undefined ? (locationLevel === current.locationLevel ? current.location : null) : input.location, locationLevel);
-    const profile = input.profile === undefined ? current.profile : input.profile.trim();
+    const next = resolveUserContextUpdate(current, input);
+    if (next.profile === current.profile && next.locationLevel === current.locationLevel && JSON.stringify(next.location) === JSON.stringify(current.location)) return current;
     const now = iso();
-    this.db.prepare("UPDATE user_contexts SET profile = ?, location_level = ?, latitude = ?, longitude = ?, accuracy = ?, location_captured_at = ?, updated_at = ? WHERE owner_id = ?").run(profile, locationLevel, location?.latitude ?? null, location?.longitude ?? null, location?.accuracy ?? null, location?.capturedAt ?? null, now, ownerId);
-    if (profile !== current.profile || locationLevel !== current.locationLevel || JSON.stringify(location) !== JSON.stringify(current.location)) this.clearOwnerProviderSessions(ownerId);
+    this.db.prepare("UPDATE user_contexts SET profile = ?, location_level = ?, latitude = ?, longitude = ?, accuracy = ?, location_captured_at = ?, updated_at = ? WHERE owner_id = ?").run(next.profile, next.locationLevel, next.location?.latitude ?? null, next.location?.longitude ?? null, next.location?.accuracy ?? null, next.location?.capturedAt ?? null, now, ownerId);
+    this.clearOwnerProviderSessions(ownerId);
     return this.getUserContext(ownerId);
   }
 
@@ -352,6 +356,11 @@ function parseObject(v: unknown): Record<string, unknown> { if (typeof v !== "st
 function parseArray(v: unknown): unknown[] { if (typeof v !== "string") return []; const parsed = JSON.parse(v) as unknown; return Array.isArray(parsed) ? parsed : []; }
 function nullableString(v: unknown): string | null { return typeof v === "string" && v.length > 0 ? v : null; }
 function normalizeLocationLevel(value: unknown): UserContext["locationLevel"] { return value === "coarse" || value === "fine" ? value : "off"; }
+function resolveUserContextUpdate(current: UserContext, input: UpdateUserContextRequest): Pick<UserContext, "profile" | "locationLevel" | "location"> {
+  const locationLevel = input.locationLevel ?? current.locationLevel;
+  const location = normalizedLocation(input.location === undefined ? (locationLevel === current.locationLevel ? current.location : null) : input.location, locationLevel);
+  return { profile: input.profile === undefined ? current.profile : input.profile.trim(), locationLevel, location };
+}
 function normalizedLocation(location: UserLocation | null, level: UserContext["locationLevel"]): UserLocation | null {
   if (!location || level === "off") return null;
   const digits = level === "coarse" ? 1 : 5;
