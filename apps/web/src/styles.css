@@ -451,8 +451,9 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .attachment-file-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: var(--surface); color: var(--text-muted); }
 .attachment-copy { display: grid; gap: 1px; min-width: 0; }
 .attachment-copy strong, .attachment-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.attachment-copy small, .attachment-error { color: var(--text-muted); font-size: calc(12px * var(--text-scale)); }
+.attachment-copy small, .attachment-error, .attachment-progress { color: var(--text-muted); font-size: calc(12px * var(--text-scale)); }
 .attachment-error { margin: 0 8px; color: var(--danger); }
+.attachment-progress { margin: 0 8px; }
 .attachment-chip button { display: grid; place-items: center; width: 24px; height: 24px; border-radius: var(--radius-pill); color: var(--text-muted); }
 .attachment-chip button:hover { background: var(--surface); color: var(--text); }
 .msg-body > .attachment-tray { margin-bottom: 8px; }

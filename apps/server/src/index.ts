@@ -11,7 +11,7 @@ import type { ProviderChatRequest } from "@copilotchat/provider";
 import { activeResponseInputRequestSchema, apiPrefix, createArtifactRequestSchema, createChatRequestSchema, createMemoryRequestSchema, createProjectChatReferenceRequestSchema, createProjectReferenceRequestSchema, createProjectRequestSchema, editMessageRequestSchema, importPreviewRequestSchema, permissionModeSchema, registerWorkspaceRequestSchema, runWorkspaceCommandRequestSchema, sendMessageRequestSchema, skillManifestSchema, titleFromContent, updateArtifactRequestSchema, updateChatRequestSchema, updateMcpServerRequestSchema, updateMemoryRequestSchema, updateProjectReferenceRequestSchema, updateProjectRequestSchema, updateSkillRequestSchema, updateUserContextRequestSchema, updateWorkspaceRequestSchema } from "@copilotchat/shared";
 import type { Chat, ChatMessage, ImportPreview, Owner, ProviderStatus, SendMessageRequest } from "@copilotchat/shared";
 import Fastify from "fastify";
-import type { FastifyRequest } from "fastify";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
 import { chatAttachmentDirectory, forgetValidatedAttachmentFiles, forgetValidatedAttachmentTree, isChatAttachmentDirectory, materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
@@ -26,7 +26,7 @@ import { ActiveChatResponses } from "./responses.js";
 import type { InternalSendMessageRequest } from "./responses.js";
 import { ownerWorkspaceDirectory, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
-import { UploadLimitError, UploadedFileStore, UploadValidationError } from "./uploaded-files.js";
+import { UploadLimitError, UploadOffsetError, UploadedFileStore, UploadValidationError } from "./uploaded-files.js";
 
 class OwnerClearingError extends Error {}
 class OwnerMutationBarrier {
@@ -394,21 +394,42 @@ app.post(`${apiPrefix}/workspaces/:workspaceId/commands`, async (request) => { c
 app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (request, reply) => {
   const owner = ownerFor(request);
   const parsed = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).safeParse(request.query);
-  if (!parsed.success) {
-    const tooLarge = parsed.error.issues.some((issue) => issue.path[0] === "size" && issue.code === "too_big");
-    reply.code(tooLarge ? 413 : 400).send({ error: parsed.error.issues[0]?.message ?? "Invalid upload metadata." });
-    return;
-  }
-  if (!(request.body instanceof Readable)) { reply.code(400).send({ error: "Upload body must be a binary stream." }); return; }
+  // Every rejection here happens before the body is read, so the socket keeps unread bytes unless the connection closes.
+  if (!parsed.success) { reply.header("connection", "close"); replyUploadMetadataError(reply, parsed.error); return; }
+  if (!(request.body instanceof Readable)) { reply.header("connection", "close").code(400).send({ error: "Upload body must be a binary stream." }); return; }
   try {
     return await uploadedFiles.create(owner.id, parsed.data, request.body);
-  } catch (error) {
-    if (error instanceof UploadLimitError) { reply.code(413).send({ error: error.message }); return; }
-    if (error instanceof UploadValidationError) { reply.code(400).send({ error: error.message }); return; }
-    throw error;
-  }
+  } catch (error) { replyStreamedUploadError(reply, error); return; }
 });
 app.delete(`${apiPrefix}/uploads/:uploadId`, async (request) => { const owner = ownerFor(request); const params = z.object({ uploadId: z.string().min(1) }).parse(request.params); await uploadedFiles.delete(owner.id, params.uploadId); return { ok: true }; });
+app.post(`${apiPrefix}/uploads/sessions`, async (request, reply) => {
+  const owner = ownerFor(request);
+  const parsed = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).safeParse(request.body);
+  if (!parsed.success) { replyUploadMetadataError(reply, parsed.error); return; }
+  try {
+    const session = await uploadedFiles.beginChunked(owner.id, parsed.data);
+    return { ...session, chunkBytes: config.uploadChunkBytes };
+  } catch (error) { replyUploadError(reply, error); return; }
+});
+app.post(`${apiPrefix}/uploads/sessions/:uploadId/chunks`, { bodyLimit: config.uploadChunkBytes * 2 }, async (request, reply) => {
+  const owner = ownerFor(request);
+  const params = z.object({ uploadId: z.string().min(1) }).parse(request.params);
+  const query = z.object({ offset: z.coerce.number().int().nonnegative() }).safeParse(request.query);
+  if (!query.success) { reply.header("connection", "close").code(400).send({ error: "Upload chunks require a numeric offset." }); return; }
+  if (!(request.body instanceof Readable)) { reply.header("connection", "close").code(400).send({ error: "Upload chunk body must be a binary stream." }); return; }
+  try {
+    const chunk = await readChunkBody(request.body, config.uploadChunkBytes);
+    return await uploadedFiles.appendChunk(owner.id, params.uploadId, query.data.offset, chunk);
+  } catch (error) { replyStreamedUploadError(reply, error); return; }
+});
+app.post(`${apiPrefix}/uploads/sessions/:uploadId/complete`, async (request, reply) => {
+  const owner = ownerFor(request);
+  const params = z.object({ uploadId: z.string().min(1) }).parse(request.params);
+  try {
+    return await uploadedFiles.finishChunked(owner.id, params.uploadId);
+  } catch (error) { replyUploadError(reply, error); return; }
+});
+app.delete(`${apiPrefix}/uploads/sessions/:uploadId`, async (request) => { const owner = ownerFor(request); const params = z.object({ uploadId: z.string().min(1) }).parse(request.params); await uploadedFiles.abortChunked(owner.id, params.uploadId); return { ok: true }; });
 app.post(`${apiPrefix}/imports/drafts`, async (request, reply) => {
   const owner = ownerFor(request);
   let claimId: string | null = null;
@@ -431,6 +452,33 @@ const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 if (fs.existsSync(webDist)) { await app.register(fastifyStatic, { root: webDist, prefix: "/", wildcard: false }); app.setNotFoundHandler((request, reply) => { if (request.raw.url?.startsWith(apiPrefix)) { reply.code(404).send({ error: "Not found" }); return; } reply.sendFile("index.html"); }); }
 await app.listen({ host: config.host, port: config.port });
 function isMutatingMethod(method: string): boolean { return method === "POST" || method === "PATCH" || method === "DELETE"; }
+/** Reads one chunk fully so a failed request can be retried at the same offset without corrupting stored bytes. */
+async function readChunkBody(source: Readable, maxBytes: number): Promise<Buffer> {
+  const parts: Buffer[] = [];
+  let total = 0;
+  for await (const part of source) {
+    const buffer = Buffer.isBuffer(part) ? part : Buffer.from(part as string);
+    total += buffer.length;
+    if (total > maxBytes) throw new UploadLimitError(`Upload chunks are limited to ${maxBytes} bytes.`);
+    parts.push(buffer);
+  }
+  return Buffer.concat(parts, total);
+}
+function replyUploadMetadataError(reply: FastifyReply, error: z.ZodError): void {
+  const tooLarge = error.issues.some((issue) => issue.path[0] === "size" && issue.code === "too_big");
+  reply.code(tooLarge ? 413 : 400).send({ error: error.issues[0]?.message ?? "Invalid upload metadata." });
+}
+function replyUploadError(reply: FastifyReply, error: unknown): void {
+  if (error instanceof UploadLimitError) { reply.code(413).send({ error: error.message }); return; }
+  if (error instanceof UploadOffsetError) { reply.code(409).send({ error: error.message, received: error.received }); return; }
+  if (error instanceof UploadValidationError) { reply.code(400).send({ error: error.message }); return; }
+  throw error;
+}
+/** Rejecting a request whose body is still streaming leaves unread bytes on the socket, so the connection cannot be reused. */
+function replyStreamedUploadError(reply: FastifyReply, error: unknown): void {
+  reply.header("connection", "close");
+  replyUploadError(reply, error);
+}
 function isDataClearPath(rawUrl: string): boolean { return (rawUrl.split("?")[0] ?? rawUrl) === `${apiPrefix}/data`; }
 function releaseRequestMutation(request: FastifyRequest): void { const release = requestMutationReleases.get(request); if (!release) return; requestMutationReleases.delete(request); release(); }
 function isAuthExemptPath(rawUrl: string): boolean {

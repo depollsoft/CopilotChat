@@ -20,6 +20,8 @@ const configSchema = z.object({
   workspaceRoot: z.string(),
   bodyLimitBytes: z.coerce.number().int().min(1).default(50 * 1024 * 1024),
   uploadLimitBytes: z.coerce.number().int().min(1).default(1024 * 1024 * 1024),
+  // The minimum matches MIN_UPLOAD_CHUNK_BYTES in the web client, which never sends chunks below its own floor.
+  uploadChunkBytes: z.coerce.number().int().min(64 * 1024).max(64 * 1024 * 1024).default(512 * 1024),
   stagedUploadLimitBytes: z.coerce.number().int().min(1).default(1024 * 1024 * 1024),
   stagedUploadLimitFiles: z.coerce.number().int().min(1).default(100),
   importLimitBytes: z.coerce.number().int().min(1).default(128 * 1024 * 1024),
@@ -59,6 +61,7 @@ export function loadConfig(): AppConfig {
     workspaceRoot: path.resolve(process.env.COPILOTCHAT_WORKSPACE_ROOT || path.join(dataDir, "registered-workspaces")),
     bodyLimitBytes: process.env.COPILOTCHAT_BODY_LIMIT_BYTES,
     uploadLimitBytes: process.env.COPILOTCHAT_UPLOAD_LIMIT_BYTES,
+    uploadChunkBytes: process.env.COPILOTCHAT_UPLOAD_CHUNK_BYTES,
     stagedUploadLimitBytes: process.env.COPILOTCHAT_STAGED_UPLOAD_LIMIT_BYTES,
     stagedUploadLimitFiles: process.env.COPILOTCHAT_STAGED_UPLOAD_LIMIT_FILES,
     importLimitBytes: process.env.COPILOTCHAT_IMPORT_LIMIT_BYTES,
