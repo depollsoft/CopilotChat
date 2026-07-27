@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
+import { ChatFileAccessError, ChatFileNotFoundError, chatFileSystemContext, contentDispositionHeader, fileEtag, isInlineContentType, resolveChatFile } from "./chat-files.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
@@ -2079,5 +2080,84 @@ describe("conversation query tools", () => {
 
     const transcript = tools.find((tool) => tool.name === "get_conversation")!.handler({ chatId: sourceChat.id }) as { messages: Array<{ content: string }> };
     expect(transcript.messages[0]?.content).toContain("migration plan");
+  });
+});
+
+describe("chat file previews", () => {
+  it("resolves workspace files the agent references and rejects paths that escape the workspace", async () => {
+    const workspaceRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-files-"));
+    const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-outside-"));
+    try {
+      const workspaceDir = fs.realpathSync(workspaceRoot);
+      fs.mkdirSync(path.join(workspaceDir, "artifacts"), { recursive: true });
+      fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("png-bytes"));
+      fs.writeFileSync(path.join(outsideRoot, "secret.txt"), "secret");
+      fs.symlinkSync(path.join(outsideRoot, "secret.txt"), path.join(workspaceDir, "escape.txt"));
+
+      const relative = await resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" });
+      expect(relative.relativePath).toBe("artifacts/chart.png");
+      expect(relative.mimeType).toBe("image/png");
+      expect(relative.size).toBe(9);
+      expect((await resolveChatFile({ workspaceDir, requestedPath: "./artifacts/chart.png" })).absolutePath).toBe(relative.absolutePath);
+      expect((await resolveChatFile({ workspaceDir, requestedPath: relative.absolutePath })).absolutePath).toBe(relative.absolutePath);
+      expect((await resolveChatFile({ workspaceDir, requestedPath: `file://${relative.absolutePath}` })).absolutePath).toBe(relative.absolutePath);
+
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "../outside.txt" })).rejects.toBeInstanceOf(ChatFileAccessError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: path.join(outsideRoot, "secret.txt") })).rejects.toBeInstanceOf(ChatFileAccessError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "escape.txt" })).rejects.toBeInstanceOf(ChatFileAccessError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "https://example.com/a.png" })).rejects.toBeInstanceOf(ChatFileAccessError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "   " })).rejects.toBeInstanceOf(ChatFileAccessError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "artifacts" })).rejects.toBeInstanceOf(ChatFileNotFoundError);
+      await expect(resolveChatFile({ workspaceDir, requestedPath: "artifacts/missing.png" })).rejects.toBeInstanceOf(ChatFileNotFoundError);
+
+      // Rewriting a file in place must change its validator so a cached preview is replaced.
+      fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("different-png-bytes"));
+      expect((await resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" })).etag).not.toBe(relative.etag);
+      expect(fileEtag(9, 1_700_000_000_000)).toBe(fileEtag(9, 1_700_000_000_000.4));
+      expect(fileEtag(9, 1_700_000_000_000)).not.toBe(fileEtag(10, 1_700_000_000_000));
+    } finally {
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+      fs.rmSync(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("only offers inline display to content the browser cannot execute", () => {
+    expect(isInlineContentType("image/png")).toBe(true);
+    expect(isInlineContentType("text/plain; charset=utf-8")).toBe(true);
+    expect(isInlineContentType("image/svg+xml")).toBe(false);
+    expect(isInlineContentType("text/html")).toBe(false);
+    expect(isInlineContentType("application/octet-stream")).toBe(false);
+    expect(contentDispositionHeader("photo of a cat.png", "inline")).toBe(`inline; filename="photo of a cat.png"; filename*=UTF-8''photo%20of%20a%20cat.png`);
+    expect(contentDispositionHeader('quote".png', "attachment")).toContain('filename="quote_.png"');
+  });
+
+  it("tells the agent how to show uploads back to the user", () => {
+    const workspaceDir = "/tmp/workspace";
+    const context = chatFileSystemContext({
+      workspaceDir,
+      attachments: [
+        { id: "a1", name: "photo.jpg", mimeType: "image/jpeg", size: 4, filePath: `${workspaceDir}/.copilotchat/uploads/chat-1/abc-photo.jpg` },
+        { id: "a2", name: "outside.jpg", mimeType: "image/jpeg", size: 4, filePath: "/elsewhere/outside.jpg" },
+        { id: "a3", name: "pending.jpg", mimeType: "image/jpeg", size: 4 },
+      ],
+    });
+    expect(context).toContain("![description](path/to/image.png)");
+    expect(context).toContain(".copilotchat/uploads/chat-1/abc-photo.jpg (photo.jpg)");
+    expect(context).not.toContain("outside.jpg");
+    expect(context).not.toContain("pending.jpg");
+    expect(chatFileSystemContext({ workspaceDir, attachments: [] })).toContain("Showing files to the user:");
+  });
+
+  it("scopes stored attachment lookups to the owner, chat, and message", () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Attachment chat", projectId: null, workspaceId: null });
+    const otherChat = db.createChat(owner.id, { title: "Other chat", projectId: null, workspaceId: null });
+    const message = db.addMessage({ chatId: chat.id, role: "user", content: "Look at this." });
+    db.replaceMessageAttachments(owner.id, chat.id, message.id, [{ id: "att-1", name: "photo.png", mimeType: "image/png", size: 5, data: Buffer.from("image").toString("base64") }]);
+
+    expect(db.getMessageAttachment(owner.id, chat.id, message.id, "att-1")).toMatchObject({ name: "photo.png", mimeType: "image/png" });
+    expect(db.getMessageAttachment(owner.id, chat.id, message.id, "missing")).toBeNull();
+    expect(db.getMessageAttachment(owner.id, otherChat.id, message.id, "att-1")).toBeNull();
   });
 });

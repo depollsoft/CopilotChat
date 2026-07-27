@@ -154,12 +154,13 @@ describe("createCopilotProvider", () => {
       if (!address || typeof address === "string") throw new Error("Expected TCP server address.");
       const provider = createCopilotProvider({ provider: "http", apiBaseUrl: `http://127.0.0.1:${address.port}`, apiToken: "token", model: "gpt-test" });
 
-      await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test", userContext: "The user prefers concise recommendations." }));
+      await collect(provider.streamChat({ messages: [{ role: "user", content: "hello" }], model: "gpt-test", userContext: "The user prefers concise recommendations.", attachmentContext: "Showing files to the user:\nUse ![description](path/to/image.png)." }));
 
       const capturedBody = await capturedBodyPromise;
       const systemMessage = capturedBody.messages?.find((message) => message.role === "system");
       expect(systemMessage?.content).toContain("Personal context shared by the user:");
       expect(systemMessage?.content).toContain("The user prefers concise recommendations.");
+      expect(systemMessage?.content).toContain("Showing files to the user:");
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }

@@ -420,6 +420,24 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .cursor-wrap.with-intent .cursor-sparkles svg { animation: intent-sparkle 1.9s ease-in-out infinite; }
 .cursor-wrap.with-intent .cursor-sparkles span:first-of-type { animation: intent-dot 1.7s ease-in-out infinite; }
 .cursor-wrap.with-intent .cursor-sparkles span:last-of-type { animation: intent-dot 1.7s ease-in-out .55s infinite; }
+.markdown-image { display: block; max-width: min(440px, 100%); margin: 10px 0; padding: 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-muted); overflow: hidden; cursor: zoom-in; }
+.markdown-image img { display: block; width: 100%; height: auto; max-height: 440px; object-fit: contain; }
+.markdown-image:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.markdown-image-loading { display: block; width: min(280px, 100%); height: 150px; margin: 10px 0; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-muted); animation: pulse 1.4s ease-in-out infinite; }
+.markdown-image-missing { color: var(--text-muted); font-style: italic; }
+.chat-file-chip { display: inline-flex; align-items: center; gap: 8px; max-width: min(100%, 320px); margin: 2px 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 13px; background: color-mix(in srgb, var(--surface-muted) 56%, transparent); text-align: left; vertical-align: middle; }
+.chat-file-chip:hover:not(:disabled) { background: var(--surface); }
+.chat-file-chip.unavailable { border-style: dashed; }
+.chat-file-icon { display: grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; border-radius: 9px; background: var(--surface); color: var(--text-muted); }
+.chat-file-copy { display: grid; gap: 1px; min-width: 0; }
+.chat-file-copy strong, .chat-file-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-file-copy small { color: var(--text-muted); font-size: calc(12px * var(--text-scale)); }
+.image-viewer { position: fixed; inset: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); z-index: 51; display: grid; grid-template-rows: auto minmax(0, 1fr); border-radius: 20px; background: var(--surface); box-shadow: var(--shadow); overflow: hidden; }
+.image-viewer-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.image-viewer-head strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-viewer-actions { display: inline-flex; align-items: center; gap: 4px; }
+.image-viewer img { min-height: 0; max-width: 100%; max-height: 100%; margin: auto; padding: 12px; object-fit: contain; }
+
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes pulse { 50% { opacity: .45; } }
 @keyframes pulse-dot { 50% { opacity: .35; transform: scale(.78); } }
@@ -446,16 +464,19 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .composer textarea { flex: 1 1 auto; width: 100%; min-width: 0; min-height: 44px; max-height: 180px; border: 0; resize: none; background: transparent; padding: 9px 10px; font-size: calc(16px * var(--text-scale)); line-height: 24px; overflow-y: auto; }
 .composer textarea:focus-visible { outline: 0; }
 .attachment-tray { display: flex; flex-wrap: wrap; gap: 7px; min-width: 0; }
-.attachment-chip { display: inline-grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; max-width: min(100%, 300px); padding: 6px 8px; border: 1px solid var(--border); border-radius: 13px; background: color-mix(in srgb, var(--surface-muted) 56%, transparent); }
+.attachment-chip { display: inline-flex; align-items: center; gap: 8px; max-width: min(100%, 300px); padding: 6px 8px; border: 1px solid var(--border); border-radius: 13px; background: color-mix(in srgb, var(--surface-muted) 56%, transparent); }
 .attachment-chip img { width: 44px; height: 44px; border-radius: 9px; object-fit: cover; background: var(--surface); }
-.attachment-file-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 10px; background: var(--surface); color: var(--text-muted); }
-.attachment-copy { display: grid; gap: 1px; min-width: 0; }
+.attachment-thumb { display: block; flex: 0 0 auto; padding: 0; border-radius: 9px; cursor: zoom-in; }
+.attachment-thumb:hover img, .attachment-thumb:focus-visible img { outline: 2px solid var(--accent); outline-offset: 1px; }
+.attachment-file-icon { display: grid; place-items: center; flex: 0 0 auto; width: 34px; height: 34px; border-radius: 10px; background: var(--surface); color: var(--text-muted); }
+.attachment-file-icon.loading { animation: pulse 1.4s ease-in-out infinite; }
+.attachment-copy { display: grid; flex: 1 1 auto; gap: 1px; min-width: 0; }
 .attachment-copy strong, .attachment-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-copy small, .attachment-error, .attachment-progress { color: var(--text-muted); font-size: calc(12px * var(--text-scale)); }
 .attachment-error { margin: 0 8px; color: var(--danger); }
 .attachment-progress { margin: 0 8px; }
-.attachment-chip button { display: grid; place-items: center; width: 24px; height: 24px; border-radius: var(--radius-pill); color: var(--text-muted); }
-.attachment-chip button:hover { background: var(--surface); color: var(--text); }
+.attachment-chip > button:not(.attachment-thumb) { display: grid; place-items: center; flex: 0 0 auto; width: 24px; height: 24px; border-radius: var(--radius-pill); color: var(--text-muted); }
+.attachment-chip > button:not(.attachment-thumb):hover { background: var(--surface); color: var(--text); }
 .msg-body > .attachment-tray { margin-bottom: 8px; }
 .msg-body > .attachment-tray .attachment-chip { background: color-mix(in srgb, var(--surface) 72%, transparent); }
 .slash-command-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 45; display: grid; gap: 4px; max-height: min(340px, calc(100dvh - 180px)); overflow: auto; padding: 8px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow); }

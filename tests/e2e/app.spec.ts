@@ -748,6 +748,46 @@ test("composer sends attached files and pasted images", async ({ page }, testInf
   await expect(response).toContainText("pasted.png");
 });
 
+test("uploaded and agent-referenced images preview inline", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers inline media previews.");
+  // A 1x1 PNG, so the browser reports a real natural size once the preview loads.
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "sunset.png", mimeType: "image/png", buffer: png });
+  const composerThumb = page.locator(".attachment-tray .attachment-thumb img");
+  await expect(composerThumb).toBeVisible();
+
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Keep this photo.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  const chatId = page.url().split("/").pop() ?? "";
+  await expect(page.locator(".msg.user .attachment-thumb img")).toBeVisible();
+
+  // Reloading drops the in-memory preview, so the thumbnail must come back from the server.
+  await page.reload();
+  const storedThumb = page.locator(".msg.user .attachment-thumb img");
+  await expect(storedThumb).toBeVisible();
+  await expect.poll(async () => storedThumb.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+  await expect.poll(async () => storedThumb.evaluate((image: HTMLImageElement) => image.currentSrc.startsWith("blob:"))).toBe(true);
+
+  const artifact = await request.post("/api/artifacts", { headers: { "X-CopilotChat-CSRF": "1" }, data: { chatId, title: "Preview chart", kind: "code", language: "svg", content: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><rect width="24" height="24" fill="#22c55e"/></svg>' } });
+  expect(artifact.ok()).toBe(true);
+
+  // The echo provider repeats the prompt, so this exercises rendering of a file the assistant references.
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Show ![chart](artifacts/preview-chart.svg) and [notes](artifacts/preview-chart.svg)");
+  await page.getByRole("button", { name: "Send" }).click();
+  const assistantImage = page.locator(".msg.assistant .markdown-image img").last();
+  await expect(assistantImage).toBeVisible({ timeout: 20000 });
+  await expect.poll(async () => assistantImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+  await expect(page.locator(".msg.assistant .chat-file-chip").last()).toBeVisible();
+
+  await assistantImage.click();
+  await expect(page.getByRole("dialog", { name: /chart/ })).toBeVisible();
+  await page.getByRole("button", { name: "Close image" }).click();
+  await expect(page.getByRole("dialog", { name: /chart/ })).toBeHidden();
+});
+
 test("upload endpoint reports invalid metadata and limits as client errors", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers upload API errors.");
   const headers = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };

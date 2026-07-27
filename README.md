@@ -37,6 +37,8 @@ Use `docker compose up -d --build` instead to build from the current checkout. T
 
 Attachments larger than 512 KB upload in chunks, so a reverse proxy that caps request bodies (nginx defaults `client_max_body_size` to 1 MB) never sees an oversized request. The browser halves its chunk size and retries whenever a proxy still answers `413`, and the server reassembles the chunks into a single file inside the chat workspace under `.copilotchat/uploads/`, which is the path handed to the agent. Set `COPILOTCHAT_UPLOAD_CHUNK_BYTES` to tune the chunk size and `COPILOTCHAT_UPLOAD_LIMIT_BYTES` for the total per-file limit.
 
+Uploaded images preview inline in the chat, and any file the agent references with a Markdown image or link resolves against the chat workspace: `![chart](artifacts/chart.png)` renders, and `[notes](artifacts/notes.md)` becomes a download. Content is served from `GET /api/chats/:chatId/files?path=…` and `GET /api/chats/:chatId/messages/:messageId/attachments/:attachmentId`, both scoped to the signed-in owner and restricted to paths that stay inside that chat's workspace. Files are sent with `X-Content-Type-Options: nosniff` and a sandboxed `Content-Security-Policy`, and anything a browser could execute (HTML, SVG, PDF) is only ever offered as a download.
+
 For direct GitHub login, create a GitHub OAuth App and set these values in `.env`:
 
 ```dotenv

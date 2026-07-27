@@ -16,6 +16,7 @@ import { z } from "zod";
 import { artifactSystemContext, syncArtifactFiles, writeExistingArtifactFile, writeFileArtifact } from "./artifact-files.js";
 import { chatAttachmentDirectory, forgetValidatedAttachmentFiles, forgetValidatedAttachmentTree, isChatAttachmentDirectory, materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { applyChatTurnScope, buildProviderChatRequest, chatWorkingDirectory } from "./chat-context.js";
+import { ChatFileAccessError, ChatFileNotFoundError, chatFileSystemContext, contentDispositionHeader, contentTypeForFile, fileEtag, isInlineContentType, resolveChatFile } from "./chat-files.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
@@ -145,6 +146,7 @@ async function prepareChatTurn(ownerId: string, chatId: string, input: InternalS
     const providerRequest = buildProviderChatRequest({ db, ownerId, chat, message: input, pendingUserMessage: existingUserMessage ? undefined : { content: input.content, attachments }, messageOverride: existingUserMessage ? { id: existingUserMessage.id, content: input.content, attachments: overrideAttachments } : undefined, messageCutoffId: options.messageCutoffId, resetProviderSession: options.resetProviderSession, defaultModel: config.copilotModel, gitHubToken, context: { isolatedWorkspaceRoot, allowStdioMcp: config.authMode !== "github" }, titleTool: chat.titleManuallySet ? undefined : { currentTitle: chat.title, required: titleRequired, setTitle: async (title) => { const current = db.getChat(ownerId, chat.id); if (current.titleManuallySet) return current.title; return db.updateChatTitle(ownerId, chat.id, title, "auto").title; } } });
     attachImportGuidance(ownerId, input, providerRequest);
     providerRequest.artifactContext = artifactSystemContext(await syncArtifactFiles({ db, ownerId, chat, workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot }));
+    providerRequest.attachmentContext = chatFileSystemContext({ workspaceDir: providerRequest.workingDirectory ?? isolatedWorkspaceRoot, attachments: [...db.listChatAttachmentFiles(ownerId, chat.id), ...overrideAttachments] });
     const userMessage = existingUserMessage ?? db.addMessage({ chatId: chat.id, role: "user", content: input.content });
     if (!existingUserMessage) addedUserMessage = userMessage;
     if ((!existingUserMessage && attachments.length > 0) || (existingUserMessage && input.attachments !== undefined)) {
@@ -243,6 +245,52 @@ app.delete(`${apiPrefix}/chats/empty`, async (request) => { const owner = ownerF
 app.patch(`${apiPrefix}/chats/:chatId`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); return db.updateChat(owner.id, params.chatId, updateChatRequestSchema.parse(request.body)); });
 app.delete(`${apiPrefix}/chats/:chatId`, async (request, reply) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); const chat = db.getChat(owner.id, params.chatId); if (!activeResponses.beginDeletion(chat.id)) { reply.code(409).send({ error: "The chat is currently being prepared or deleted." }); return; } try { await activeResponses.cancelAndWait(chat.id); await removeChatFiles(owner.id, chat); db.deleteChat(owner.id, params.chatId); return { ok: true }; } finally { activeResponses.endDeletion(chat.id); } });
 app.get(`${apiPrefix}/chats/:chatId/messages`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); return db.listMessages(params.chatId); });
+app.get(`${apiPrefix}/chats/:chatId/messages/:messageId/attachments/:attachmentId`, async (request, reply) => {
+  const owner = ownerFor(request);
+  const params = z.object({ chatId: z.string(), messageId: z.string(), attachmentId: z.string() }).parse(request.params);
+  const query = z.object({ download: z.string().optional() }).parse(request.query);
+  const attachment = db.getMessageAttachment(owner.id, params.chatId, params.messageId, params.attachmentId);
+  if (!attachment) { reply.code(404).send({ error: "Attachment not found." }); return; }
+  const mimeType = attachment.mimeType || contentTypeForFile(attachment.name);
+  if (attachment.filePath) {
+    const chat = db.getChat(owner.id, params.chatId);
+    const workspaceDir = chatWorkingDirectory(db, owner.id, chat, isolatedWorkspaceRoot);
+    let file;
+    try {
+      file = await resolveChatFile({ workspaceDir, requestedPath: attachment.filePath });
+    } catch (error) {
+      if (error instanceof ChatFileNotFoundError) { reply.code(404).send({ error: "Attachment file is no longer available." }); return; }
+      if (error instanceof ChatFileAccessError) { reply.code(403).send({ error: error.message }); return; }
+      throw error;
+    }
+    sendChatFile(request, reply, { absolutePath: file.absolutePath, fileName: attachment.name, size: file.size, mimeType, etag: file.etag, download: isDownloadRequest(query.download) });
+    return reply;
+  }
+  if (!attachment.data) { reply.code(404).send({ error: "Attachment content is no longer available." }); return; }
+  const content = Buffer.from(attachment.data, "base64");
+  const headers = { fileName: attachment.name, size: content.byteLength, mimeType, etag: fileEtag(content.byteLength, 0), download: isDownloadRequest(query.download) };
+  applyChatFileHeaders(reply, headers);
+  if (isFreshRequest(request, headers.etag)) { reply.code(304).send(); return reply; }
+  reply.send(content);
+  return reply;
+});
+app.get(`${apiPrefix}/chats/:chatId/files`, async (request, reply) => {
+  const owner = ownerFor(request);
+  const params = z.object({ chatId: z.string() }).parse(request.params);
+  const query = z.object({ path: z.string().min(1).max(4096), download: z.string().optional() }).parse(request.query);
+  const chat = db.getChat(owner.id, params.chatId);
+  const workspaceDir = chatWorkingDirectory(db, owner.id, chat, isolatedWorkspaceRoot);
+  let file;
+  try {
+    file = await resolveChatFile({ workspaceDir, requestedPath: query.path });
+  } catch (error) {
+    if (error instanceof ChatFileNotFoundError) { reply.code(404).send({ error: error.message }); return; }
+    if (error instanceof ChatFileAccessError) { reply.code(403).send({ error: error.message }); return; }
+    throw error;
+  }
+  sendChatFile(request, reply, { absolutePath: file.absolutePath, fileName: file.fileName, size: file.size, mimeType: file.mimeType, etag: file.etag, download: isDownloadRequest(query.download) });
+  return reply;
+});
 app.get(`${apiPrefix}/chats/:chatId/active-response`, async (request, reply) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); activeResponses.attach(params.chatId, reply); });
 app.patch(`${apiPrefix}/chats/:chatId/active-response`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); const body = z.object({ permissionMode: permissionModeSchema }).parse(request.body); return { active: activeResponses.setPermissionMode(params.chatId, body.permissionMode) }; });
 app.delete(`${apiPrefix}/chats/:chatId/active-response`, async (request) => { const owner = ownerFor(request); const params = z.object({ chatId: z.string() }).parse(request.params); db.getChat(owner.id, params.chatId); return { cancelled: activeResponses.cancel(params.chatId) }; });
@@ -452,6 +500,30 @@ const webDist = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.
 if (fs.existsSync(webDist)) { await app.register(fastifyStatic, { root: webDist, prefix: "/", wildcard: false }); app.setNotFoundHandler((request, reply) => { if (request.raw.url?.startsWith(apiPrefix)) { reply.code(404).send({ error: "Not found" }); return; } reply.sendFile("index.html"); }); }
 await app.listen({ host: config.host, port: config.port });
 function isMutatingMethod(method: string): boolean { return method === "POST" || method === "PATCH" || method === "DELETE"; }
+function isDownloadRequest(value: string | undefined): boolean { return value === "1" || value === "true"; }
+/** Serves chat content with headers that stop the browser from treating a stored file as active same-origin content. */
+function applyChatFileHeaders(reply: FastifyReply, file: { fileName: string; size: number; mimeType: string; etag: string; download: boolean }): void {
+  const inline = !file.download && isInlineContentType(file.mimeType);
+  reply
+    .header("Content-Type", file.mimeType)
+    .header("Content-Length", String(file.size))
+    .header("Content-Disposition", contentDispositionHeader(file.fileName, inline ? "inline" : "attachment"))
+    .header("Content-Security-Policy", "default-src 'none'; sandbox")
+    .header("X-Content-Type-Options", "nosniff")
+    .header("ETag", file.etag)
+    // The agent rewrites files in place, so every read revalidates instead of trusting a cached copy.
+    .header("Cache-Control", "private, no-cache");
+}
+function isFreshRequest(request: FastifyRequest, etag: string): boolean {
+  const header = request.headers["if-none-match"];
+  const values = (Array.isArray(header) ? header.join(",") : header ?? "").split(",").map((value) => value.trim().replace(/^W\//, ""));
+  return values.includes(etag);
+}
+function sendChatFile(request: FastifyRequest, reply: FastifyReply, file: { absolutePath: string; fileName: string; size: number; mimeType: string; etag: string; download: boolean }): void {
+  applyChatFileHeaders(reply, file);
+  if (isFreshRequest(request, file.etag)) { reply.code(304).send(); return; }
+  reply.send(fs.createReadStream(file.absolutePath));
+}
 /** Reads one chunk fully so a failed request can be retried at the same offset without corrupting stored bytes. */
 async function readChunkBody(source: Readable, maxBytes: number): Promise<Buffer> {
   const parts: Buffer[] = [];

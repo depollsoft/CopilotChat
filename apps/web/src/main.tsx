@@ -1,12 +1,14 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components } from "react-markdown";
-import rehypeSanitize from "rehype-sanitize";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
 import { formatAic } from "@copilotchat/shared";
 import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
+import { chatFileUrl, fileNameFromPath, isImageMimeType, isPreservedMarkdownUrl, messageAttachmentUrl, resolveMarkdownSource } from "./attachments.js";
+import type { MarkdownSource } from "./attachments.js";
 import { ChatStreamRegistry, pruneLocalRunningChats } from "./chat-streams.js";
 import type { LocalRunningChats } from "./chat-streams.js";
 import { externalLinkProps } from "./links.js";
@@ -70,6 +72,13 @@ type SlashCommand = { command: string; title: string; description: string; body:
 type ComposerHandle = { focus: () => void; setValue: (value: string) => void; clear: () => void };
 type ChatScrollState = { top: number; atLive: boolean };
 type MessageProps = { message: ChatMessage; streaming?: boolean; activities?: AssistantActivity[]; editing?: boolean; editValue?: string; canEdit?: boolean; canRetry?: boolean; onEditStart?: (message: ChatMessage) => void; onEditChange?: (content: string) => void; onEditCancel?: () => void; onEditSave?: (message: ChatMessage, content: string) => void; onRetry?: (message: ChatMessage) => void };
+/** An image opened full size, addressed by a URL the browser can already load. */
+type ViewerImage = { url: string; name: string; downloadName?: string };
+type ChatMedia = { chatId: string | null; openImage: (image: ViewerImage) => void };
+const ChatMediaContext = React.createContext<ChatMedia>({ chatId: null, openImage: () => {} });
+/** Uploaded images the browser still holds, so a just-sent attachment previews without a round trip. */
+const ATTACHMENT_PREVIEW_LIMIT = 24;
+const attachmentPreviews = new Map<string, string>();
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "preferences", label: "Preferences", icon: <IconSettings width={14} height={14} /> },
   { id: "context", label: "Personal context", icon: <IconUser width={14} height={14} /> },
@@ -120,6 +129,7 @@ function App(): React.ReactElement {
   const [toast, setToast] = useState<string | null>(null);
   const [dialog, setDialog] = useState<AppDialog | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [viewerImage, setViewerImage] = useState<ViewerImage | null>(null);
   const [showJumpToLive, setShowJumpToLive] = useState(false);
   const [modelsRefreshing, setModelsRefreshing] = useState(false);
   const chatStreamsRef = useRef(new ChatStreamRegistry());
@@ -149,6 +159,7 @@ function App(): React.ReactElement {
   const activeProject = useMemo(() => projects.find((p) => p.id === (selectedChat?.projectId ?? activeProjectId)) ?? null, [projects, activeProjectId, selectedChat?.projectId]);
   const activeWorkspace = useMemo(() => (state?.workspaces ?? []).find((w) => w.id === (selectedChat?.workspaceId ?? activeWorkspaceId)) ?? null, [state?.workspaces, selectedChat?.workspaceId, activeWorkspaceId]);
   const selectedSkills = useMemo(() => skills.filter((s) => selectedSkillIds.includes(s.id)), [skills, selectedSkillIds]);
+  const chatMedia = useMemo<ChatMedia>(() => ({ chatId: selectedChatId, openImage: setViewerImage }), [selectedChatId]);
   const runningChatIdsArray = useMemo(() => Array.from(new Set([...(state?.activeChatIds ?? []), ...Object.keys(localRunningChats)])), [state?.activeChatIds, localRunningChats]);
   const runningChatIds = useMemo(() => new Set(runningChatIdsArray), [runningChatIdsArray]);
   const runningChatKey = runningChatIdsArray.join("|");
@@ -581,7 +592,7 @@ function App(): React.ReactElement {
   function restoreChatScroll(chatId: string, state: ChatScrollState | null): void { const scroll = scrollRef.current; if (!scroll) return; if (!state || state.atLive) { scrollToLive("auto"); chatScrollStatesRef.current[chatId] = { top: scroll.scrollTop, atLive: true }; return; } scroll.scrollTo({ top: Math.min(state.top, scroll.scrollHeight), behavior: "auto" }); liveScrollRef.current = false; chatScrollStatesRef.current[chatId] = { top: scroll.scrollTop, atLive: isAtLiveEdge(scroll) }; setShowJumpToLive(scroll.scrollHeight > scroll.clientHeight + LIVE_SCROLL_THRESHOLD); }
   function renderThreadMessages(): React.ReactNode[] { const nodes: React.ReactNode[] = []; let lastDay = ""; for (const message of messages) { const day = messageDayKey(message.createdAt); if (day && day !== lastDay) { nodes.push(<DateBarrier key={`date-${day}-${message.id}`} value={message.createdAt} />); lastDay = day; } nodes.push(<Message key={message.id} message={message} editing={editingMessage?.id === message.id} editValue={editingMessage?.id === message.id ? editingMessage.content : ""} canEdit={!busy} canRetry={!busy} onEditStart={(next) => setEditingMessage({ id: next.id, content: next.content })} onEditChange={(content) => setEditingMessage((current) => current ? { ...current, content } : current)} onEditCancel={() => setEditingMessage(null)} onEditSave={(next, content) => void editAndContinue(next.id, content)} onRetry={(next) => void retryResponse(next.id)} />); } return nodes; }
   if (loginRequired) return <div className="auth-screen"><div className="auth-panel"><span className="welcome-mark"><IconCopilot width={46} height={46}/></span><h1>Sign in to CopilotChat</h1><p>Use GitHub to access this self-hosted instance. Your chats, projects, tools, and imports are isolated by GitHub login.</p>{error ? <p className="auth-error">{error}</p> : null}<a className="btn btn-primary" href="/api/auth/github/login">Sign in with GitHub</a></div></div>;
-  return <div className="app">
+  return <ChatMediaContext.Provider value={chatMedia}><div className="app">
     {sidebarOpen ? <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} /> : null}
     <Sidebar open={sidebarOpen} chats={chats} projects={projects} selectedChatId={selectedChatId} activeProjectId={activeProjectId} runningChatIds={runningChatIds} unreadChatIds={unreadChatIds} searchQuery={searchQuery} owner={state?.owner.login ?? "Local"} providerLabel={provider.id === "sdk" ? "GitHub Copilot" : provider.label} onSearch={setSearchQuery} onSelectChat={(id) => { selectChat(id); setSidebarOpen(false); }} onNewChat={() => void createChat()} onNewProject={() => void createProjectFromSidebar()} onSelectProject={(id) => { selectProject(id); setSidebarOpen(false); }} onToggleChatFavorite={(chat) => void toggleChatFavorite(chat)} onToggleProjectFavorite={(project) => void toggleProjectFavorite(project)} onRenameProject={(project) => void renameProject(project)} onDeleteProject={(project) => void deleteProject(project)} onRenameChat={(chat) => void renameChat(chat)} onArchiveChat={(chat) => void archiveChat(chat)} onDeleteChat={(chat) => void deleteChat(chat)} onOpenDrawer={(tab) => { setDrawer(tab); setSidebarOpen(false); }} />
     <main className="main">
@@ -602,7 +613,8 @@ function App(): React.ReactElement {
     {shortcutsOpen ? <ShortcutsDialog onClose={() => setShortcutsOpen(false)} /> : null}
     {dialog ? <AppDialogView dialog={dialog} onClose={() => setDialog(null)} onError={(message) => setError(message)} /> : null}
     {toast ? <Toast text={toast} onDone={() => setToast(null)} /> : null}
-  </div>;
+    {viewerImage ? <ImageViewer image={viewerImage} onClose={() => setViewerImage(null)} /> : null}
+  </div></ChatMediaContext.Provider>;
 }
 
 type SidebarProps = { open: boolean; chats: Chat[]; projects: Project[]; selectedChatId: string | null; activeProjectId: string | null; runningChatIds: Set<string>; unreadChatIds: Set<string>; searchQuery: string; owner: string; providerLabel: string; onSearch: (v: string) => void; onSelectChat: (id: string) => void; onNewChat: () => void; onNewProject: () => void; onSelectProject: (id: string | null) => void; onToggleChatFavorite: (chat: Chat) => void; onToggleProjectFavorite: (project: Project) => void; onRenameProject: (project: Project) => void; onDeleteProject: (project: Project) => void; onRenameChat: (c: Chat) => void; onArchiveChat: (c: Chat) => void; onDeleteChat: (c: Chat) => void; onOpenDrawer: (t: Tab) => void };
@@ -741,7 +753,7 @@ function ProjectEditorModal(p: { editor: ProjectEditorState; onClose: () => void
   return <><div className="modal-scrim" onClick={p.onClose}/><section className="editor-modal" role="dialog" aria-label={p.editor.title}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></section></>;
 }
 const Markdown = React.memo(function Markdown(p: { children: string }) { const parts = useMemo(() => splitMarkdownTaskLists(p.children), [p.children]); if (parts.length === 1 && parts[0]?.kind === "markdown") return <MarkdownText>{p.children}</MarkdownText>; return <>{parts.map((part, index) => part.kind === "tasks" ? <TaskListCard key={index} items={part.items} /> : <MarkdownText key={index}>{part.content}</MarkdownText>)}</>; });
-const MarkdownText = React.memo(function MarkdownText(p: { children: string }) { return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={markdownComponents}>{p.children}</ReactMarkdown>; });
+const MarkdownText = React.memo(function MarkdownText(p: { children: string }) { return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[[rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA]]} urlTransform={markdownUrlTransform} components={markdownComponents}>{p.children}</ReactMarkdown>; });
 function DateBarrier(p: { value: string }) { return <time className="date-barrier" dateTime={messageDayKey(p.value)} title={formatMessageDateTime(p.value)}><span>{formatMessageDateBarrier(p.value)}</span></time>; }
 function MessageTime(p: { value: string }) {
   const [open, setOpen] = useState(false);
@@ -757,7 +769,7 @@ const Message = React.memo(function Message(p: MessageProps) {
   const intent = p.streaming ? currentReportIntent(activities) : null;
   const nanoAiu = !isUser ? messageNanoAiu(p.message) : 0;
   const actions = !p.streaming ? <div className="msg-actions"><button aria-label={isUser ? "Copy message" : "Copy response"} title="Copy" className="msg-action-button" onClick={() => void copyText(p.message.content)}><IconCopy width={18}/></button>{isUser ? <button aria-label="Edit message" title="Edit" className="msg-action-button" disabled={!p.canEdit} onClick={() => p.onEditStart?.(p.message)}><IconEdit width={18}/></button> : <button aria-label="Retry response" title="Retry" className="msg-action-button" disabled={!p.canRetry} onClick={() => p.onRetry?.(p.message)}><IconRetry width={18}/></button>}</div> : null;
-  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{nanoAiu > 0 ? <span className="msg-usage" title={`This response used ${formatAic(nanoAiu)} AI credits`}>{formatAic(nanoAiu)} AIC</span> : null}{!p.editing ? actions : null}</div></article>;
+  return <article className={`msg ${isUser ? "user" : "assistant"}`}><span className="msg-avatar">{isUser ? "You" : <IconCopilot width={18} height={18}/>}</span><div className="msg-body">{p.editing ? <form className="edit-message-form" onSubmit={(e) => { e.preventDefault(); p.onEditSave?.(p.message, p.editValue ?? ""); }}><textarea aria-label="Edit message" value={p.editValue ?? ""} rows={4} onChange={(e) => p.onEditChange?.(e.target.value)} autoFocus/><div className="msg-actions"><button aria-label="Save and continue" title="Save and continue" className="msg-action-button primary" disabled={!p.editValue?.trim() && attachments.length === 0}><IconCheck width={18}/></button><button type="button" aria-label="Cancel edit" title="Cancel" className="msg-action-button" onClick={p.onEditCancel}><IconClose width={18}/></button></div></form> : <>{activities.length > 0 ? <ActivityList activities={activities} streaming={Boolean(p.streaming)} /> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} message={p.message} /> : null}{p.message.content ? <Markdown>{p.message.content}</Markdown> : null}{p.streaming ? <StreamingCursor intent={intent}/> : null}</>}</div><div className="msg-meta"><MessageTime value={p.message.createdAt} />{nanoAiu > 0 ? <span className="msg-usage" title={`This response used ${formatAic(nanoAiu)} AI credits`}>{formatAic(nanoAiu)} AIC</span> : null}{!p.editing ? actions : null}</div></article>;
 }, areMessagePropsEqual);
 function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<MessageProps>): boolean {
   return prev.message === next.message &&
@@ -769,8 +781,63 @@ function areMessagePropsEqual(prev: Readonly<MessageProps>, next: Readonly<Messa
     prev.canRetry === next.canRetry;
 }
 function PendingTurns(p: { turns: PendingTurn[] }) { const visible = p.turns.filter((turn) => turn.status !== "done"); if (visible.length === 0) return null; return <div className="pending-turns">{visible.map((turn) => <article key={turn.id} className={`pending-turn ${turn.mode} ${turn.status}`}><span className="pending-label">{turn.mode === "steer" ? "Steer" : "Queued"}</span><span className="pending-content">{turn.content}</span><span className="pending-status">{turn.status === "running" ? "Running next" : turn.status === "sent" ? "Sent live" : turn.status}</span></article>)}</div>; }
-const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock>, a: (props) => <MarkdownLink {...props} /> };
-function MarkdownLink(props: React.ComponentPropsWithoutRef<"a"> & { node?: unknown }) { const anchor: React.ComponentPropsWithoutRef<"a"> & { node?: unknown } = { ...props }; delete anchor.node; return <a {...anchor} {...externalLinkProps(props.href)} />; }
+const markdownComponents: Components = { pre: ({ children }) => <CodeBlock>{children}</CodeBlock>, a: (props) => <MarkdownLink {...props} />, img: (props) => <MarkdownImage {...props} /> };
+/** The default schema drops inline and file sources, which are exactly the ones a chat file preview needs. */
+const MARKDOWN_SANITIZE_SCHEMA = { ...defaultSchema, protocols: { ...defaultSchema.protocols, src: [...(defaultSchema.protocols?.src ?? []), "data", "file"], href: [...(defaultSchema.protocols?.href ?? []), "file"] } };
+/** Runs after sanitizing, so it only has to keep the sources the schema already allowed instead of blanking them. */
+function markdownUrlTransform(url: string): string { return isPreservedMarkdownUrl(url) ? url : defaultUrlTransform(url); }
+function MarkdownLink(props: React.ComponentPropsWithoutRef<"a"> & { node?: unknown }) {
+  const media = React.useContext(ChatMediaContext);
+  const anchor: React.ComponentPropsWithoutRef<"a"> & { node?: unknown } = { ...props };
+  delete anchor.node;
+  const source = resolveMarkdownSource(typeof props.href === "string" ? props.href : null, media.chatId);
+  if (source?.kind === "chat-file") return <ChatFileChip path={source.path} fileName={source.fileName} label={textFromNode(props.children) || source.fileName} />;
+  return <a {...anchor} {...externalLinkProps(props.href)} />;
+}
+function MarkdownImage(props: React.ComponentPropsWithoutRef<"img"> & { node?: unknown }) {
+  const media = React.useContext(ChatMediaContext);
+  const alt = typeof props.alt === "string" ? props.alt : "";
+  const source = resolveMarkdownSource(typeof props.src === "string" ? props.src : null, media.chatId);
+  if (!source) return alt ? <span className="markdown-image-missing">{alt}</span> : null;
+  if (source.kind === "direct") return <MarkdownImageFrame url={source.url} alt={alt} name={alt || fileNameFromPath(source.url)} />;
+  return <ChatFileImage source={source} alt={alt} />;
+}
+/** Loads a workspace image through the chat file endpoint, which needs the request to carry credentials. */
+function ChatFileImage(p: { source: Extract<MarkdownSource, { kind: "chat-file" }>; alt: string }) {
+  const [placeholderRef, nearViewport] = useNearViewport<HTMLSpanElement>();
+  const { objectUrl, error } = useAuthedObjectUrl(nearViewport ? p.source.url : null);
+  if (error) return <ChatFileChip path={p.source.path} fileName={p.source.fileName} label={p.alt || p.source.fileName} unavailable />;
+  if (!objectUrl) return <span ref={placeholderRef} className="markdown-image-loading" role="status" aria-label={`Loading ${p.source.fileName}`} />;
+  return <MarkdownImageFrame url={objectUrl} alt={p.alt} name={p.alt || p.source.fileName} downloadName={p.source.fileName} />;
+}
+function MarkdownImageFrame(p: { url: string; alt: string; name: string; downloadName?: string }) {
+  const media = React.useContext(ChatMediaContext);
+  return <button type="button" className="markdown-image" aria-label={`Open ${p.name} full size`} title={p.name} onClick={() => media.openImage({ url: p.url, name: p.name, downloadName: p.downloadName })}><img src={p.url} alt={p.alt} loading="lazy" /></button>;
+}
+/** A chat file the user can download, also used when an image referenced by the agent cannot be read. */
+function ChatFileChip(p: { path: string; fileName: string; label: string; unavailable?: boolean }) {
+  const media = React.useContext(ChatMediaContext);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function download(): Promise<void> {
+    if (!media.chatId) return;
+    setBusy(true);
+    setError(null);
+    try { await downloadApiFile(chatFileUrl(media.chatId, p.path, { download: true }), p.fileName); } catch (e) { setError(toErr(e)); } finally { setBusy(false); }
+  }
+  return <button type="button" className={`chat-file-chip${p.unavailable ? " unavailable" : ""}`} title={p.path} disabled={busy} onClick={() => void download()}>
+    <span className="chat-file-icon"><IconDownload width={14}/></span>
+    <span className="chat-file-copy"><strong>{p.label}</strong><small>{error ?? (busy ? "Downloading\u2026" : p.unavailable ? "File unavailable" : p.fileName)}</small></span>
+  </button>;
+}
+function ImageViewer(p: { image: ViewerImage; onClose: () => void }) {
+  const onClose = p.onClose;
+  useEffect(() => { const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); }; window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [onClose]);
+  return <><div className="modal-scrim" onClick={onClose} /><section className="image-viewer" role="dialog" aria-modal="true" aria-label={p.image.name}>
+    <div className="image-viewer-head"><strong>{p.image.name}</strong><span className="image-viewer-actions"><a className="icon-button" href={p.image.url} download={p.image.downloadName ?? p.image.name} aria-label="Download image" title="Download"><IconDownload/></a><button className="icon-button" aria-label="Close image" onClick={onClose}><IconClose/></button></span></div>
+    <img src={p.image.url} alt={p.image.name} />
+  </section></>;
+}
 function CodeBlock(p: { children?: React.ReactNode }) { const code = textFromNode(p.children).replace(/\n$/, ""); return <div className="code-block"><button type="button" className="code-copy" aria-label="Copy code block" title="Copy code" onClick={() => void copyText(code)}><IconCopy width={15}/></button><pre>{p.children}</pre></div>; }
 type MarkdownTaskPart = { kind: "markdown"; content: string } | { kind: "tasks"; items: TaskListItem[] };
 function splitMarkdownTaskLists(markdown: string): MarkdownTaskPart[] {
@@ -1032,7 +1099,25 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   function submitMessage(): void { void submit(p.onSubmit); }
   return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{uploadProgress ? <p className="attachment-progress" role="status">{`Uploading ${uploadProgress.files === 1 ? "1 file" : `${uploadProgress.files} files`}… ${formatBytes(uploadProgress.uploaded)} of ${formatBytes(uploadProgress.total)}`}</p> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? "Steer or queue a follow-up" : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
 });
-function AttachmentTray(p: { attachments: MessageAttachment[]; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => { const src = isImageAttachment(attachment) ? attachmentDataUrl(attachment) : null; return <div key={attachment.id} className={`attachment-chip${isImageAttachment(attachment) ? " image" : ""}`}>{src ? <img alt="" src={src} /> : <span className="attachment-file-icon"><IconUpload width={15}/></span>}<span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.mimeType} · {formatBytes(attachment.size)}</small></span>{p.onRemove ? <button type="button" aria-label={`Remove ${attachment.name}`} disabled={p.removeDisabled} onClick={() => p.onRemove?.(attachment.id)}><IconClose width={14}/></button> : null}</div>; })}</div>; }
+function AttachmentTray(p: { attachments: MessageAttachment[]; message?: ChatMessage; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => <AttachmentChip key={attachment.id} attachment={attachment} message={p.message} onRemove={p.onRemove} removeDisabled={p.removeDisabled} />)}</div>; }
+function AttachmentChip(p: { attachment: MessageAttachment; message?: ChatMessage; onRemove?: (id: string) => void; removeDisabled?: boolean }) {
+  const media = React.useContext(ChatMediaContext);
+  const [chipRef, nearViewport] = useNearViewport<HTMLDivElement>();
+  const isImage = isImageMimeType(p.attachment.mimeType);
+  const localPreview = attachmentPreviews.get(p.attachment.id) ?? null;
+  const message = isStoredMessage(p.message) ? p.message : null;
+  const stored = useAuthedObjectUrl(isImage && !localPreview && message && nearViewport ? messageAttachmentUrl(message.chatId, message.id, p.attachment.id) : null);
+  const previewUrl = localPreview ?? stored.objectUrl;
+  const downloadUrl = message ? messageAttachmentUrl(message.chatId, message.id, p.attachment.id, { download: true }) : null;
+  return <div ref={chipRef} className={`attachment-chip${isImage ? " image" : ""}`}>
+    {previewUrl
+      ? <button type="button" className="attachment-thumb" aria-label={`Open ${p.attachment.name}`} onClick={() => media.openImage({ url: previewUrl, name: p.attachment.name })}><img alt="" src={previewUrl} /></button>
+      : <span className={`attachment-file-icon${isImage && !stored.error ? " loading" : ""}`}><IconUpload width={15}/></span>}
+    <span className="attachment-copy"><strong>{p.attachment.name}</strong><small>{p.attachment.mimeType} · {formatBytes(p.attachment.size)}</small></span>
+    {downloadUrl ? <button type="button" aria-label={`Download ${p.attachment.name}`} title="Download" onClick={() => void downloadApiFile(downloadUrl, p.attachment.name)}><IconDownload width={14}/></button> : null}
+    {p.onRemove ? <button type="button" aria-label={`Remove ${p.attachment.name}`} disabled={p.removeDisabled} onClick={() => p.onRemove?.(p.attachment.id)}><IconClose width={14}/></button> : null}
+  </div>;
+}
 function composerPickerTitle(picker: ComposerPicker): string { return picker === "menu" ? "Composer options" : picker === "project" ? "Choose project" : picker === "skills" ? "Choose skills" : picker === "workspace" ? "Choose workspace" : "Tool permissions"; }
 function ComposerPickerContent(p: { picker: ComposerPicker; busy: boolean; projects: Project[]; activeProjectId: string | null; workspaces: Workspace[]; activeWorkspaceId: string | null; skills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; selectedSkillCount: number; activeProjectName: string | null; activeWorkspaceName: string | null; onAttach: () => void; onOpenPicker: (picker: ComposerPicker) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onToggleSkill: (id: string) => void; onPermissionMode: (mode: PermissionMode) => void; onManage: (tab: Tab) => void }) {
   if (p.picker === "menu") return <><div className="picker-head"><strong>Composer options</strong></div><div className="picker-list"><button type="button" className="picker-option" onClick={p.onAttach}><span>Attach files or images</span><small>{p.busy ? "Attach context for steering or the next queued message." : "Upload files, images, screenshots, or paste images into the composer."}</small></button><button type="button" className="picker-option" disabled={p.busy} onClick={() => p.onOpenPicker("project")}><span>Project</span><small>{p.busy ? "Project context is locked while this response runs." : p.activeProjectName ?? "General chat, no project context"}</small></button><button type="button" className="picker-option" onClick={() => p.onOpenPicker("skills")}><span>Skills</span><small>{p.selectedSkillCount ? `${p.selectedSkillCount} selected for the next turn` : "Choose reusable behavior for the next turn"}</small></button><button type="button" className="picker-option" disabled={p.busy} onClick={() => p.onOpenPicker("workspace")}><span>Workspace</span><small>{p.busy ? "Workspace context is locked while this response runs." : p.activeWorkspaceName ?? "No local folder attached"}</small></button><button type="button" className="picker-option" onClick={() => p.onOpenPicker("permissions")}><span>Tool permissions</span><small>{p.permissionMode === "yolo" ? "Auto-approve is on" : "Ask before tool use"}</small></button></div></>;
@@ -1319,6 +1404,61 @@ function appRouteFromPath(path: string): AppRoute {
 function routeSegment(path: string, prefix: string): string | null { const segment = path.slice(prefix.length).split("/")[0]; if (!segment) return null; try { return decodeURIComponent(segment); } catch { return segment; } }
 function appPathForSelection(chatId: string | null, projectId: string | null): string { if (chatId) return `${CHAT_ROUTE_PREFIX}${encodeURIComponent(chatId)}`; return projectId ? `${PROJECT_ROUTE_PREFIX}${encodeURIComponent(projectId)}` : "/"; }
 function syncAppUrl(path: string): void { if (location.pathname === path) return; history.replaceState({ copilotChatBackGuard: true }, "", path); }
+/** Fetches binary chat content with the same credentials the JSON API uses, since an <img> tag cannot send them. */
+async function apiBlob(url: string, signal?: AbortSignal, token = localStorage.getItem(API_TOKEN_KEY) ?? ""): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers: Object.keys(headers).length ? headers : undefined, signal });
+  if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
+  return await response.blob();
+}
+async function downloadApiFile(url: string, fileName: string): Promise<void> {
+  const objectUrl = URL.createObjectURL(await apiBlob(url));
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+}
+/** Defers a preview fetch until its placeholder is close to the viewport, so a long chat does not download every image at once. */
+function useNearViewport<T extends HTMLElement>(): [React.RefObject<T | null>, boolean] {
+  const ref = useRef<T | null>(null);
+  const [near, setNear] = useState(typeof IntersectionObserver === "undefined");
+  useEffect(() => {
+    const node = ref.current;
+    if (near || !node) return;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) setNear(true); }, { rootMargin: "400px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [near]);
+  return [ref, near];
+}
+/** Loads a protected file into an object URL that image tags and download links can use. */
+function useAuthedObjectUrl(url: string | null): { objectUrl: string | null; error: string | null; loading: boolean } {
+  const [state, setState] = useState<{ objectUrl: string | null; error: string | null; loading: boolean }>({ objectUrl: null, error: null, loading: Boolean(url) });
+  useEffect(() => {
+    if (!url) { setState({ objectUrl: null, error: null, loading: false }); return; }
+    let active = true;
+    let objectUrl: string | null = null;
+    const controller = new AbortController();
+    setState({ objectUrl: null, error: null, loading: true });
+    void apiBlob(url, controller.signal).then((blob) => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(blob);
+      setState({ objectUrl, error: null, loading: false });
+    }).catch((error: unknown) => {
+      if (!active || (error as Error).name === "AbortError") return;
+      setState({ objectUrl: null, error: toErr(error), loading: false });
+    });
+    return () => { active = false; controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [url]);
+  return state;
+}
+/** The streaming placeholder has no stored row yet, so its content cannot be fetched back. */
+function isStoredMessage(message: ChatMessage | undefined): message is ChatMessage { return Boolean(message && message.id !== "streaming" && message.chatId); }
 async function api<T>(url:string,init:{method?:string;body?:unknown;raw?:boolean}={},token=localStorage.getItem(API_TOKEN_KEY)??""):Promise<T>{const method=init.method??"GET";const headers:Record<string,string>={};if(init.body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:init.body!==undefined?JSON.stringify(init.body):undefined});if(!res.ok)throw new Error(httpErrorMessage(res.status,await res.text()));return init.raw?undefined as T:await res.json() as T;}
 async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",onAccepted?:()=>void,hooks:StreamHooks={}):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new FatalStreamError(httpErrorMessage(res.status,await res.text()));onAccepted?.();hooks.onOpen?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";try{while(true){const{done,value}=await reader.read();if(done)break;hooks.onChunk?.();buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}finally{void reader.cancel().catch(()=>undefined);}}
 function parseSse(chunk:string):SseEvent|null{const lines=chunk.split("\n");const event=lines.find(l=>l.startsWith("event:"))?.slice(6).trim();const data=lines.find(l=>l.startsWith("data:"))?.slice(5).trim();return event&&data?{event,data:JSON.parse(data) as unknown}:null;}
@@ -1332,13 +1472,27 @@ function readSeenChatUpdates(): Record<string, string> { const saved = localStor
 function writeSeenChatUpdates(value: Record<string, string>): Record<string, string> { localStorage.setItem(CHAT_SEEN_KEY, JSON.stringify(value)); return value; }
 async function registerServiceWorker(){if("serviceWorker" in navigator)try{await navigator.serviceWorker.register("/sw.js");}catch{return;}}
 function notify(title:string,body:string){if(typeof Notification==="undefined"||Notification.permission!=="granted"||document.visibilityState!=="hidden")return;if(navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:"notify",title,body});else new Notification(title,{body});}
-function fileToBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error("Failed to read file."));r.onload=()=>typeof r.result==="string"?resolve(r.result.slice(r.result.indexOf(",")+1)):reject(new Error("Failed to read file."));r.readAsDataURL(file);});}
 async function uploadFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
   const attachment = file.size > SINGLE_REQUEST_UPLOAD_LIMIT ? await uploadFileInChunks(file, token, onProgress) : await uploadWholeFile(file, token, onProgress);
-  if (file.type.startsWith("image/") && file.size <= 1024 * 1024) {
-    try { attachment.data = await fileToBase64(file); } catch { /* The uploaded image remains usable without an inline preview. */ }
-  }
+  rememberAttachmentPreview(attachment.id, file);
   return attachment;
+}
+/** Holds an image the user just picked so its preview shows before, during, and right after sending. */
+function rememberAttachmentPreview(attachmentId: string, file: File): void {
+  if (!isImageMimeType(file.type)) return;
+  forgetAttachmentPreview(attachmentId);
+  attachmentPreviews.set(attachmentId, URL.createObjectURL(file));
+  while (attachmentPreviews.size > ATTACHMENT_PREVIEW_LIMIT) {
+    const oldest = attachmentPreviews.keys().next().value;
+    if (typeof oldest !== "string") break;
+    forgetAttachmentPreview(oldest);
+  }
+}
+function forgetAttachmentPreview(attachmentId: string): void {
+  const url = attachmentPreviews.get(attachmentId);
+  if (!url) return;
+  URL.revokeObjectURL(url);
+  attachmentPreviews.delete(attachmentId);
 }
 async function uploadWholeFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
   const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
@@ -1433,14 +1587,13 @@ function uploadErrorMessage(status: number, body: string, file: File): string {
   return serverErrorText(body) ?? `${file.name || "That file"} is too large to upload at ${formatBytes(file.size)}. Raise the upload size limit on CopilotChat or on the reverse proxy in front of it, such as the nginx client_max_body_size setting.`;
 }
 async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {
+  forgetAttachmentPreview(attachment.id);
   if (!attachment.uploadId) return;
   await api<void>(`/api/uploads/${encodeURIComponent(attachment.uploadId)}`, { method: "DELETE", raw: true }, token);
 }
 function attachmentForRequest(attachment: MessageAttachment): MessageAttachment { return { id: attachment.id, name: attachment.name, mimeType: attachment.mimeType, size: attachment.size, ...(attachment.uploadId ? { uploadId: attachment.uploadId } : attachment.data ? { data: attachment.data } : attachment.filePath ? { filePath: attachment.filePath } : {}) }; }
 function messageAttachments(message: ChatMessage): MessageAttachment[] { const value = message.metadata.attachments; if (!Array.isArray(value)) return []; return value.filter(isMessageAttachment); }
 function isMessageAttachment(value: unknown): value is MessageAttachment { return isObjectRecord(value) && typeof value.id === "string" && typeof value.name === "string" && typeof value.mimeType === "string" && typeof value.size === "number" && (value.data === undefined || typeof value.data === "string"); }
-function isImageAttachment(attachment: MessageAttachment): boolean { return attachment.mimeType.startsWith("image/"); }
-function attachmentDataUrl(attachment: MessageAttachment): string | null { return attachment.data ? `data:${attachment.mimeType};base64,${attachment.data}` : null; }
 function formatBytes(value: number): string { if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`; if (value >= 1024) return `${Math.round(value / 1024)} KB`; return `${Math.max(0, Math.round(value))} B`; }
 function guidedImportPrompt(draft: ImportDraft): string { return ["Use Import assistant to guide this import.", "", `Import draft ID: ${draft.id}`, `File: ${draft.fileName}`, `Requested source: ${draft.source}`, `Encoding: ${draft.encoding}`, "", "First call preview_import_draft. Then explain what will import and request screenshots or copied text of Claude/ChatGPT project conversation lists when that would help verify project membership. If screenshots are not readable in this chat, request pasted visible project names and conversation titles. Only call apply_import_draft after I explicitly confirm."].join("\n"); }
 function copyText(text:string):Promise<void>{return navigator.clipboard.writeText(text);}
