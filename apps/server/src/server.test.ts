@@ -1064,6 +1064,62 @@ describe("chat provider context", () => {
     }
   });
 
+  it("tears down chunked uploads when owner data is cleared", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024, 64, 4);
+      const session = await uploads.beginChunked("github:alice", { fileName: "half.bin", mimeType: "application/octet-stream", size: 8 });
+      await uploads.appendChunk("github:alice", session.uploadId, 0, Buffer.alloc(4));
+
+      await uploads.clearOwner("github:alice", async () => undefined);
+
+      expect(fs.readdirSync(uploadDir)).toEqual([]);
+      await expect(uploads.appendChunk("github:alice", session.uploadId, 4, Buffer.alloc(4))).rejects.toThrow("session not found");
+      const replacement = await uploads.beginChunked("github:alice", { fileName: "again.bin", mimeType: "application/octet-stream", size: 64 });
+      await uploads.appendChunk("github:alice", replacement.uploadId, 0, Buffer.alloc(64));
+      await expect(uploads.finishChunked("github:alice", replacement.uploadId)).resolves.toMatchObject({ size: 64 });
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("discards a finalized upload when its completion response was lost", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024, 8, 1);
+      const session = await uploads.beginChunked("github:alice", { fileName: "done.bin", mimeType: "application/octet-stream", size: 8 });
+      await uploads.appendChunk("github:alice", session.uploadId, 0, Buffer.alloc(8));
+      await uploads.finishChunked("github:alice", session.uploadId);
+
+      await uploads.abortChunked("github:alice", session.uploadId);
+
+      expect(fs.readdirSync(uploadDir)).toEqual([]);
+      const reopened = await uploads.beginChunked("github:alice", { fileName: "next.bin", mimeType: "application/octet-stream", size: 8 });
+      await uploads.abortChunked("github:alice", reopened.uploadId);
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
+  it("removes untracked partial uploads instead of holding disk outside the quota", async () => {
+    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
+    try {
+      const uploads = new UploadedFileStore(uploadDir, 1024);
+      const live = await uploads.beginChunked("github:alice", { fileName: "live.bin", mimeType: "application/octet-stream", size: 8 });
+      await uploads.appendChunk("github:alice", live.uploadId, 0, Buffer.alloc(4));
+      fs.writeFileSync(path.join(uploadDir, "restarted.upload.part"), "orphan from a previous process");
+
+      await uploads.cleanupExpired();
+
+      expect(fs.existsSync(path.join(uploadDir, "restarted.upload.part"))).toBe(false);
+      expect(fs.existsSync(path.join(uploadDir, `${live.uploadId}.upload.part`))).toBe(true);
+      await uploads.appendChunk("github:alice", live.uploadId, 4, Buffer.alloc(4));
+      await expect(uploads.finishChunked("github:alice", live.uploadId)).resolves.toMatchObject({ size: 8 });
+    } finally {
+      fs.rmSync(uploadDir, { recursive: true, force: true });
+    }
+  });
+
   it("enforces staged upload quotas and cleans orphaned files", async () => {    const uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), "copilotchat-uploads-"));
     try {
       const uploads = new UploadedFileStore(uploadDir, 1024, 6, 2);

@@ -77,7 +77,7 @@ export class UploadedFileStore {
     this.beginOwnerOperation(ownerId);
     upload.busy = true;
     try {
-      if (chunk.length > 0) await upload.handle.write(chunk, 0, chunk.length, offset);
+      if (chunk.length > 0) await writeFully(upload.handle, chunk, offset);
       upload.received = Math.max(upload.received, offset + chunk.length);
       upload.updatedAt = Date.now();
       return { received: upload.received, size: upload.size };
@@ -125,13 +125,18 @@ export class UploadedFileStore {
 
   async abortChunked(ownerId: string, uploadId: string): Promise<void> {
     const upload = this.chunkedUploads.get(uploadId);
-    if (!upload) return;
+    // A completion whose response never reached the client leaves a finalized upload that the abort must still discard.
+    if (!upload) { await this.delete(ownerId, uploadId).catch(() => undefined); return; }
     if (upload.ownerId !== ownerId) throw new UploadValidationError("Upload session not found.");
     this.chunkedUploads.delete(uploadId);
-    await upload.handle.close().catch(() => undefined);
-    await Promise.all([fs.rm(`${this.dataPath(uploadId)}.part`, { force: true }), fs.rm(this.dataPath(uploadId), { force: true }), fs.rm(this.metadataPath(uploadId), { force: true })]);
-    await this.withQuotaLock(async () => upload.releaseReservation());
-    this.activeUploadIds.delete(uploadId);
+    try {
+      await upload.handle.close().catch(() => undefined);
+      await Promise.all([fs.rm(`${this.dataPath(uploadId)}.part`, { force: true }), fs.rm(this.dataPath(uploadId), { force: true }), fs.rm(this.metadataPath(uploadId), { force: true })]);
+    } finally {
+      // Bookkeeping must be released even when the files cannot be removed, or the reservation is stranded until restart.
+      await this.withQuotaLock(async () => upload.releaseReservation());
+      this.activeUploadIds.delete(uploadId);
+    }
   }
 
   private chunkedUpload(ownerId: string, uploadId: string): ChunkedUpload {
@@ -296,6 +301,10 @@ export class UploadedFileStore {
   }
 
   private async deleteOwnerFiles(ownerId: string): Promise<number> {
+    // Chunked sessions span requests, so the owner looks idle between chunks and must be torn down explicitly.
+    for (const upload of [...this.chunkedUploads.values()]) {
+      if (upload.ownerId === ownerId) await this.abortChunked(ownerId, upload.id);
+    }
     let entries: string[];
     try {
       entries = await fs.readdir(this.rootDir);
@@ -374,6 +383,8 @@ export class UploadedFileStore {
     for (const entry of entries) {
       const uploadId = entry.endsWith(".upload.part") ? entry.slice(0, -".upload.part".length) : entry.endsWith(".json.part") ? entry.slice(0, -".json.part".length) : entry.endsWith(".upload") ? entry.slice(0, -".upload".length) : null;
       if (!uploadId || this.activeUploadIds.has(uploadId) || (entry.endsWith(".upload") && metadataIds.has(uploadId))) continue;
+      // Partial files only belong to an upload in progress, so once untracked they are unreachable and hold disk outside the quota.
+      if (entry.endsWith(".part")) { await fs.rm(path.join(this.rootDir, entry), { force: true }); continue; }
       const stat = await fs.stat(path.join(this.rootDir, entry)).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
       if (stat && stat.mtimeMs < cutoff) await fs.rm(path.join(this.rootDir, entry), { force: true });
     }
@@ -507,6 +518,16 @@ async function hashFile(filePath: string): Promise<string> {
   const hash = createHash("sha256");
   await pipeline(createReadStream(filePath), hash);
   return hash.digest("hex");
+}
+
+/** A positional write may store fewer bytes than requested, which would leave a zero-filled hole the size check cannot see. */
+async function writeFully(handle: FileHandle, chunk: Buffer, position: number): Promise<void> {
+  let written = 0;
+  while (written < chunk.length) {
+    const result = await handle.write(chunk, written, chunk.length - written, position + written);
+    if (result.bytesWritten <= 0) throw new Error("Upload chunk could not be written to disk.");
+    written += result.bytesWritten;
+  }
 }
 
 function formatBytes(value: number): string {
