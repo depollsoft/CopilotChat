@@ -174,7 +174,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .sidebar-row-title { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-row-flags { display: inline-flex; align-items: center; gap: 2px; color: var(--accent); }
 .sidebar-row-meta { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
-.chat-indicator { display: inline-flex; align-items: center; min-height: 20px; padding: 0 7px; border-radius: var(--radius-pill); font-size: calc(10px * var(--text-scale)); font-weight: 900; letter-spacing: .04em; text-transform: uppercase; }
+.chat-indicator { display: inline-flex; align-items: center; min-height: 20px; padding: 0 7px; border-radius: var(--radius-pill); font-size: var(--text-label); font-weight: 900; letter-spacing: .04em; text-transform: uppercase; }
 .chat-indicator.running { position: relative; padding-left: 17px; background: color-mix(in srgb, var(--accent) 16%, var(--surface)); color: var(--accent); }
 .chat-indicator.running::before { content: ""; position: absolute; left: 7px; width: 6px; height: 6px; border-radius: var(--radius-pill); background: var(--accent); animation: pulse-dot 1s ease-in-out infinite; }
 .chat-indicator.unread { background: color-mix(in srgb, var(--accent) 22%, var(--surface)); color: var(--text); }
@@ -248,7 +248,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .model-picker-row-copy strong, .model-picker-row-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-picker-row-copy small { color: var(--text-muted); font-size: calc(11px * var(--text-scale)); }
 .model-picker-row-meta { display: flex; align-items: center; justify-content: flex-end; gap: 5px; color: var(--text-muted); font-size: calc(11px * var(--text-scale)); white-space: nowrap; }
-.model-picker-row-meta em { padding: 2px 6px; border: 1px solid var(--border); border-radius: var(--radius-pill); color: var(--text); font-size: calc(10px * var(--text-scale)); font-style: normal; font-weight: 720; }
+.model-picker-row-meta em { padding: 2px 6px; border: 1px solid var(--border); border-radius: var(--radius-pill); color: var(--text); font-size: var(--text-label); font-style: normal; font-weight: 720; }
 .model-picker-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 12px 14px 14px; border-top: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 78%, var(--surface-muted)); }
 .model-picker-options > strong, .model-picker-options > p { grid-column: 1 / -1; }
 .model-picker-options > p { margin: 0; color: var(--text-muted); }
@@ -342,7 +342,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .pending-turns { display: grid; gap: 8px; justify-items: end; }
 .pending-turn { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 8px; max-width: min(84%, 680px); padding: 9px 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius); background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--text); font-size: calc(13px * var(--text-scale)); }
 .pending-turn.steer { background: color-mix(in srgb, var(--warning) 10%, var(--surface)); }
-.pending-label, .pending-status { padding: 2px 7px; border-radius: var(--radius-pill); background: var(--surface); color: var(--text-muted); font-size: calc(10px * var(--text-scale)); font-weight: 900; letter-spacing: .05em; text-transform: uppercase; }
+.pending-label, .pending-status { padding: 2px 7px; border-radius: var(--radius-pill); background: var(--surface); color: var(--text-muted); font-size: var(--text-label); font-weight: 900; letter-spacing: .05em; text-transform: uppercase; }
 .pending-content { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-body pre, .terminal { max-width: 100%; overflow: auto; overflow-wrap: normal; word-break: normal; white-space: pre; padding: 12px; border-radius: var(--radius); background: var(--code-bg); color: var(--code-text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .msg-body p, .msg-body li, .msg-body blockquote, .msg-body td, .msg-body th { min-width: 0; overflow-wrap: anywhere; }
@@ -392,7 +392,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .tool-group-heading { display: grid; gap: 1px; min-width: 0; }
 .activity-card.tool > summary { min-height: 30px; gap: 6px; padding: 4px 8px; font-size: calc(12px * var(--text-scale)); font-weight: 720; }
 .activity-card.tool .activity-icon { width: 18px; height: 18px; }
-.activity-card.tool .activity-status { padding: 1px 6px; font-size: calc(10px * var(--text-scale)); }
+.activity-card.tool .activity-status { padding: 1px 6px; font-size: var(--text-label); }
 .activity-card.tool .activity-body { padding: 0 8px 8px; font-size: calc(12px * var(--text-scale)); }
 .activity-card.tool .code-block pre { padding: 9px 42px 9px 10px; font-size: calc(12px * var(--text-scale)); line-height: 1.45; }
 .activity-card.tool .code-copy { width: 28px; height: 28px; top: 6px; right: 6px; }
@@ -584,7 +584,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .mini-card { display: grid; gap: 4px; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); }
 .mini-card p { margin: 0; color: var(--text-muted); font-size: calc(13px * var(--text-scale)); }
 .artifact-actions .btn { gap: 4px; }
-.artifact-actions span { font-size: calc(10px * var(--text-scale)); font-weight: 900; letter-spacing: .04em; }
+.artifact-actions span { font-size: var(--text-label); font-weight: 900; letter-spacing: .04em; }
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 40px; padding: 8px 14px; border-radius: var(--radius-pill); background: var(--surface); border: 1px solid var(--border); color: var(--text); font-weight: 700; }
 .btn:hover { border-color: var(--border-strong); background: var(--surface-muted); }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
@@ -717,7 +717,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .welcome-sub { font-size: calc(15px * var(--text-scale)); }
   .welcome-grid { grid-template-columns: 1fr; gap: 8px; }
   .welcome-card { min-height: 0; padding: 14px; }
-  .project-home { padding: 18px max(12px, env(safe-area-inset-right, 0px)) 20px max(12px, env(safe-area-inset-left, 0px)); gap: 16px; }
+  .project-home { padding: 18px max(12px, env(safe-area-inset-right, 0px)) calc(150px + env(safe-area-inset-bottom, 0px)) max(12px, env(safe-area-inset-left, 0px)); gap: 16px; }
   .project-title-block h1 { font-size: calc(32px * var(--text-scale)); }
   .project-summary-grid { grid-template-columns: 1fr; gap: 10px; }
   .project-summary-card { min-height: 0; padding: 12px; border-radius: var(--radius); }

@@ -5,11 +5,23 @@ import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import type { MessageAttachment } from "@copilotchat/shared";
 
-/** Selects auto-approve and clears the consequence confirmation when it appears. */
-async function enableAutoApprove(page: Page): Promise<void> {
+/**
+ * Selects auto-approve and clears the consequence confirmation.
+ *
+ * Pass `expectConfirm: false` only when auto-approve is already enabled, where
+ * re-selecting it is a no-op and no confirmation is offered.
+ */
+async function enableAutoApprove(page: Page, options: { expectConfirm?: boolean } = {}): Promise<void> {
+  const expectConfirm = options.expectConfirm ?? true;
   await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
   const confirm = page.getByRole("button", { name: "Turn on auto-approve" });
-  if (await confirm.isVisible().catch(() => false)) await confirm.click();
+  if (!expectConfirm) {
+    await expect(confirm).toHaveCount(0);
+    return;
+  }
+  await expect(confirm).toBeVisible();
+  await confirm.click();
+  await expect(confirm).toHaveCount(0);
 }
 
 
@@ -142,7 +154,7 @@ test("project model defaults apply to the first turn", async ({ page }, testInfo
 
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile shell coverage only runs in mobile project.");
-  await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
+  await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await contextRing.click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
 });
 
 test("mobile foreground reconnects to an in-progress response", async ({ page, context }, testInfo) => {
@@ -1194,6 +1206,9 @@ test("context menus and popups dismiss when touching elsewhere", async ({ page }
   await page.goto("/");
   await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const contextRing = page.getByRole("button", { name: /Context:/ });
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Context ring check.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(contextRing).toBeVisible();
   await contextRing.click();
   await expect(page.locator("#context-details")).toBeVisible();
   await page.locator(".scroll").click({ position: { x: 12, y: 12 } });
@@ -1436,7 +1451,7 @@ test("agent questions and tool permissions are interactive, with auto-approval",
 
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
-  await enableAutoApprove(page);
+  await enableAutoApprove(page, { expectConfirm: false });
   await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please request permission.");
   await page.getByRole("button", { name: "Send" }).click();

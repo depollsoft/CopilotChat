@@ -156,7 +156,7 @@ The palette is restrained product-neutral with a rare teal accent for action and
 
 **The Tonal Layer Rule.** Depth starts with `--surface`, `--surface-muted`, `--sidebar`, and `--border`; shadows come after tonal hierarchy, not before it.
 
-**The Token Floor Rule.** Radius, spacing, and small-label type come from tokens, never literals. `styles.css` exposes `--radius-xs|sm|md(--radius)|lg|xl|pill`, `--space-2xs|xs|sm|md|lg|xl`, `--text-label|meta|caption|body`, `--measure`, and `--hit`. Functional text never renders below 11px, and every interactive control reaches a `--hit` (44px) pointer target.
+**The Token Floor Rule.** Radius and small-label type come from tokens, never literals. `styles.css` exposes `--radius-xs|sm|md(--radius)|lg|xl|pill`, `--space-2xs|xs|sm|md|lg|xl`, `--text-label|meta|caption|body`, `--measure`, and `--hit`. Label-tier text renders at `--text-label` or above, so no functional label falls below 11px. Primary navigation, header, and composer controls reach a `--hit` (44px) pointer target; compact in-content controls keep their visual size and extend their hit area to `--hit` with a transparent `::after`. Spacing is migrating onto `--space-*`; new rules should use the tokens rather than literals.
 
 ## 3. Typography
 

@@ -53,4 +53,22 @@ describe("titleFromContent", () => {
   it("keeps the six-word bound", () => {
     expect(titleFromContent("one two three four five six seven eight")).toBe("one two three four five six");
   });
+  it("leaves developer identifiers intact", () => {
+    expect(titleFromContent("Why does my_var_name crash?")).toBe("Why does my_var_name crash?");
+    expect(titleFromContent("What is __init__ for?")).toBe("What is __init__ for?");
+    expect(titleFromContent("Open _file_name.txt")).toBe("Open _file_name.txt");
+    expect(titleFromContent("value is 5_000_000")).toBe("value is 5_000_000");
+    expect(titleFromContent("Fix snake_case in the parser")).toBe("Fix snake_case in the parser");
+  });
+  it("still strips genuine underscore emphasis", () => {
+    expect(titleFromContent("Plan the _next_ release")).toBe("Plan the next release");
+    expect(titleFromContent("__really important__ fix")).toBe("really important fix");
+  });
+  it("stays fast on adversarial input", () => {
+    const started = Date.now();
+    titleFromContent("[".repeat(80_000) + "]x");
+    titleFromContent("*".repeat(80_000));
+    titleFromContent("`".repeat(80_000));
+    expect(Date.now() - started).toBeLessThan(500);
+  });
 });
