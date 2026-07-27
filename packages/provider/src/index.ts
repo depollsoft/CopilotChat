@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { ChatRole, McpServer, PermissionMode, ProviderStatus, SkillManifest } from "@copilotchat/shared";
+import { stripMarkdown } from "@copilotchat/shared";
 import { CopilotClient, RuntimeConnection } from "@github/copilot-sdk";
 import type { CopilotClientOptions, CopilotSession, MCPServerConfig, MessageOptions, ModelInfo, PermissionHandler, SessionConfig, SessionEvent, SessionFsFileInfo, SessionFsProvider, Tool } from "@github/copilot-sdk";
 
@@ -742,7 +743,7 @@ function subagentEventId(event: SdkSessionEvent): string { return eventAgentId(e
 function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 function formatToolOutput(value: unknown): string { try { return JSON.stringify(value); } catch { return String(value); } }
 function summarizeInline(value?: string | null): string { const normalized = value?.replace(/\s+/g, " ").trim() ?? ""; return normalized.length > 160 ? `${normalized.slice(0, 157)}...` : normalized; }
-function normalizeConversationTitle(value: string): string { return value.replace(/\s+/g, " ").trim().replace(/^["'`]+|["'`]+$/g, "").split(" ").filter(Boolean).slice(0, 6).join(" "); }
+function normalizeConversationTitle(value: string): string { return stripMarkdown(value).replace(/\s+/g, " ").trim().replace(/^["'`]+|["'`]+$/g, "").split(" ").filter(Boolean).slice(0, 6).join(" "); }
 function suggestConversationTitle(value: string): string { return normalizeConversationTitle(value.replace(/^(please\s+)?(title|rename)\s+(this\s+)?(conversation|chat)\s*(about|to)?\s*/i, "")); }
 function chunkText(text: string, size: number): string[] { const chunks: string[] = []; for (let i = 0; i < text.length; i += size) chunks.push(text.slice(i, i + size)); return chunks; }
 function delay(ms: number): Promise<void> { return new Promise((resolve) => setTimeout(resolve, ms)); }

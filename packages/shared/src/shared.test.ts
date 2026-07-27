@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAic, formatMemoryContext, nanoAiuPerAic } from "./index.js";
+import { formatAic, formatMemoryContext, nanoAiuPerAic, titleFromContent } from "./index.js";
 
 describe("formatAic", () => {
   it("formats nano-AI units as AI credits", () => {
@@ -35,5 +35,22 @@ describe("formatMemoryContext", () => {
 
     expect(context.length).toBeLessThanOrEqual(16_000);
     expect(context).toContain("memories omitted");
+  });
+});
+
+describe("titleFromContent", () => {
+  it("strips markdown so derived chat titles read as plain text", () => {
+    expect(titleFromContent("Show me a **markdown** sample")).toBe("Show me a markdown sample");
+    expect(titleFromContent("## Plan the _next_ release")).toBe("Plan the next release");
+    expect(titleFromContent("- Fix `parseArgs` in the CLI")).toBe("Fix parseArgs in the CLI");
+    expect(titleFromContent("Read [the guide](https://example.com) first")).toBe("Read the guide first");
+    expect(titleFromContent("~~Drop~~ Keep the cache")).toBe("Drop Keep the cache");
+  });
+  it("falls back when a message carries no prose", () => {
+    expect(titleFromContent("```ts\nconst a = 1;\n```")).toBe("New chat");
+    expect(titleFromContent("   ")).toBe("New chat");
+  });
+  it("keeps the six-word bound", () => {
+    expect(titleFromContent("one two three four five six seven eight")).toBe("one two three four five six");
   });
 });

@@ -353,8 +353,24 @@ export type RunWorkspaceCommandRequest = z.infer<typeof runWorkspaceCommandReque
 export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1).max(1024), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
 export type ImportPreviewRequest = z.infer<typeof importPreviewRequestSchema>;
 
+/** Removes Markdown syntax so derived labels such as chat titles read as plain text. */
+export function stripMarkdown(value: string): string {
+  return value
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s{0,3}>\s?/gm, "")
+    .replace(/^\s{0,3}(?:[-*+]|\d+\.)\s+/gm, "")
+    .replace(/(\*\*\*|___)(.+?)\1/g, "$2")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(\*|_)(.+?)\1/g, "$2")
+    .replace(/~~(.+?)~~/g, "$1");
+}
+
 export function titleFromContent(content: string): string {
-  const compact = content.replace(/\s+/g, " ").trim();
+  const compact = stripMarkdown(content).replace(/\s+/g, " ").trim();
   if (!compact) return "New chat";
   return compact.split(" ").slice(0, 6).join(" ");
 }
