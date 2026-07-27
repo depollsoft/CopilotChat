@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
-import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { Readable } from "node:stream";
@@ -28,7 +27,7 @@ export class UploadOffsetError extends Error {
 }
 
 /** An upload still being assembled from chunks, so it survives request boundaries imposed by proxy body limits. */
-type ChunkedUpload = { id: string; ownerId: string; fileName: string; mimeType: string; size: number; received: number; handle: FileHandle; releaseReservation: () => void; updatedAt: number; busy: boolean };
+type ChunkedUpload = { id: string; ownerId: string; fileName: string; mimeType: string; size: number; received: number; releaseReservation: () => void; updatedAt: number; busy: boolean };
 
 export class UploadedFileStore {
   private readonly claimsByUpload = new Map<string, { claimId: string; ownerId: string }>();
@@ -55,8 +54,9 @@ export class UploadedFileStore {
       await fs.mkdir(this.rootDir, { recursive: true });
       releaseReservation = await this.reserve(ownerId, input.size);
       this.activeUploadIds.add(id);
-      const handle = await fs.open(`${this.dataPath(id)}.part`, "wx");
-      this.chunkedUploads.set(id, { id, ownerId, fileName, mimeType: input.mimeType, size: input.size, received: 0, handle, releaseReservation, updatedAt: Date.now(), busy: false });
+      // Sessions idle between requests, so the descriptor is opened per chunk instead of held for the whole upload.
+      await fs.writeFile(`${this.dataPath(id)}.part`, "", { flag: "wx" });
+      this.chunkedUploads.set(id, { id, ownerId, fileName, mimeType: input.mimeType, size: input.size, received: 0, releaseReservation, updatedAt: Date.now(), busy: false });
       return { uploadId: id, received: 0 };
     } catch (error) {
       this.activeUploadIds.delete(id);
@@ -77,12 +77,12 @@ export class UploadedFileStore {
     this.beginOwnerOperation(ownerId);
     upload.busy = true;
     try {
-      if (chunk.length > 0) await writeFully(upload.handle, chunk, offset);
+      if (chunk.length > 0) await writeChunkAt(`${this.dataPath(uploadId)}.part`, chunk, offset);
       upload.received = Math.max(upload.received, offset + chunk.length);
       upload.updatedAt = Date.now();
       return { received: upload.received, size: upload.size };
     } catch (error) {
-      await this.abortChunked(ownerId, uploadId).catch(() => undefined);
+      await this.discardChunked(upload).catch(() => undefined);
       throw error;
     } finally {
       upload.busy = false;
@@ -99,11 +99,9 @@ export class UploadedFileStore {
     const temporaryPath = `${this.dataPath(uploadId)}.part`;
     try {
       if (upload.received !== upload.size) throw new UploadValidationError(`Upload size mismatch: expected ${upload.size} bytes but received ${upload.received}.`);
-      await upload.handle.close();
       const stat = await fs.stat(temporaryPath);
       if (stat.size !== upload.size) throw new UploadValidationError(`Upload size mismatch: expected ${upload.size} bytes but stored ${stat.size}.`);
       const uploaded: UploadedFile = { id: uploadId, ownerId, fileName: upload.fileName, mimeType: upload.mimeType, size: upload.size, sha256: await hashFile(temporaryPath), createdAt: new Date().toISOString() };
-      this.chunkedUploads.delete(uploadId);
       await this.withQuotaLock(async () => {
         await fs.rename(temporaryPath, this.dataPath(uploadId));
         const metadataTemporaryPath = `${this.metadataPath(uploadId)}.part`;
@@ -111,10 +109,11 @@ export class UploadedFileStore {
         await fs.rename(metadataTemporaryPath, this.metadataPath(uploadId));
         upload.releaseReservation();
       });
+      // The session stays reachable until the metadata is published, so a concurrent abort cannot slip between the two.
+      this.chunkedUploads.delete(uploadId);
       return { id: uploaded.id, uploadId: uploaded.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size };
     } catch (error) {
-      this.chunkedUploads.set(uploadId, upload);
-      await this.abortChunked(ownerId, uploadId).catch(() => undefined);
+      await this.discardChunked(upload).catch(() => undefined);
       throw error;
     } finally {
       upload.busy = false;
@@ -128,14 +127,18 @@ export class UploadedFileStore {
     // A completion whose response never reached the client leaves a finalized upload that the abort must still discard.
     if (!upload) { await this.delete(ownerId, uploadId).catch(() => undefined); return; }
     if (upload.ownerId !== ownerId) throw new UploadValidationError("Upload session not found.");
-    this.chunkedUploads.delete(uploadId);
+    if (upload.busy) throw new UploadValidationError("Another chunk of this upload is still being written.");
+    await this.discardChunked(upload);
+  }
+
+  private async discardChunked(upload: ChunkedUpload): Promise<void> {
+    this.chunkedUploads.delete(upload.id);
     try {
-      await upload.handle.close().catch(() => undefined);
-      await Promise.all([fs.rm(`${this.dataPath(uploadId)}.part`, { force: true }), fs.rm(this.dataPath(uploadId), { force: true }), fs.rm(this.metadataPath(uploadId), { force: true })]);
+      await Promise.all([fs.rm(`${this.dataPath(upload.id)}.part`, { force: true }), fs.rm(this.dataPath(upload.id), { force: true }), fs.rm(`${this.metadataPath(upload.id)}.part`, { force: true }), fs.rm(this.metadataPath(upload.id), { force: true })]);
     } finally {
       // Bookkeeping must be released even when the files cannot be removed, or the reservation is stranded until restart.
       await this.withQuotaLock(async () => upload.releaseReservation());
-      this.activeUploadIds.delete(uploadId);
+      this.activeUploadIds.delete(upload.id);
     }
   }
 
@@ -303,7 +306,7 @@ export class UploadedFileStore {
   private async deleteOwnerFiles(ownerId: string): Promise<number> {
     // Chunked sessions span requests, so the owner looks idle between chunks and must be torn down explicitly.
     for (const upload of [...this.chunkedUploads.values()]) {
-      if (upload.ownerId === ownerId) await this.abortChunked(ownerId, upload.id);
+      if (upload.ownerId === ownerId) await this.discardChunked(upload);
     }
     let entries: string[];
     try {
@@ -341,7 +344,7 @@ export class UploadedFileStore {
     const cutoff = Date.now() - this.chunkSessionTtlMs;
     for (const upload of [...this.chunkedUploads.values()]) {
       if (upload.busy || upload.updatedAt > cutoff) continue;
-      await this.abortChunked(upload.ownerId, upload.id).catch(() => undefined);
+      await this.discardChunked(upload).catch(() => undefined);
     }
   }
 
@@ -521,12 +524,17 @@ async function hashFile(filePath: string): Promise<string> {
 }
 
 /** A positional write may store fewer bytes than requested, which would leave a zero-filled hole the size check cannot see. */
-async function writeFully(handle: FileHandle, chunk: Buffer, position: number): Promise<void> {
-  let written = 0;
-  while (written < chunk.length) {
-    const result = await handle.write(chunk, written, chunk.length - written, position + written);
-    if (result.bytesWritten <= 0) throw new Error("Upload chunk could not be written to disk.");
-    written += result.bytesWritten;
+async function writeChunkAt(filePath: string, chunk: Buffer, position: number): Promise<void> {
+  const handle = await fs.open(filePath, "r+");
+  try {
+    let written = 0;
+    while (written < chunk.length) {
+      const result = await handle.write(chunk, written, chunk.length - written, position + written);
+      if (result.bytesWritten <= 0) throw new Error("Upload chunk could not be written to disk.");
+      written += result.bytesWritten;
+    }
+  } finally {
+    await handle.close();
   }
 }
 

@@ -394,8 +394,9 @@ app.post(`${apiPrefix}/workspaces/:workspaceId/commands`, async (request) => { c
 app.post(`${apiPrefix}/uploads`, { bodyLimit: config.uploadLimitBytes }, async (request, reply) => {
   const owner = ownerFor(request);
   const parsed = z.object({ fileName: z.string().min(1).max(1024), mimeType: z.string().min(1).max(255).default("application/octet-stream"), size: z.coerce.number().int().nonnegative().max(config.uploadLimitBytes) }).safeParse(request.query);
-  if (!parsed.success) { replyUploadMetadataError(reply, parsed.error); return; }
-  if (!(request.body instanceof Readable)) { reply.code(400).send({ error: "Upload body must be a binary stream." }); return; }
+  // Every rejection here happens before the body is read, so the socket keeps unread bytes unless the connection closes.
+  if (!parsed.success) { reply.header("connection", "close"); replyUploadMetadataError(reply, parsed.error); return; }
+  if (!(request.body instanceof Readable)) { reply.header("connection", "close").code(400).send({ error: "Upload body must be a binary stream." }); return; }
   try {
     return await uploadedFiles.create(owner.id, parsed.data, request.body);
   } catch (error) { replyStreamedUploadError(reply, error); return; }
@@ -414,8 +415,8 @@ app.post(`${apiPrefix}/uploads/sessions/:uploadId/chunks`, { bodyLimit: config.u
   const owner = ownerFor(request);
   const params = z.object({ uploadId: z.string().min(1) }).parse(request.params);
   const query = z.object({ offset: z.coerce.number().int().nonnegative() }).safeParse(request.query);
-  if (!query.success) { reply.code(400).send({ error: "Upload chunks require a numeric offset." }); return; }
-  if (!(request.body instanceof Readable)) { reply.code(400).send({ error: "Upload chunk body must be a binary stream." }); return; }
+  if (!query.success) { reply.header("connection", "close").code(400).send({ error: "Upload chunks require a numeric offset." }); return; }
+  if (!(request.body instanceof Readable)) { reply.header("connection", "close").code(400).send({ error: "Upload chunk body must be a binary stream." }); return; }
   try {
     const chunk = await readChunkBody(request.body, config.uploadChunkBytes);
     return await uploadedFiles.appendChunk(owner.id, params.uploadId, query.data.offset, chunk);

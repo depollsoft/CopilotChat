@@ -16,6 +16,7 @@ type Theme = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
 type Tab = "preferences" | "context" | "skills" | "tools" | "code";
 type SseEvent = { event: string; data: unknown };
+type StreamHooks = { onOpen?: () => void; onChunk?: () => void };
 const API_TOKEN_KEY = "copilotchat.apiToken";
 const MODEL_KEY = "copilotchat.model";
 const EFFORT_KEY = "copilotchat.reasoningEffort";
@@ -34,6 +35,16 @@ const UPLOAD_CHUNK_ATTEMPTS = 8;
 const DEFAULT_TEXT_SCALE = 0.95;
 const IMPORT_ASSISTANT_SKILL_ID = "import-assistant";
 const MODEL_REFRESH_COOLDOWN_MS = 60_000;
+const STREAM_RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 4000, 8000];
+const STREAM_RECONNECT_LIMIT = 24;
+/** A suspended app leaves sockets that accept a request but never answer, so cap how long an attempt may stay unopened. */
+const STREAM_OPEN_TIMEOUT_MS = 8_000;
+/** Heartbeats arrive every 15s, so silence for longer than this means the socket died without an EOF. */
+const STREAM_IDLE_TIMEOUT_MS = 40_000;
+/** Only a connection that stays up this long earns a fresh retry budget. */
+const STREAM_HEALTHY_MS = 20_000;
+/** An outage should not burn the retry budget, but a stuck `navigator.onLine` must not stall recovery either. */
+const STREAM_OFFLINE_WAIT_MS = 30_000;
 const EMPTY_PROVIDER: ProviderStatus = { id: "unknown", label: "Loading", available: false, details: "", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: undefined };
 const STARTERS = [
   ["Search the web", "Get up-to-date answers using Copilot tools.", "Search the web for the latest GitHub Copilot SDK release notes and summarize the highlights."],
@@ -112,6 +123,7 @@ function App(): React.ReactElement {
   const [showJumpToLive, setShowJumpToLive] = useState(false);
   const [modelsRefreshing, setModelsRefreshing] = useState(false);
   const chatStreamsRef = useRef(new ChatStreamRegistry());
+  const loadedChatIdRef = useRef<string | null>(null);
   const runningChatIdsRef = useRef<Set<string>>(new Set());
   const stateSnapshotStartedAtRef = useRef(0);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -234,7 +246,7 @@ function App(): React.ReactElement {
   }, [apiToken]);
   useEffect(() => { if (selectedChat) { markChatSeen(selectedChat.id, selectedChat.updatedAt); setActiveProjectId(selectedChat.projectId); setActiveWorkspaceId(selectedChat.workspaceId); if (selectedChat.model) setSelectedModel(selectedChat.model); setReasoningEffort(selectedChat.reasoningEffort && EFFORT_OPTIONS.includes(selectedChat.reasoningEffort) ? selectedChat.reasoningEffort : "default"); setContextTier(selectedChat.contextTier ?? "default"); } }, [selectedChat]);
   useEffect(() => {
-    if (!selectedChatId) { setBusy(false); setLiveUsage(emptyChatUsage); setMessages([]); clearStreamingView(); return; }
+    if (!selectedChatId) { loadedChatIdRef.current = null; setBusy(false); setLiveUsage(emptyChatUsage); setMessages([]); clearStreamingView(); return; }
     const chatId = selectedChatId;
     const alreadyStreaming = chatStreamsRef.current.has(chatId);
     setBusy(alreadyStreaming || runningChatIdsRef.current.has(chatId));
@@ -312,7 +324,9 @@ function App(): React.ReactElement {
   async function editAndContinue(messageId: string, content: string): Promise<void> { const trimmed = content.trim(); if (!selectedChat || !trimmed || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setEditingMessage(null); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index + 1).map((message) => message.id === messageId ? { ...message, content: trimmed, metadata: { ...message.metadata, editedAt: new Date().toISOString() } } : message)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/edit`, { content: trimmed, skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function retryResponse(messageId: string): Promise<void> { if (!selectedChat || busy) return; const index = messages.findIndex((message) => message.id === messageId); if (index < 0) return; activateLiveScroll(); setBusy(true); setError(null); clearStreamingView(); setMessages(messages.slice(0, index)); const controller = new AbortController(); await streamChatResponse(selectedChat.id, `/api/chats/${selectedChat.id}/messages/${messageId}/retry`, { skillIds: selectedSkillIds, model: selectedModel, reasoningEffort, contextTier, permissionMode }, controller); }
   async function loadChatAndReconnect(chatId: string, controller: AbortController): Promise<void> {
-    clearStreamingView();
+    // Reattaching to the chat already on screen must not blank its running turn; only a chat switch should.
+    if (loadedChatIdRef.current !== chatId) clearStreamingView();
+    loadedChatIdRef.current = chatId;
     let networkFailures = 0;
     while (!controller.signal.aborted) {
       try {
@@ -350,29 +364,78 @@ function App(): React.ReactElement {
   /** True while `chatId` is the chat on screen, so only its stream may write to the visible response. */
   function isVisibleChat(chatId: string): boolean { return selectedChatIdRef.current === chatId; }
   function clearStreamingView(): void { setStreamingText(""); setStreamingActivities([]); setPendingInteractions([]); setPendingTurns([]); }
-  async function syncChatMessages(chatId: string): Promise<void> {
+  async function syncChatMessages(chatId: string, controller?: AbortController): Promise<void> {
     if (!isVisibleChat(chatId)) return;
     const loaded = await api<ChatMessage[]>(`/api/chats/${chatId}/messages`, {}, apiToken);
-    if (isVisibleChat(chatId)) setMessages(loaded);
+    // This fetch is not tied to the stream, so a chat switch or a replacement stream during it has to win.
+    if (!isVisibleChat(chatId)) return;
+    if (controller && !chatStreamsRef.current.isLive(chatId, controller)) return;
+    setMessages(loaded);
   }
   async function streamChatResponse(chatId: string, url: string, body: unknown, controller: AbortController, method = "POST", rethrowNetworkErrors = false, onAccepted?: () => void): Promise<void> {
     chatStreamsRef.current.begin(chatId, controller);
     addRunningChat(chatId);
     let completed = false;
     let idle = false;
+    let attempts = 0;
+    let resync = false;
+    let target: { url: string; body: unknown; method: string; onAccepted?: () => void } = { url, body, method, onAccepted };
     try {
-      for await (const event of streamSse(url, body, controller.signal, apiToken, method, onAccepted)) {
-        const outcome = await handleStreamEvent(chatId, event);
-        if (outcome !== "continue") { completed = true; idle = outcome === "idle"; break; }
+      while (!completed) {
+        if (controller.signal.aborted) return;
+        const attempt = new AbortController();
+        const abortAttempt = (): void => attempt.abort();
+        controller.signal.addEventListener("abort", abortAttempt);
+        const state = { opened: false, openedAt: 0, expired: null as "open" | "idle" | null };
+        let timer = window.setTimeout(() => { state.expired = "open"; attempt.abort(); }, STREAM_OPEN_TIMEOUT_MS);
+        const armIdleTimer = (): void => { window.clearTimeout(timer); timer = window.setTimeout(() => { state.expired = "idle"; attempt.abort(); }, STREAM_IDLE_TIMEOUT_MS); };
+        try {
+          for await (const event of streamSse(target.url, target.body, attempt.signal, apiToken, target.method, target.onAccepted, {
+            onOpen: () => { state.opened = true; state.openedAt = Date.now(); armIdleTimer(); },
+            onChunk: () => { armIdleTimer(); if (attempts > 0 && Date.now() - state.openedAt >= STREAM_HEALTHY_MS) attempts = 0; },
+          })) {
+            // A queued or steered turn can finish while the socket is dead and its saved message arrives
+            // exactly once, so a stream that just reattached has to pull the transcript back in line.
+            if (resync) { resync = false; await syncChatMessages(chatId, controller); if (!chatStreamsRef.current.isLive(chatId, controller)) return; }
+            const outcome = await handleStreamEvent(chatId, event, controller);
+            if (outcome !== "continue") { completed = true; idle = outcome === "idle"; break; }
+          }
+        } catch (e) {
+          if (controller.signal.aborted) return;
+          // A timeout only aborts this attempt, so it has to become a real failure instead of a silent cancel.
+          const failure = state.expired && isAbortError(e) ? new Error(state.expired === "open" ? "Network error: timed out connecting to this response." : "Network error: this response stream went silent.") : e;
+          // A fatal error is the server's own answer, and a POST that never opened may still have started a
+          // turn, so retrying either one is wrong.
+          if (failure instanceof FatalStreamError || isAbortError(failure) || (!state.opened && target.method !== "GET") || attempts >= STREAM_RECONNECT_LIMIT) throw failure;
+        } finally {
+          window.clearTimeout(timer);
+          controller.signal.removeEventListener("abort", abortAttempt);
+        }
+        if (completed) break;
+        if (controller.signal.aborted) return;
+        // The transport ended without a terminal event, so the response is probably still running server-side.
+        // Reattaching keeps the turn on screen instead of collapsing the chat back to an idle state.
+        if (attempts >= STREAM_RECONNECT_LIMIT) throw new Error("Network error: lost the connection to this response.");
+        target = { url: `/api/chats/${chatId}/active-response`, body: undefined, method: "GET" };
+        resync = true;
+        const offline = !navigator.onLine;
+        await waitForRetry(STREAM_RECONNECT_DELAYS_MS[Math.min(attempts, STREAM_RECONNECT_DELAYS_MS.length - 1)] ?? 8_000, controller.signal);
+        // Waiting out an outage keeps it from burning the retry budget, but a stuck `onLine` flag must not
+        // strand the stream, so the wait is bounded and a retry happens either way.
+        if (offline) await waitUntilOnline(controller.signal, STREAM_OFFLINE_WAIT_MS);
+        // Both waits resolve immediately once aborted, and an abort listener added afterwards never fires,
+        // so ownership has to be rechecked before another attempt may open.
+        if (controller.signal.aborted) return;
+        // Time spent offline is not the server's fault, so it must not burn the retry budget.
+        if (!offline) attempts += 1;
       }
-      if (rethrowNetworkErrors && !completed && !controller.signal.aborted) throw new Error("Network error: the response stream ended before completion.");
       if (!chatStreamsRef.current.isLive(chatId, controller)) return;
       if (isVisibleChat(chatId)) clearStreamingView();
-      await syncChatMessages(chatId);
+      await syncChatMessages(chatId, controller);
       await refreshState();
       if (!idle) notify("CopilotChat", "Response ready");
     } catch (e) {
-      if ((e as Error).name !== "AbortError" && chatStreamsRef.current.isLive(chatId, controller)) {
+      if (!isAbortError(e) && chatStreamsRef.current.isLive(chatId, controller)) {
         removeRunningChat(chatId);
         const message = toErr(e);
         if (rethrowNetworkErrors && isNetworkError(message)) throw e;
@@ -386,7 +449,7 @@ function App(): React.ReactElement {
     }
   }
   /** "idle" reports a stream that found no response running, so it is not a completion worth announcing. */
-  async function handleStreamEvent(chatId: string, event: SseEvent): Promise<"continue" | "done" | "idle"> {
+  async function handleStreamEvent(chatId: string, event: SseEvent, controller: AbortController): Promise<"continue" | "done" | "idle"> {
     const visible = isVisibleChat(chatId);
     if (event.event === "snapshot") {
       if (!visible) return "continue";
@@ -402,21 +465,21 @@ function App(): React.ReactElement {
     if (event.event === "usage") { if (visible) setLiveUsage(readChatUsage(event.data)); return "continue"; }
     if (event.event === "pending") { if (visible) { setBusy(true); setPendingTurns(readPendingTurns((event.data as { pendingTurns?: unknown }).pendingTurns)); } return "continue"; }
     if (event.event === "message") {
-      await syncChatMessages(chatId);
-      if (isVisibleChat(chatId)) { setStreamingText(""); setStreamingActivities([]); }
+      await syncChatMessages(chatId, controller);
+      if (isVisibleChat(chatId) && chatStreamsRef.current.isLive(chatId, controller)) { setStreamingText(""); setStreamingActivities([]); }
       return "continue";
     }
     if (event.event === "interaction") { if (visible) { setBusy(true); setPendingInteractions(readInteractions((event.data as { interactions?: unknown }).interactions)); } return "continue"; }
     if (event.event === "activity") { if (visible) { setBusy(true); setStreamingActivities(readActivities((event.data as { activities?: unknown }).activities)); } return "continue"; }
     if (event.event === "delta") { if (visible) { setBusy(true); setStreamingText((t) => t + ((event.data as { text?: string }).text ?? "")); } return "continue"; }
     if (event.event === "artifact") { void refreshState(); if (visible) setToast("Artifact created"); return "continue"; }
-    if (event.event === "error") throw new Error((event.data as { message?: string }).message ?? "Message failed");
+    if (event.event === "error") throw new FatalStreamError((event.data as { message?: string }).message ?? "Message failed");
     if (event.event === "done") {
       const data = event.data as { active?: boolean; cancelled?: boolean } | undefined;
       if (data?.active === false) return "idle";
       if (data?.cancelled && visible) setToast("Response stopped");
       if (isVisibleChat(chatId)) { setPendingInteractions([]); setPendingTurns([]); }
-      await syncChatMessages(chatId);
+      await syncChatMessages(chatId, controller);
       return "done";
     }
     return "continue";
@@ -899,6 +962,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [pendingUploads, setPendingUploads] = useState(0);
   const [uploadProgress, setUploadProgress] = useState<{ files: number; uploaded: number; total: number } | null>(null);
+  const uploadBatchesRef = useRef<Set<UploadBatch>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   const [openPicker, setOpenPicker] = useState<ComposerPicker | null>(null);
   const [slashIndex, setSlashIndex] = useState(0);
@@ -926,21 +990,22 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
     const nextFiles = [...files];
     if (nextFiles.length === 0) return;
     const total = nextFiles.reduce((sum, file) => sum + file.size, 0);
-    const uploadedByFile = new Map<number, number>();
+    // Attaching stays enabled while uploads run, so progress is aggregated across every batch still in flight.
+    const batch: UploadBatch = { files: nextFiles.length, total, uploadedByFile: new Map<number, number>() };
     setPendingUploads((current) => current + nextFiles.length);
-    if (total > SINGLE_REQUEST_UPLOAD_LIMIT) setUploadProgress({ files: nextFiles.length, uploaded: 0, total });
+    if (total > SINGLE_REQUEST_UPLOAD_LIMIT) { uploadBatchesRef.current.add(batch); setUploadProgress(totalUploadProgress(uploadBatchesRef.current)); }
     try {
       const results = await Promise.allSettled(nextFiles.map((file, index) => p.onUploadFile(file, (bytes) => {
-        uploadedByFile.set(index, bytes);
-        const uploaded = [...uploadedByFile.values()].reduce((sum, value) => sum + value, 0);
-        setUploadProgress((current) => current ? { ...current, uploaded } : current);
+        batch.uploadedByFile.set(index, bytes);
+        setUploadProgress(totalUploadProgress(uploadBatchesRef.current));
       })));
       const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
       const failed = results.flatMap((result) => result.status === "rejected" ? [toErr(result.reason)] : []);
       if (uploaded.length > 0) setAttachments((current) => [...current, ...uploaded]);
       if (failed.length > 0) setAttachmentError(failed.length === 1 ? failed[0]! : `${failed.length} files failed to upload. ${failed[0]}`);
     } finally {
-      setUploadProgress(null);
+      uploadBatchesRef.current.delete(batch);
+      setUploadProgress(totalUploadProgress(uploadBatchesRef.current));
       setPendingUploads((current) => Math.max(0, current - nextFiles.length));
     }
   }
@@ -1255,7 +1320,7 @@ function routeSegment(path: string, prefix: string): string | null { const segme
 function appPathForSelection(chatId: string | null, projectId: string | null): string { if (chatId) return `${CHAT_ROUTE_PREFIX}${encodeURIComponent(chatId)}`; return projectId ? `${PROJECT_ROUTE_PREFIX}${encodeURIComponent(projectId)}` : "/"; }
 function syncAppUrl(path: string): void { if (location.pathname === path) return; history.replaceState({ copilotChatBackGuard: true }, "", path); }
 async function api<T>(url:string,init:{method?:string;body?:unknown;raw?:boolean}={},token=localStorage.getItem(API_TOKEN_KEY)??""):Promise<T>{const method=init.method??"GET";const headers:Record<string,string>={};if(init.body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:init.body!==undefined?JSON.stringify(init.body):undefined});if(!res.ok)throw new Error(httpErrorMessage(res.status,await res.text()));return init.raw?undefined as T:await res.json() as T;}
-async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",onAccepted?:()=>void):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new Error(httpErrorMessage(res.status,await res.text()));onAccepted?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";while(true){const{done,value}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}
+async function* streamSse(url:string,body:unknown,signal:AbortSignal,token:string,method="POST",onAccepted?:()=>void,hooks:StreamHooks={}):AsyncIterable<SseEvent>{const headers:Record<string,string>={};if(body!==undefined)headers["Content-Type"]="application/json";if(["POST","PATCH","DELETE"].includes(method))headers["X-CopilotChat-CSRF"]="1";if(token)headers.Authorization=`Bearer ${token}`;const res=await fetch(url,{method,headers:Object.keys(headers).length?headers:undefined,body:body!==undefined?JSON.stringify(body):undefined,signal});if(!res.ok||!res.body)throw new FatalStreamError(httpErrorMessage(res.status,await res.text()));onAccepted?.();hooks.onOpen?.();const reader=res.body.getReader();const dec=new TextDecoder();let buf="";try{while(true){const{done,value}=await reader.read();if(done)break;hooks.onChunk?.();buf+=dec.decode(value,{stream:true});const parts=buf.split("\n\n");buf=parts.pop()??"";for(const part of parts){const ev=parseSse(part);if(ev)yield ev;}}}finally{void reader.cancel().catch(()=>undefined);}}
 function parseSse(chunk:string):SseEvent|null{const lines=chunk.split("\n");const event=lines.find(l=>l.startsWith("event:"))?.slice(6).trim();const data=lines.find(l=>l.startsWith("data:"))?.slice(5).trim();return event&&data?{event,data:JSON.parse(data) as unknown}:null;}
 function readTheme(): Theme { const saved = localStorage.getItem("copilotchat.theme"); return saved === "system" || saved === "light" || saved === "dark" ? saved : "system"; }
 function readSystemTheme(): ResolvedTheme { return window.matchMedia(SYSTEM_THEME_QUERY).matches ? "dark" : "light"; }
@@ -1287,9 +1352,10 @@ async function uploadWholeFile(file: File, token: string, onProgress?: (bytes: n
  * never see an oversized request. The server reassembles the chunks into one staged file for the agent to open.
  */
 async function uploadFileInChunks(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
-  const session = await api<{ uploadId: string; received: number; chunkBytes: number }>("/api/uploads/sessions", { method: "POST", body: { fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: file.size } }, token);
+  const session = await uploadJson<{ uploadId: string; received: number; chunkBytes: number }>("/api/uploads/sessions", { fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: file.size }, token, file);
   let offset = session.received;
-  let chunkBytes = Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.min(session.chunkBytes, SINGLE_REQUEST_UPLOAD_LIMIT));
+  // The server advertises a chunk size its own limit accepts, so it is honored as-is and only reduced after a proxy 413.
+  let chunkBytes = Math.max(MIN_UPLOAD_CHUNK_BYTES, session.chunkBytes);
   let attempts = 0;
   try {
     while (offset < file.size) {
@@ -1306,21 +1372,49 @@ async function uploadFileInChunks(file: File, token: string, onProgress?: (bytes
         continue;
       }
       if (response.status === 413 && chunkBytes > MIN_UPLOAD_CHUNK_BYTES) { chunkBytes = Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.floor(chunkBytes / 2)); continue; }
-      if (response.status === 409) { offset = readResumeOffset(await response.text()) ?? offset; continue; }
-      if (!response.ok) throw new Error(uploadErrorMessage(response.status, await response.text(), file));
+      if (!response.ok) {
+        const body = await response.text();
+        // Only a 409 that reports how much the server holds is resumable; anything else is a real failure to surface.
+        const resumeOffset = response.status === 409 ? readResumeOffset(body) : null;
+        if (resumeOffset === null) throw new Error(uploadErrorMessage(response.status, body, file));
+        offset = resumeOffset;
+        continue;
+      }
       const progress = await response.json() as { received: number };
       offset = progress.received;
       attempts = 0;
       onProgress?.(offset);
     }
-    return await api<MessageAttachment>(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}/complete`, { method: "POST" }, token);
+    return await uploadJson<MessageAttachment>(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}/complete`, undefined, token, file);
   } catch (error) {
     await api<void>(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}`, { method: "DELETE", raw: true }, token).catch(() => undefined);
     throw error;
   }
 }
-function uploadHeaders(token: string): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+/** Like `api`, but reports failures with upload wording so a rejected attachment never reads as a chat context problem. */
+async function uploadJson<T>(url: string, body: unknown, token: string, file: File): Promise<T> {
+  const headers: Record<string, string> = { "X-CopilotChat-CSRF": "1" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (token) headers.Authorization = ["Bearer", token].join(" ");
+  const response = await fetch(url, { method: "POST", headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  if (!response.ok) throw new Error(uploadErrorMessage(response.status, await response.text(), file));
+  return await response.json() as T;
+}
+type UploadBatch = { files: number; total: number; uploadedByFile: Map<number, number> };
+/** Sums every in-flight batch so a finished batch cannot clear progress that other batches still own. */
+function totalUploadProgress(batches: Set<UploadBatch>): { files: number; uploaded: number; total: number } | null {
+  if (batches.size === 0) return null;
+  let files = 0;
+  let uploaded = 0;
+  let total = 0;
+  for (const batch of batches) {
+    files += batch.files;
+    total += batch.total;
+    for (const bytes of batch.uploadedByFile.values()) uploaded += bytes;
+  }
+  return { files, uploaded, total };
+}
+function uploadHeaders(token: string): Record<string, string> {  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
   if (token) headers.Authorization = ["Bearer", token].join(" ");
   return headers;
 }
@@ -1412,7 +1506,24 @@ function buildSlashCommands(skills: Skill[]): SlashCommand[] {
 }
 function slashCommandSlug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "command"; }
 function toErr(e:unknown){return e instanceof Error?e.message:String(e);}
+/** A failure the server reported itself, so retrying the transport would only repeat it. */
+class FatalStreamError extends Error {}
+function isAbortError(e: unknown): boolean { return e instanceof Error && e.name === "AbortError"; }
 function isNetworkError(message: string): boolean { return /network\s*(?:request\s*)?(?:error|failed)|network connection (?:was )?lost|failed to fetch|fetch failed|load failed|offline|internet connection/i.test(message); }
+function waitUntilOnline(signal: AbortSignal, timeout: number): Promise<void> {
+  if (navigator.onLine || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("online", done);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = window.setTimeout(done, timeout);
+    window.addEventListener("online", done, { once: true });
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
 function waitForRetry(delay: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => {

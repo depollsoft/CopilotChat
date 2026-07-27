@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
 import type { MessageAttachment } from "@copilotchat/shared";
@@ -1246,6 +1247,51 @@ test("assistant responses stream incrementally before the final message is saved
   await expect(streamingResponse).toContainText("I am running with the local development provider");
   await expect(streamingResponse).not.toContainText("Configure Copilot auth/provider settings");
   await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
+});
+
+test("a dropped stream reconnects without losing the running response", async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers transport recovery.");
+  const sockets = new Set<net.Socket>();
+  const proxy = net.createServer((client) => {
+    const upstream = net.connect(4528, "127.0.0.1");
+    client.pipe(upstream);
+    upstream.pipe(client);
+    const track = (socket: net.Socket): void => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.on("error", () => sockets.delete(socket)); };
+    track(client); track(upstream);
+    client.on("close", () => upstream.destroy());
+  });
+  // Binding without a host accepts both localhost resolutions, and a `localhost` page origin is accepted by
+  // any local server as a loopback tunnel, so this works against a spawned or a reused dev server alike.
+  await new Promise<void>((resolve) => { proxy.listen(4529, resolve); });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const streamedLength = async (): Promise<number> => (await page.locator(".msg.assistant").last().innerText()).length;
+  let messageFetches = 0;
+  page.on("request", (request) => { if (request.method() === "GET" && /\/api\/chats\/[^/]+\/messages/.test(request.url())) messageFetches += 1; });
+  try {
+    await page.goto("http://localhost:4529/");
+    await expect(page.getByText(/Back at it/i)).toBeVisible();
+    await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`start a long response ${"keep streaming ".repeat(6000)}`);
+    await page.getByRole("button", { name: "Send" }).click();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect.poll(streamedLength).toBeGreaterThan(500);
+    const beforeDrop = await streamedLength();
+
+    // Sever every open socket the way a phone does when the app is suspended.
+    messageFetches = 0;
+    for (const socket of [...sockets]) socket.end();
+
+    // The running turn must stay on screen instead of collapsing back to an idle chat.
+    await page.waitForTimeout(1500);
+    await expect(page.getByPlaceholder("Steer or queue a follow-up")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+    await expect.poll(streamedLength, { timeout: 20_000 }).toBeGreaterThan(beforeDrop);
+    // A turn that finished during the outage is only in the saved transcript, so reattaching has to refetch it.
+    await expect.poll(() => messageFetches, { timeout: 10_000 }).toBeGreaterThan(0);
+  } finally {
+    await context.close();
+    await new Promise<void>((resolve) => { proxy.close(() => resolve()); });
+  }
 });
 
 test("editing works after stopping an in-progress response", async ({ page }, testInfo) => {

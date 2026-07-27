@@ -6,7 +6,8 @@ import { Readable } from "node:stream";
 import type { CopilotProvider } from "@copilotchat/provider";
 import type { ImportPreview, MessageAttachment } from "@copilotchat/shared";
 import Database from "better-sqlite3";
-import { afterEach, describe, expect, it } from "vitest";
+import type { FastifyReply } from "fastify";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
@@ -17,7 +18,7 @@ import { assertImportPayloadSize, ImportDraftStore, ImportLimitError } from "./i
 import { buildImportTools } from "./import-tools.js";
 import { buildConversationTools } from "./conversation-tools.js";
 import { isAllowedCorsOrigin } from "./cors-origin.js";
-import { ActiveChatResponse, ActiveChatResponses } from "./responses.js";
+import { ActiveChatResponse, ActiveChatResponses, sseHeartbeatIntervalMs } from "./responses.js";
 import { UploadedFileStore, UploadOffsetError } from "./uploaded-files.js";
 import { ownerWorkspaceDirectory, ownerWorkspaceRoot, runWorkspaceCommand, validateRegisteredWorkspaceRoot } from "./workspace.js";
 
@@ -30,6 +31,25 @@ async function waitForCondition(condition: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   expect(condition()).toBe(true);
+}
+function createFakeSseReply(): { reply: FastifyReply; writes: string[]; close: () => void } {
+  const writes: string[] = [];
+  const closeHandlers: Array<() => void> = [];
+  const raw = {
+    writableNeedDrain: false,
+    writableLength: 0,
+    writableEnded: false,
+    destroyed: false,
+    socket: { setNoDelay: () => undefined },
+    writeHead: () => raw,
+    flushHeaders: () => undefined,
+    write: (chunk: string) => { writes.push(chunk); return true; },
+    end: () => { raw.writableEnded = true; },
+    on: (event: string, handler: () => void) => { if (event === "close") closeHandlers.push(handler); return raw; },
+    once: () => raw,
+  };
+  const reply = { hijack: () => undefined, raw } as unknown as FastifyReply;
+  return { reply, writes, close: () => { for (const handler of closeHandlers) handler(); } };
 }
 
 describe("loadConfig", () => {
@@ -1089,7 +1109,10 @@ describe("chat provider context", () => {
       const uploads = new UploadedFileStore(uploadDir, 1024, 8, 1);
       const session = await uploads.beginChunked("github:alice", { fileName: "done.bin", mimeType: "application/octet-stream", size: 8 });
       await uploads.appendChunk("github:alice", session.uploadId, 0, Buffer.alloc(8));
-      await uploads.finishChunked("github:alice", session.uploadId);
+      const finishing = uploads.finishChunked("github:alice", session.uploadId);
+      // An abort that races finalization must not slip between publishing the data and publishing the metadata.
+      await expect(uploads.abortChunked("github:alice", session.uploadId)).rejects.toThrow("still being written");
+      await finishing;
 
       await uploads.abortChunked("github:alice", session.uploadId);
 
@@ -1579,6 +1602,62 @@ describe("chat provider context", () => {
     const content = db.listMessages(chat.id).find((message) => message.role === "assistant")?.content ?? "";
     expect(content.length).toBeLessThan(1_020_000);
     expect(content).toContain("Response truncated");
+  });
+
+  it("replays a snapshot and sends heartbeats when a client reattaches mid-response", async () => {
+    const db = createTestDb();
+    const owner = db.getOwner();
+    const chat = db.createChat(owner.id, { title: "Reconnect chat", projectId: null, workspaceId: null });
+    const userMessage = db.addMessage({ chatId: chat.id, role: "user", content: "Keep streaming" });
+    let finishTurn = (): void => {};
+    const turnFinished = new Promise<void>((resolve) => { finishTurn = resolve; });
+    const provider: CopilotProvider = {
+      id: "echo",
+      label: "Echo",
+      status: async () => ({ id: "echo", label: "Echo", available: true, details: "test", capabilities: [], models: [], modelsAuthoritative: false, defaultModel: "gpt-test" }),
+      async *streamChat() {
+        yield { type: "delta", text: "Partial answer" };
+        await turnFinished;
+        yield { type: "done" };
+      },
+    };
+    const responses = new ActiveChatResponses();
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      responses.start({ db, provider, ownerId: owner.id, chat, userMessage, providerRequest: { messages: [{ role: "user", content: "Keep streaming" }], model: "gpt-test" }, prepareTurn: async () => { throw new Error("No queued turns expected."); } });
+      const first = createFakeSseReply();
+      responses.attach(chat.id, first.reply);
+      // The snapshot goes out even before any content exists so a reconnecting client knows the turn is live.
+      expect(first.writes[0]).toBe(": connected\n\n");
+      expect(first.writes[1]?.startsWith("event: snapshot")).toBe(true);
+      await waitForCondition(() => first.writes.some((chunk) => chunk.includes("Partial answer")));
+
+      // A client that lost its connection must be able to pick the running turn back up.
+      const reconnected = createFakeSseReply();
+      responses.attach(chat.id, reconnected.reply);
+      const snapshot = reconnected.writes.find((chunk) => chunk.startsWith("event: snapshot"));
+      expect(snapshot).toContain("Partial answer");
+
+      vi.advanceTimersByTime(sseHeartbeatIntervalMs + 10);
+      expect(reconnected.writes.filter((chunk) => chunk.startsWith(": ping"))).toHaveLength(1);
+
+      reconnected.close();
+      vi.advanceTimersByTime(sseHeartbeatIntervalMs * 3);
+      expect(reconnected.writes.filter((chunk) => chunk.startsWith(": ping"))).toHaveLength(1);
+    } finally {
+      finishTurn();
+      vi.useRealTimers();
+    }
+    await waitForCondition(() => db.listMessages(chat.id).some((message) => message.role === "assistant"));
+  });
+
+  it("tells a client that no response is active when there is nothing to reattach to", () => {
+    const responses = new ActiveChatResponses();
+    const { reply, writes } = createFakeSseReply();
+
+    responses.attach("missing-chat", reply);
+
+    expect(writes.some((chunk) => chunk.startsWith("event: done") && chunk.includes("\"active\":false"))).toBe(true);
   });
 
   it("auto-activates installed skills by activation rule or explicit name mention", () => {
