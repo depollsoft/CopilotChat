@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, createWriteStream } from "node:fs";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { Readable } from "node:stream";
@@ -21,12 +22,20 @@ const uploadedFileSchema = z.object({
 export type UploadedFile = z.infer<typeof uploadedFileSchema>;
 export class UploadLimitError extends Error {}
 export class UploadValidationError extends Error {}
+/** Raised when a chunk does not continue from the bytes already stored, so the client can resume from `received`. */
+export class UploadOffsetError extends Error {
+  constructor(message: string, readonly received: number) { super(message); }
+}
+
+/** An upload still being assembled from chunks, so it survives request boundaries imposed by proxy body limits. */
+type ChunkedUpload = { id: string; ownerId: string; fileName: string; mimeType: string; size: number; received: number; handle: FileHandle; releaseReservation: () => void; updatedAt: number; busy: boolean };
 
 export class UploadedFileStore {
   private readonly claimsByUpload = new Map<string, { claimId: string; ownerId: string }>();
   private readonly uploadsByClaim = new Map<string, { ownerId: string; uploadIds: string[] }>();
   private readonly deletingUploads = new Set<string>();
   private readonly activeUploadIds = new Set<string>();
+  private readonly chunkedUploads = new Map<string, ChunkedUpload>();
   private readonly reservationsByOwner = new Map<string, { bytes: number; count: number }>();
   private readonly activeOperationsByOwner = new Map<string, number>();
   private readonly ownerIdleWaiters = new Map<string, Set<() => void>>();
@@ -34,12 +43,112 @@ export class UploadedFileStore {
   private readonly ownerDeletionQueue = new Map<string, Promise<void>>();
   private quotaQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly rootDir: string, private readonly maxBytes: number, private readonly maxStagedBytes = maxBytes, private readonly maxStagedFiles = 100) {}
+  constructor(private readonly rootDir: string, private readonly maxBytes: number, private readonly maxStagedBytes = maxBytes, private readonly maxStagedFiles = 100, private readonly chunkSessionTtlMs = 60 * 60 * 1000) {}
 
-  async create(ownerId: string, input: { fileName: string; mimeType: string; size: number }, source: Readable): Promise<MessageAttachment> {
+  /** Opens an upload that is filled by repeated `appendChunk` calls, keeping every request small enough for proxies. */
+  async beginChunked(ownerId: string, input: { fileName: string; mimeType: string; size: number }): Promise<{ uploadId: string; received: number }> {
+    const fileName = this.validateUploadInput(input);
+    this.beginOwnerOperation(ownerId);
+    const id = randomUUID();
+    let releaseReservation: (() => void) | null = null;
+    try {
+      await fs.mkdir(this.rootDir, { recursive: true });
+      releaseReservation = await this.reserve(ownerId, input.size);
+      this.activeUploadIds.add(id);
+      const handle = await fs.open(`${this.dataPath(id)}.part`, "wx");
+      this.chunkedUploads.set(id, { id, ownerId, fileName, mimeType: input.mimeType, size: input.size, received: 0, handle, releaseReservation, updatedAt: Date.now(), busy: false });
+      return { uploadId: id, received: 0 };
+    } catch (error) {
+      this.activeUploadIds.delete(id);
+      await fs.rm(`${this.dataPath(id)}.part`, { force: true });
+      if (releaseReservation) await this.withQuotaLock(async () => releaseReservation?.());
+      throw error;
+    } finally {
+      this.endOwnerOperation(ownerId);
+    }
+  }
+
+  /** Writes `chunk` at `offset`. Re-sending the previous chunk is safe because bytes are written by position. */
+  async appendChunk(ownerId: string, uploadId: string, offset: number, chunk: Buffer): Promise<{ received: number; size: number }> {
+    const upload = this.chunkedUpload(ownerId, uploadId);
+    if (upload.busy) throw new UploadValidationError("Another chunk of this upload is still being written.");
+    if (offset > upload.received) throw new UploadOffsetError(`Upload is missing bytes before offset ${offset}.`, upload.received);
+    if (offset + chunk.length > upload.size) throw new UploadValidationError("Upload contained more bytes than declared.");
+    this.beginOwnerOperation(ownerId);
+    upload.busy = true;
+    try {
+      if (chunk.length > 0) await upload.handle.write(chunk, 0, chunk.length, offset);
+      upload.received = Math.max(upload.received, offset + chunk.length);
+      upload.updatedAt = Date.now();
+      return { received: upload.received, size: upload.size };
+    } catch (error) {
+      await this.abortChunked(ownerId, uploadId).catch(() => undefined);
+      throw error;
+    } finally {
+      upload.busy = false;
+      this.endOwnerOperation(ownerId);
+    }
+  }
+
+  /** Seals a chunked upload into the same staged file a single-request upload produces. */
+  async finishChunked(ownerId: string, uploadId: string): Promise<MessageAttachment> {
+    const upload = this.chunkedUpload(ownerId, uploadId);
+    if (upload.busy) throw new UploadValidationError("Another chunk of this upload is still being written.");
+    this.beginOwnerOperation(ownerId);
+    upload.busy = true;
+    const temporaryPath = `${this.dataPath(uploadId)}.part`;
+    try {
+      if (upload.received !== upload.size) throw new UploadValidationError(`Upload size mismatch: expected ${upload.size} bytes but received ${upload.received}.`);
+      await upload.handle.close();
+      const stat = await fs.stat(temporaryPath);
+      if (stat.size !== upload.size) throw new UploadValidationError(`Upload size mismatch: expected ${upload.size} bytes but stored ${stat.size}.`);
+      const uploaded: UploadedFile = { id: uploadId, ownerId, fileName: upload.fileName, mimeType: upload.mimeType, size: upload.size, sha256: await hashFile(temporaryPath), createdAt: new Date().toISOString() };
+      this.chunkedUploads.delete(uploadId);
+      await this.withQuotaLock(async () => {
+        await fs.rename(temporaryPath, this.dataPath(uploadId));
+        const metadataTemporaryPath = `${this.metadataPath(uploadId)}.part`;
+        await fs.writeFile(metadataTemporaryPath, JSON.stringify(uploaded), { encoding: "utf8", flag: "wx" });
+        await fs.rename(metadataTemporaryPath, this.metadataPath(uploadId));
+        upload.releaseReservation();
+      });
+      return { id: uploaded.id, uploadId: uploaded.id, name: uploaded.fileName, mimeType: uploaded.mimeType, size: uploaded.size };
+    } catch (error) {
+      this.chunkedUploads.set(uploadId, upload);
+      await this.abortChunked(ownerId, uploadId).catch(() => undefined);
+      throw error;
+    } finally {
+      upload.busy = false;
+      this.activeUploadIds.delete(uploadId);
+      this.endOwnerOperation(ownerId);
+    }
+  }
+
+  async abortChunked(ownerId: string, uploadId: string): Promise<void> {
+    const upload = this.chunkedUploads.get(uploadId);
+    if (!upload) return;
+    if (upload.ownerId !== ownerId) throw new UploadValidationError("Upload session not found.");
+    this.chunkedUploads.delete(uploadId);
+    await upload.handle.close().catch(() => undefined);
+    await Promise.all([fs.rm(`${this.dataPath(uploadId)}.part`, { force: true }), fs.rm(this.dataPath(uploadId), { force: true }), fs.rm(this.metadataPath(uploadId), { force: true })]);
+    await this.withQuotaLock(async () => upload.releaseReservation());
+    this.activeUploadIds.delete(uploadId);
+  }
+
+  private chunkedUpload(ownerId: string, uploadId: string): ChunkedUpload {
+    const upload = this.chunkedUploads.get(uploadId);
+    if (!upload || upload.ownerId !== ownerId) throw new UploadValidationError("Upload session not found. Start the upload again.");
+    return upload;
+  }
+
+  private validateUploadInput(input: { fileName: string; size: number }): string {
     if (input.size > this.maxBytes) throw new UploadLimitError(`Upload exceeds the ${formatBytes(this.maxBytes)} limit.`);
     const fileName = path.basename(input.fileName).trim();
     if (!fileName || fileName === "." || fileName === "..") throw new UploadValidationError("Upload requires a valid file name.");
+    return fileName;
+  }
+
+  async create(ownerId: string, input: { fileName: string; mimeType: string; size: number }, source: Readable): Promise<MessageAttachment> {
+    const fileName = this.validateUploadInput(input);
     this.beginOwnerOperation(ownerId);
     const id = randomUUID();
     let releaseReservation: (() => void) | null = null;
@@ -214,7 +323,17 @@ export class UploadedFileStore {
   }
 
   async cleanupExpired(): Promise<void> {
+    await this.expireChunkedUploads();
     await this.withQuotaLock(async () => this.cleanupExpiredUnlocked());
+  }
+
+  /** Abandoned chunked uploads hold staged-quota reservations, so they are released well before the 24 hour file sweep. */
+  private async expireChunkedUploads(): Promise<void> {
+    const cutoff = Date.now() - this.chunkSessionTtlMs;
+    for (const upload of [...this.chunkedUploads.values()]) {
+      if (upload.busy || upload.updatedAt > cutoff) continue;
+      await this.abortChunked(upload.ownerId, upload.id).catch(() => undefined);
+    }
   }
 
   private async cleanupExpiredUnlocked(): Promise<void> {
@@ -382,6 +501,12 @@ export class UploadedFileStore {
 function safeId(id: string): string {
   if (!/^[a-zA-Z0-9_.-]+$/.test(id)) throw new Error("Invalid upload id.");
   return id;
+}
+
+async function hashFile(filePath: string): Promise<string> {
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(filePath), hash);
+  return hash.digest("hex");
 }
 
 function formatBytes(value: number): string {

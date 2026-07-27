@@ -844,13 +844,58 @@ test("composer retains successful files and discards each upload once", async ({
   ]);
 
   await expect(page.locator(".attachment-tray").filter({ hasText: "good.txt" })).toBeVisible();
-  await expect(page.locator(".attachment-error")).toContainText("too large");
+  await expect(page.locator(".attachment-error")).toContainText("Upload rejected");
   await expect(page.locator(".attachment-tray").filter({ hasText: "bad.txt" })).toHaveCount(0);
   let deleteCount = 0;
   await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
   await page.getByRole("button", { name: "Remove good.txt" }).click();
   await expect.poll(() => deleteCount).toBe(1);
   await expect(page.locator(".attachment-tray")).toHaveCount(0);
+});
+
+test("uploads large files in chunks when a proxy caps request bodies", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers chunked uploads.");
+  const proxyLimit = 200_000;
+  const rejected: number[] = [];
+  await page.route("**/api/uploads**", async (route) => {
+    const body = route.request().postDataBuffer();
+    if (body && body.byteLength > proxyLimit) {
+      rejected.push(body.byteLength);
+      await route.fulfill({ status: 413, contentType: "text/html", body: "<html><head><title>413 Request Entity Too Large</title></head><body></body></html>" });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "camera-photo.jpg", mimeType: "image/jpeg", buffer: Buffer.alloc(3 * 1024 * 1024, 9) });
+
+  await expect(page.locator(".attachment-tray").filter({ hasText: "camera-photo.jpg" })).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator(".attachment-error")).toHaveCount(0);
+  expect(rejected.length).toBeGreaterThan(0);
+  expect(Math.max(...rejected)).toBeGreaterThan(proxyLimit);
+
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Read the attached photo from its path.");
+  await page.getByRole("button", { name: "Send" }).click();
+  // The echo provider repeats the attachment summary, so this proves the agent received a readable path, not inline bytes.
+  await expect(page.locator(".msg.assistant").last()).toContainText(".copilotchat/uploads", { timeout: 30_000 });
+  await expect(page.locator(".msg.assistant").last()).toContainText("camera-photo.jpg");
+});
+
+test("explains proxy upload rejections instead of blaming chat context", async ({ page }, testInfo) => {  test.skip(testInfo.project.name !== "desktop", "Desktop covers composer upload errors.");
+  await page.route("**/api/uploads?*", async (route) => {
+    await route.fulfill({ status: 413, contentType: "text/html", body: "<html><head><title>413 Request Entity Too Large</title></head><body></body></html>" });
+  });
+  await page.goto("/");
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "IMG_9876.jpg", mimeType: "image/jpeg", buffer: Buffer.alloc(2048, 7) });
+
+  const error = page.locator(".attachment-error");
+  await expect(error).toContainText("IMG_9876.jpg");
+  await expect(error).toContainText("client_max_body_size");
+  await expect(error).not.toContainText("<html>");
 });
 
 test("composer retains staged uploads when message acceptance fails", async ({ page }, testInfo) => {

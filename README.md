@@ -35,6 +35,8 @@ docker compose up -d
 
 Use `docker compose up -d --build` instead to build from the current checkout. The service listens on `127.0.0.1:4317` by default; change `COPILOTCHAT_BIND_ADDRESS` and `COPILOTCHAT_PORT` in `.env` when placing it behind a reverse proxy or exposing it on a trusted network. Application state, OAuth tokens, imports, artifacts, and SQLite files persist in the `copilotchat-data` volume across container replacement.
 
+Attachments larger than 512 KB upload in chunks, so a reverse proxy that caps request bodies (nginx defaults `client_max_body_size` to 1 MB) never sees an oversized request. The browser halves its chunk size and retries whenever a proxy still answers `413`, and the server reassembles the chunks into a single file inside the chat workspace under `.copilotchat/uploads/`, which is the path handed to the agent. Set `COPILOTCHAT_UPLOAD_CHUNK_BYTES` to tune the chunk size and `COPILOTCHAT_UPLOAD_LIMIT_BYTES` for the total per-file limit.
+
 For direct GitHub login, create a GitHub OAuth App and set these values in `.env`:
 
 ```dotenv

@@ -27,6 +27,10 @@ const SYSTEM_THEME_QUERY = "(prefers-color-scheme: dark)";
 const CHAT_ROUTE_PREFIX = "/chats/";
 const PROJECT_ROUTE_PREFIX = "/projects/";
 const LIVE_SCROLL_THRESHOLD = 96;
+/** Files at or below this go up in one request; larger ones are chunked so proxy body limits never reject them. */
+const SINGLE_REQUEST_UPLOAD_LIMIT = 512 * 1024;
+const MIN_UPLOAD_CHUNK_BYTES = 64 * 1024;
+const UPLOAD_CHUNK_ATTEMPTS = 8;
 const DEFAULT_TEXT_SCALE = 0.95;
 const IMPORT_ASSISTANT_SKILL_ID = "import-assistant";
 const MODEL_REFRESH_COOLDOWN_MS = 60_000;
@@ -528,7 +532,7 @@ function App(): React.ReactElement {
             ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); composerRef.current?.focus(); }} />
             : <div className="thread">{renderThreadMessages()}<PendingTurns turns={pendingTurns}/>{streamingText || streamingActivities.length > 0 ? <Message streaming activities={streamingActivities} message={{ id: "streaming", chatId: selectedChatId ?? "", role: "assistant", content: streamingText, provider: provider.id, metadata: {}, createdAt: new Date().toISOString() }} /> : null}{busy && !streamingText && streamingActivities.length === 0 ? <Thinking /> : null}<InteractionDock interactions={pendingInteractions} onResolve={(interaction, resolution) => void resolveInteraction(interaction, resolution)} /></div>}
       </div>
-      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onUploadFile={(file) => uploadFile(file, apiToken)} onDiscardAttachment={(attachment) => discardUploadedFile(attachment, apiToken)} onSubmit={(content, attachments, onAccepted) => busy ? sendWhileBusy("queue", content, attachments, onAccepted) : sendMessage(content, { attachments }, onAccepted)} onSteer={(content, attachments, onAccepted) => sendWhileBusy("steer", content, attachments, onAccepted)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
+      <Composer ref={composerRef} busy={busy} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onUploadFile={(file, onProgress) => uploadFile(file, apiToken, onProgress)} onDiscardAttachment={(attachment) => discardUploadedFile(attachment, apiToken)} onSubmit={(content, attachments, onAccepted) => busy ? sendWhileBusy("queue", content, attachments, onAccepted) : sendMessage(content, { attachments }, onAccepted)} onSteer={(content, attachments, onAccepted) => sendWhileBusy("steer", content, attachments, onAccepted)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
       {showJumpToLive && selectedChat ? <button className="jump-to-live" aria-label="Jump to live" onClick={() => scrollToLive("smooth")}><IconDownload width={16}/><span>Live</span></button> : null}
     </main>
     {drawer && state ? <Drawer active={drawer} onChangeTab={setDrawer} onClose={() => setDrawer(null)}><DrawerContent tab={drawer} state={state} theme={theme} setTheme={setTheme} textScale={textScale} setTextScale={setTextScale} apiToken={apiToken} setApiToken={(token) => { setApiToken(token); if (token) localStorage.setItem(API_TOKEN_KEY, token); else localStorage.removeItem(API_TOKEN_KEY); }} selectedSkillIds={selectedSkillIds} setSelectedSkillIds={setSelectedSkillIds} activeProjectId={activeProjectId} onSelectProject={selectProject} activeWorkspaceId={activeWorkspaceId} setActiveWorkspaceId={setActiveWorkspaceId} refresh={refreshState} showToast={setToast} clearAllData={clearAllData} onStartGuidedImport={startGuidedImport} /></Drawer> : null}
@@ -887,13 +891,14 @@ function RunningActionButton(p: { label: string; tooltip: string; icon: React.Re
   return <button type="button" aria-label={p.label} className={`composer-running-button ${p.variant ?? "primary"}${showLongPressTooltip ? " show-tooltip" : ""}`} disabled={p.disabled} onClick={click} onPointerDown={startLongPress} onPointerUp={finishLongPress} onPointerCancel={finishLongPress} onPointerLeave={finishLongPress}><span className="running-button-icon">{p.icon}</span><span className="running-button-label">{p.label.replace(" response", "").replace(" message", "")}</span><span className="composer-action-tooltip" role="tooltip"><strong>{p.label}</strong><span>{p.tooltip}</span></span></button>;
 }
 type ComposerPicker = "menu" | "project" | "skills" | "workspace" | "permissions";
-const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onUploadFile: (file: File) => Promise<MessageAttachment>; onDiscardAttachment: (attachment: MessageAttachment) => Promise<void>; onSubmit: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onSteer: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
+const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Project | null; projects: Project[]; workspace: Workspace | null; workspaces: Workspace[]; skills: Skill[]; selectedSkills: Skill[]; selectedSkillIds: string[]; permissionMode: PermissionMode; setPermissionMode: (mode: PermissionMode) => void; onDraftPreviewChange: (v: string) => void; onUploadFile: (file: File, onProgress: (bytes: number) => void) => Promise<MessageAttachment>; onDiscardAttachment: (attachment: MessageAttachment) => Promise<void>; onSubmit: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onSteer: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>; onStop: () => void; onOpenTab: (t: Tab) => void; onSelectProject: (id: string | null) => void; onSelectWorkspace: (id: string | null) => void; onSelectSkills: (ids: string[]) => void }>(function Composer(p, ref) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [pendingUploads, setPendingUploads] = useState(0);
+  const [uploadProgress, setUploadProgress] = useState<{ files: number; uploaded: number; total: number } | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [openPicker, setOpenPicker] = useState<ComposerPicker | null>(null);
   const [slashIndex, setSlashIndex] = useState(0);
@@ -920,14 +925,22 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
     setAttachmentError(null);
     const nextFiles = [...files];
     if (nextFiles.length === 0) return;
+    const total = nextFiles.reduce((sum, file) => sum + file.size, 0);
+    const uploadedByFile = new Map<number, number>();
     setPendingUploads((current) => current + nextFiles.length);
+    if (total > SINGLE_REQUEST_UPLOAD_LIMIT) setUploadProgress({ files: nextFiles.length, uploaded: 0, total });
     try {
-      const results = await Promise.allSettled(nextFiles.map(p.onUploadFile));
+      const results = await Promise.allSettled(nextFiles.map((file, index) => p.onUploadFile(file, (bytes) => {
+        uploadedByFile.set(index, bytes);
+        const uploaded = [...uploadedByFile.values()].reduce((sum, value) => sum + value, 0);
+        setUploadProgress((current) => current ? { ...current, uploaded } : current);
+      })));
       const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
       const failed = results.flatMap((result) => result.status === "rejected" ? [toErr(result.reason)] : []);
       if (uploaded.length > 0) setAttachments((current) => [...current, ...uploaded]);
       if (failed.length > 0) setAttachmentError(failed.length === 1 ? failed[0]! : `${failed.length} files failed to upload. ${failed[0]}`);
     } finally {
+      setUploadProgress(null);
       setPendingUploads((current) => Math.max(0, current - nextFiles.length));
     }
   }
@@ -952,7 +965,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; project: Proj
   async function submit(action: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>): Promise<void> { const content = value.trim(); if (submitting || pendingUploads > 0 || (!content && attachments.length === 0)) return; const submittedAttachments = attachments; setSubmitting(true); setAttachmentError(null); let accepted = false; const onAccepted = () => { if (accepted) return; accepted = true; clearValue(); setSubmitting(false); }; try { await action(content, submittedAttachments, onAccepted); } catch (error) { setAttachmentError(toErr(error)); } finally { setSubmitting(false); } }
   function submitSteer(): void { void submit(p.onSteer); }
   function submitMessage(): void { void submit(p.onSubmit); }
-  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? "Steer or queue a follow-up" : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
+  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{uploadProgress ? <p className="attachment-progress" role="status">{`Uploading ${uploadProgress.files === 1 ? "1 file" : `${uploadProgress.files} files`}… ${formatBytes(uploadProgress.uploaded)} of ${formatBytes(uploadProgress.total)}`}</p> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? "Steer or queue a follow-up" : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
 });
 function AttachmentTray(p: { attachments: MessageAttachment[]; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => { const src = isImageAttachment(attachment) ? attachmentDataUrl(attachment) : null; return <div key={attachment.id} className={`attachment-chip${isImageAttachment(attachment) ? " image" : ""}`}>{src ? <img alt="" src={src} /> : <span className="attachment-file-icon"><IconUpload width={15}/></span>}<span className="attachment-copy"><strong>{attachment.name}</strong><small>{attachment.mimeType} · {formatBytes(attachment.size)}</small></span>{p.onRemove ? <button type="button" aria-label={`Remove ${attachment.name}`} disabled={p.removeDisabled} onClick={() => p.onRemove?.(attachment.id)}><IconClose width={14}/></button> : null}</div>; })}</div>; }
 function composerPickerTitle(picker: ComposerPicker): string { return picker === "menu" ? "Composer options" : picker === "project" ? "Choose project" : picker === "skills" ? "Choose skills" : picker === "workspace" ? "Choose workspace" : "Tool permissions"; }
@@ -1255,17 +1268,75 @@ function writeSeenChatUpdates(value: Record<string, string>): Record<string, str
 async function registerServiceWorker(){if("serviceWorker" in navigator)try{await navigator.serviceWorker.register("/sw.js");}catch{return;}}
 function notify(title:string,body:string){if(typeof Notification==="undefined"||Notification.permission!=="granted"||document.visibilityState!=="hidden")return;if(navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:"notify",title,body});else new Notification(title,{body});}
 function fileToBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error("Failed to read file."));r.onload=()=>typeof r.result==="string"?resolve(r.result.slice(r.result.indexOf(",")+1)):reject(new Error("Failed to read file."));r.readAsDataURL(file);});}
-async function uploadFile(file: File, token: string): Promise<MessageAttachment> {
-  const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
-  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
-  if (token) headers.Authorization = ["Bearer", token].join(" ");
-  const response = await fetch(`/api/uploads?${query.toString()}`, { method: "POST", headers, body: file });
-  if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
-  const attachment = await response.json() as MessageAttachment;
+async function uploadFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
+  const attachment = file.size > SINGLE_REQUEST_UPLOAD_LIMIT ? await uploadFileInChunks(file, token, onProgress) : await uploadWholeFile(file, token, onProgress);
   if (file.type.startsWith("image/") && file.size <= 1024 * 1024) {
     try { attachment.data = await fileToBase64(file); } catch { /* The uploaded image remains usable without an inline preview. */ }
   }
   return attachment;
+}
+async function uploadWholeFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
+  const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
+  const response = await fetch(`/api/uploads?${query.toString()}`, { method: "POST", headers: uploadHeaders(token), body: file });
+  if (!response.ok) throw new Error(uploadErrorMessage(response.status, await response.text(), file));
+  onProgress?.(file.size);
+  return await response.json() as MessageAttachment;
+}
+/**
+ * Splits large files across small requests so reverse proxies with modest body limits (nginx defaults to 1 MB)
+ * never see an oversized request. The server reassembles the chunks into one staged file for the agent to open.
+ */
+async function uploadFileInChunks(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
+  const session = await api<{ uploadId: string; received: number; chunkBytes: number }>("/api/uploads/sessions", { method: "POST", body: { fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: file.size } }, token);
+  let offset = session.received;
+  let chunkBytes = Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.min(session.chunkBytes, SINGLE_REQUEST_UPLOAD_LIMIT));
+  let attempts = 0;
+  try {
+    while (offset < file.size) {
+      attempts += 1;
+      if (attempts > UPLOAD_CHUNK_ATTEMPTS) throw new Error(`Uploading ${file.name || "that file"} stopped making progress after ${UPLOAD_CHUNK_ATTEMPTS} attempts.`);
+      const end = Math.min(offset + chunkBytes, file.size);
+      let response: Response;
+      try {
+        response = await fetch(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}/chunks?offset=${offset}`, { method: "POST", headers: uploadHeaders(token), body: file.slice(offset, end) });
+      } catch (error) {
+        // Chunks are stored by offset, so replaying the same range after a dropped connection is safe.
+        if (attempts >= UPLOAD_CHUNK_ATTEMPTS) throw error;
+        await new Promise((resolve) => window.setTimeout(resolve, 250 * attempts));
+        continue;
+      }
+      if (response.status === 413 && chunkBytes > MIN_UPLOAD_CHUNK_BYTES) { chunkBytes = Math.max(MIN_UPLOAD_CHUNK_BYTES, Math.floor(chunkBytes / 2)); continue; }
+      if (response.status === 409) { offset = readResumeOffset(await response.text()) ?? offset; continue; }
+      if (!response.ok) throw new Error(uploadErrorMessage(response.status, await response.text(), file));
+      const progress = await response.json() as { received: number };
+      offset = progress.received;
+      attempts = 0;
+      onProgress?.(offset);
+    }
+    return await api<MessageAttachment>(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}/complete`, { method: "POST" }, token);
+  } catch (error) {
+    await api<void>(`/api/uploads/sessions/${encodeURIComponent(session.uploadId)}`, { method: "DELETE", raw: true }, token).catch(() => undefined);
+    throw error;
+  }
+}
+function uploadHeaders(token: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
+  if (token) headers.Authorization = ["Bearer", token].join(" ");
+  return headers;
+}
+/** A 409 reports the bytes the server already holds, so an interrupted chunk resumes instead of restarting the file. */
+function readResumeOffset(body: string): number | null {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    return isObjectRecord(parsed) && typeof parsed.received === "number" && Number.isFinite(parsed.received) ? parsed.received : null;
+  } catch {
+    return null;
+  }
+}
+/** A 413 on an upload usually comes from a reverse proxy rather than CopilotChat, so it names the file and the real limit to check. */
+function uploadErrorMessage(status: number, body: string, file: File): string {
+  if (status !== 413) return httpErrorMessage(status, body);
+  return serverErrorText(body) ?? `${file.name || "That file"} is too large to upload at ${formatBytes(file.size)}. Raise the upload size limit on CopilotChat or on the reverse proxy in front of it, such as the nginx client_max_body_size setting.`;
 }
 async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {
   if (!attachment.uploadId) return;
@@ -1365,8 +1436,14 @@ function httpErrorMessage(status: number, body: string): string {
   return text || `Request failed with status ${status}.`;
 }
 function readableErrorText(body: string): string {
+  const parsed = serverErrorText(body);
+  if (parsed) return parsed;
+  return body.trim() ? "The server returned an unexpected response." : "";
+}
+/** The server's own error text, or null when the body is an unhelpful envelope such as a proxy HTML error page. */
+function serverErrorText(body: string): string | null {
   const trimmed = body.trim();
-  if (!trimmed) return "";
+  if (!trimmed) return null;
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (isObjectRecord(parsed)) {
@@ -1376,7 +1453,7 @@ function readableErrorText(body: string): string {
   } catch {
     // Plain text response.
   }
-  return trimmed.startsWith("{") || trimmed.startsWith("[") ? "The server returned an unexpected response." : trimmed;
+  return trimmed.startsWith("{") || trimmed.startsWith("[") || trimmed.startsWith("<") ? null : trimmed;
 }
 function friendlyError(raw: string): { title: string; message: string; action: string } {
   const message = readableErrorText(raw);
