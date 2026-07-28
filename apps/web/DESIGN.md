@@ -51,20 +51,28 @@ typography:
     lineHeight: 1.5
   label:
     fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
-    fontSize: "11px"
+    fontSize: "12px"
     fontWeight: 800
     letterSpacing: "0.06em"
+  mono:
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+    fontSize: "13px"
+    fontWeight: 400
+    lineHeight: 1.5
 rounded:
-  sm: "8px"
-  md: "14px"
-  lg: "22px"
+  xs: "8px"
+  sm: "12px"
+  md: "16px"
+  lg: "20px"
+  xl: "24px"
   pill: "999px"
 spacing:
-  xs: "4px"
-  sm: "8px"
-  md: "12px"
-  lg: "16px"
-  xl: "24px"
+  2xs: "4px"
+  xs: "8px"
+  sm: "12px"
+  md: "16px"
+  lg: "24px"
+  xl: "32px"
 components:
   button-primary:
     backgroundColor: "{colors.accent}"
@@ -148,6 +156,8 @@ The palette is restrained product-neutral with a rare teal accent for action and
 
 **The Tonal Layer Rule.** Depth starts with `--surface`, `--surface-muted`, `--sidebar`, and `--border`; shadows come after tonal hierarchy, not before it.
 
+**The Token Floor Rule.** Radius and small-label type come from tokens, never literals. `styles.css` exposes `--radius-xs|sm|md(--radius)|lg|xl|pill`, `--space-2xs|xs|sm|md|lg|xl`, `--text-label|meta|caption|body`, `--measure`, and `--hit`. Label-tier text renders at `--text-label` or above. Those tokens are clamped with `max(11px, ...)` so the 11px floor holds across the whole 0.85-1.2 text-scale range, not just at the default. Primary navigation, header, and composer controls reach a `--hit` (44px) pointer target; compact in-content controls keep their visual size and extend their hit area to `--hit` with a transparent `::after`. Spacing is migrating onto `--space-*`; new rules should use the tokens rather than literals.
+
 ## 3. Typography
 
 **Display Font:** Inter, with the system sans stack as fallback.
@@ -161,7 +171,7 @@ The palette is restrained product-neutral with a rare teal accent for action and
 - **Headline** (760, 24px, 1.15): Drawer titles and modal headers.
 - **Title** (700-850, 14-18px, 1.3): Card headings, section titles, active row labels, and important control labels.
 - **Body** (400, 15-16px, 1.5-1.65): Chat content, settings descriptions, helper copy, and readable prose. Long prose should stay near 65-75ch.
-- **Label** (800-900, 10-12px, 0.04-0.06em): Status pills, section labels, metadata, timestamps, and compact control annotations.
+- **Label** (800-900, 12px, 0.04-0.06em): Status pills, section labels, metadata, timestamps, and compact control annotations. 11px rendered is the hard floor for any functional text.
 
 ### Named Rules
 
@@ -187,7 +197,7 @@ CopilotChat uses a hybrid of tonal layering and ambient elevation. Flat surfaces
 ## 5. Components
 
 ### Buttons
-- **Shape:** Pill-shaped for primary and secondary buttons (`999px`) and rounded-square for icon buttons (`12px`).
+- **Shape:** Pill-shaped for primary and secondary buttons (`pill`) and rounded-square for icon buttons (`sm`, 12px).
 - **Primary:** Teal background (`--accent`) with accent text (`--accent-text`), minimum height near 40px, and compact horizontal padding.
 - **Hover / Focus:** Hover darkens or shifts the surface; focus uses a 2px accent-colored outline with a 2px offset.
 - **Secondary / Ghost:** Secondary buttons use `--surface` plus `--border`; ghost buttons stay transparent until hover.
@@ -197,14 +207,14 @@ CopilotChat uses a hybrid of tonal layering and ambient elevation. Flat surfaces
 - **State:** Project and permission chips are icon-forward on constrained surfaces; count badges use teal for compact status.
 
 ### Cards / Containers
-- **Corner Style:** Standard containers use 14-18px radii; large panels and auth surfaces use 22-24px.
+- **Corner Style:** Standard containers use the `md` (16px) radius; large panels, drawers, and auth surfaces use `lg` (20px) or `xl` (24px). Small chips, checks, and code chrome use `xs` (8px).
 - **Background:** Cards use `--surface`; summary cards and nested activity use mixed muted surfaces.
 - **Shadow Strategy:** Cards are mostly flat with a 1px border. Hover can raise only when the card is actionable.
 - **Border:** Default `--border`, stronger `--border-strong` on hover or emphasized states.
 - **Internal Padding:** Compact cards use 10-15px; large panels use 16-28px depending on density.
 
 ### Inputs / Fields
-- **Style:** 1px border, 12px radius, sheet surface, 10px by 12px padding.
+- **Style:** 1px border, `md` (16px) radius, sheet surface, 10px by 12px padding.
 - **Focus:** Accent-colored outline with offset; composer textareas remove the inner outline because the composer shell owns focus context.
 - **Error / Disabled:** Error text uses `--danger`; disabled controls reduce opacity and keep shape stable.
 

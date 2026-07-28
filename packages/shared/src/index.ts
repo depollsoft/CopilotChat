@@ -353,8 +353,40 @@ export type RunWorkspaceCommandRequest = z.infer<typeof runWorkspaceCommandReque
 export const importPreviewRequestSchema = z.object({ source: importSourceSchema.default("auto"), fileName: z.string().min(1).max(1024), content: z.string().min(1), encoding: z.enum(["text", "base64"]).default("text") });
 export type ImportPreviewRequest = z.infer<typeof importPreviewRequestSchema>;
 
+const STRIP_MARKDOWN_INPUT_LIMIT = 4_000;
+
+/**
+ * Removes Markdown syntax so derived labels such as chat titles read as plain text.
+ *
+ * Underscore emphasis requires word boundaries, and double-underscore emphasis
+ * additionally requires multi-word content, so developer identifiers such as
+ * `foo_bar_baz` and the `__init__` dunder survive intact. Input is bounded because
+ * callers only need the opening words and the content is untrusted.
+ */
+export function stripMarkdown(value: string): string {
+  return value
+    .slice(0, STRIP_MARKDOWN_INPUT_LIMIT)
+    // Fences are code, not prose. GFM allows tilde fences too, and a fence left
+    // unclosed by the input bound still counts as closed.
+    .replace(/```[\s\S]*?(?:```|$)/g, " ")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s{0,3}>\s?/gm, "")
+    .replace(/^\s{0,3}(?:[-*+]|\d+\.)\s+/gm, "")
+    .replace(/\*\*\*(?=\S)([^*]+?)(?<=\S)\*\*\*/g, "$1")
+    .replace(/\*\*(?=\S)([^*]+?)(?<=\S)\*\*/g, "$1")
+    .replace(/\*(?=\S)([^*]+?)(?<=\S)\*/g, "$1")
+    .replace(/(?<![\w\\])___(?=\S)(?=[^_]*\s)([^_]+?)(?<=\S)___(?!\w)/g, "$1")
+    .replace(/(?<![\w\\])__(?=\S)(?=[^_]*\s)([^_]+?)(?<=\S)__(?!\w)/g, "$1")
+    .replace(/(?<![\w\\])_(?=\S)([^_]+?)(?<=\S)_(?!\w)/g, "$1")
+    .replace(/~~(?=\S)([^~]+?)(?<=\S)~~/g, "$1");
+}
+
 export function titleFromContent(content: string): string {
-  const compact = content.replace(/\s+/g, " ").trim();
+  const compact = stripMarkdown(content).replace(/\s+/g, " ").trim();
   if (!compact) return "New chat";
   return compact.split(" ").slice(0, 6).join(" ");
 }
