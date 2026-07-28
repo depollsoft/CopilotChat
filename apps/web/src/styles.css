@@ -487,8 +487,8 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .composer:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); box-shadow: 0 14px 34px rgb(0 0 0 / 10%), 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent); }
 /* The dark elevation rule outranks the focus ring above, so restate both here. */
 :root[data-theme="dark"] .composer:focus-within { box-shadow: 0 14px 40px rgb(0 0 0 / 32%), 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent); }
-.attachment-tray { display: flex; flex-wrap: wrap; gap: 7px; min-width: 0; }
-.attachment-chip { display: inline-grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; max-width: min(100%, 300px); padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--surface-muted) 56%, transparent); }
+.attachment-tray { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
+.attachment-chip { display: inline-grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; max-width: min(100%, 300px); padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--surface-muted) 56%, transparent); }
 .attachment-chip img { width: 44px; height: 44px; border-radius: var(--radius-xs); object-fit: cover; background: var(--surface); }
 .attachment-file-icon { display: grid; place-items: center; width: 34px; height: 34px; border-radius: var(--radius-xs); background: var(--surface); color: var(--text-muted); }
 .attachment-copy { display: grid; gap: 1px; min-width: 0; }
@@ -496,7 +496,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .attachment-copy small, .attachment-error, .attachment-progress { color: var(--text-muted); font-size: var(--text-label); }
 .attachment-error { margin: 0 8px; color: var(--danger); }
 .attachment-progress { margin: 0 8px; }
-.attachment-chip button { display: grid; place-items: center; width: 24px; height: 24px; border-radius: var(--radius-pill); color: var(--text-muted); }
+.attachment-chip button { position: relative; display: grid; place-items: center; width: 28px; height: 28px; border-radius: var(--radius-pill); color: var(--text-muted); }
 .attachment-chip button:hover { background: var(--surface); color: var(--text); }
 .msg-body > .attachment-tray { margin-bottom: 8px; }
 .msg-body > .attachment-tray .attachment-chip { background: color-mix(in srgb, var(--surface) 72%, transparent); }
@@ -765,7 +765,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .shortcut-list div { grid-template-columns: 1fr; gap: 5px; }
 }
 
-.sidebar-row-menu::after, .composer-plus-button::after, .composer-icon-chip::after, .composer-send::after, .composer-active-chip::after, .composer-running-button::after, .msg-action-button::after {
+.sidebar-row-menu::after, .composer-plus-button::after, .composer-icon-chip::after, .composer-send::after, .composer-active-chip::after, .composer-running-button::after, .msg-action-button::after, .attachment-chip button::after {
   content: "";
   position: absolute;
   top: 50%;
