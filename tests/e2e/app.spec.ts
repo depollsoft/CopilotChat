@@ -2,12 +2,33 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
+import type { Page } from "@playwright/test";
 import type { MessageAttachment } from "@copilotchat/shared";
+
+/**
+ * Selects auto-approve and clears the consequence confirmation.
+ *
+ * Pass `expectConfirm: false` only when auto-approve is already enabled, where
+ * re-selecting it is a no-op and no confirmation is offered.
+ */
+async function enableAutoApprove(page: Page, options: { expectConfirm?: boolean } = {}): Promise<void> {
+  const expectConfirm = options.expectConfirm ?? true;
+  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  const confirm = page.getByRole("button", { name: "Turn on auto-approve" });
+  if (!expectConfirm) {
+    await expect(confirm).toHaveCount(0);
+    return;
+  }
+  await expect(confirm).toBeVisible();
+  await confirm.click();
+  await expect(confirm).toHaveCount(0);
+}
+
 
 test("core app flows work end to end", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers full management flow.");
   const workspace = testInfo.outputPath("workspace"); fs.mkdirSync(workspace, { recursive: true }); fs.writeFileSync(path.join(workspace, "note.txt"), "hello\n");
-  await page.goto("/"); await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await page.goto("/"); await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
   await page.getByRole("dialog", { name: "New project" }).getByLabel("Project name").fill(`Project ${testInfo.project.name}`);
   await page.getByRole("button", { name: "Create project" }).click();
@@ -131,9 +152,41 @@ test("project model defaults apply to the first turn", async ({ page }, testInfo
   await expect(response).toContainText("Context size: default.");
 });
 
+test("desktop sidebar collapses, restores, and persists", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop owns the collapsible rail.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  const sidebar = page.locator(".sidebar");
+  const toggle = page.getByRole("button", { name: /(Show|Hide) sidebar/ });
+  const railWidth = async (): Promise<number> => page.evaluate(() => Math.round(document.querySelector(".sidebar")!.getBoundingClientRect().width));
+  const railCollapsed = async (): Promise<boolean> => page.evaluate(() => getComputedStyle(document.querySelector(".app")!).gridTemplateColumns.startsWith("0px") && getComputedStyle(document.querySelector(".sidebar")!).visibility === "hidden");
+
+  await expect(sidebar).toBeVisible();
+  expect(await railWidth()).toBeGreaterThan(200);
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(toggle).toHaveAccessibleName("Hide sidebar");
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toHaveAccessibleName("Show sidebar");
+  await expect.poll(railCollapsed).toBe(true);
+  // The mobile scrim must never appear on desktop.
+  await expect(page.locator(".sidebar-scrim")).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /(Show|Hide) sidebar/ })).toHaveAttribute("aria-expanded", "false");
+  await expect.poll(railCollapsed).toBe(true);
+
+  // The documented keyboard shortcut must drive the same desktop state.
+  await page.keyboard.press("ControlOrMeta+b");
+  await expect.poll(railWidth).toBeGreaterThan(200);
+  await expect(page.getByRole("button", { name: /(Show|Hide) sidebar/ })).toHaveAttribute("aria-expanded", "true");
+});
+
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile shell coverage only runs in mobile project.");
-  await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: "Toggle sidebar" }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
+  await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await contextRing.click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);
 });
 
 test("mobile foreground reconnects to an in-progress response", async ({ page, context }, testInfo) => {
@@ -184,7 +237,7 @@ test("mobile shell keeps controls inside emulated safe areas", async ({ page }, 
   const session = await page.context().newCDPSession(page);
   await session.send("Emulation.setSafeAreaInsetsOverride", { insets });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
 
   async function safeAreaBounds(selector: string): Promise<{ top: number; right: number; bottom: number; left: number; width: number; height: number }> {
     const bounds = await page.locator(selector).evaluate((element) => {
@@ -212,7 +265,7 @@ test("mobile shell keeps controls inside emulated safe areas", async ({ page }, 
   await expectInsideSafeArea(".app-dialog");
   await page.keyboard.press("Escape");
 
-  await page.getByRole("button", { name: "Toggle sidebar" }).click();
+  await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click();
   await page.getByText("Preferences").click();
   await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible();
   await expectInsideSafeArea(".drawer-head .icon-button");
@@ -230,7 +283,7 @@ test("mobile shell keeps controls inside emulated safe areas", async ({ page }, 
 test("composer pickers stay within the mobile viewport", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile viewport coverage only runs in mobile project.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await expect(page.getByRole("button", { name: "Open composer options" })).toBeVisible();
   await expect(page.locator(".composer-toolbar")).toHaveCount(0);
   await expect(page.locator(".composer-active-chip")).toHaveCount(0);
@@ -264,7 +317,7 @@ test("composer pickers stay within the mobile viewport", async ({ page }, testIn
 test("mobile Return inserts a composer newline", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile keyboard behavior only runs in mobile project.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const composer = page.getByPlaceholder(/Ask CopilotChat/);
   await composer.fill("First line");
   await composer.press("Enter");
@@ -275,7 +328,7 @@ test("mobile Return inserts a composer newline", async ({ page }, testInfo) => {
 test("project navigation shows editable context and project chats", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers project landing page.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-row").filter({ hasText: "New project" }).click();
   await page.getByRole("dialog", { name: "New project" }).getByLabel("Project name").fill("Landing project");
   await page.getByRole("button", { name: "Create project" }).click();
@@ -330,7 +383,7 @@ test("project navigation shows editable context and project chats", async ({ pag
   await expect(page.getByRole("button", { name: "Start a new chat" })).toBeVisible();
   await page.locator(".sidebar-row").filter({ hasText: "General" }).click();
   await expect(page).toHaveURL(/\/$/);
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
 });
 
 test("personal context and coarse location are included in chats", async ({ page, context }, testInfo) => {
@@ -338,7 +391,7 @@ test("personal context and coarse location are included in chats", async ({ page
   await context.grantPermissions(["geolocation"]);
   await context.setGeolocation({ latitude: 47.60621, longitude: -122.33207 });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-footer-user").click();
   const drawer = page.getByRole("dialog", { name: "Personal context" });
   const profile = "I am a staff engineer who prefers concise TypeScript examples.";
@@ -627,7 +680,7 @@ test("superseded memory reload errors stay hidden", async ({ page, request }, te
 test("abandoned empty chats are removed from the sidebar", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers sidebar cleanup.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-new").click();
   await expect(page).toHaveURL(/\/chats\/[^/]+$/);
   const firstChatId = page.url().split("/").pop() ?? "";
@@ -657,14 +710,14 @@ test("setup banner waits until provider state has loaded", async ({ page }) => {
   await expect(page.getByRole("button", { name: "Fix setup" })).toHaveCount(0);
   await expect(page.getByText("Copilot needs authentication in this terminal.")).toHaveCount(0);
   releaseState();
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await expect(page.getByRole("button", { name: "Fix setup" })).toHaveCount(0);
 });
 
 test("preferences text size slider scales the app and persists", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers preferences appearance controls.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const defaultBodySize = await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize));
   expect(defaultBodySize).toBeLessThan(15);
   await page.locator(".sidebar-preferences-row").click();
@@ -684,7 +737,7 @@ test("preferences text size slider scales the app and persists", async ({ page }
   const largerBodySize = await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize));
   expect(largerBodySize).toBeGreaterThan(defaultBodySize + 2);
   await page.reload();
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-preferences-row").click();
   await expect(page.getByLabel("Text size")).toHaveValue("115");
   const persistedBodySize = await page.evaluate(() => parseFloat(getComputedStyle(document.body).fontSize));
@@ -694,7 +747,7 @@ test("preferences text size slider scales the app and persists", async ({ page }
 test("preferences import starts a guided import chat", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers guided imports from Preferences.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-preferences-row").click();
   const preferences = page.getByRole("dialog", { name: "Preferences" });
   await expect(preferences.getByText("Import data")).toBeVisible();
@@ -717,7 +770,7 @@ test("failed guided imports discard their staged upload", async ({ page }, testI
   await page.route("**/api/imports/drafts", async (route) => route.fulfill({ status: 413, contentType: "application/json", body: JSON.stringify({ error: "Import exceeds limit" }) }));
   await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-preferences-row").click();
   await page.getByRole("dialog", { name: "Preferences" }).locator('input[type="file"]').setInputFiles({ name: "too-large.json", mimeType: "application/json", buffer: Buffer.from("{}") });
 
@@ -728,7 +781,7 @@ test("failed guided imports discard their staged upload", async ({ page }, testI
 test("composer sends attached files and pasted images", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer attachments.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("attachment notes") });
   await expect(page.locator(".attachment-tray").filter({ hasText: "notes.txt" })).toBeVisible();
@@ -878,7 +931,7 @@ test("composer retains successful files and discards each upload once", async ({
     await route.continue();
   });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator('.composer input[type="file"]').setInputFiles([
     { name: "good.txt", mimeType: "text/plain", buffer: Buffer.from("keep me") },
     { name: "bad.txt", mimeType: "text/plain", buffer: Buffer.from("reject me") },
@@ -908,7 +961,7 @@ test("uploads large files in chunks when a proxy caps request bodies", async ({ 
     await route.continue();
   });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
 
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "camera-photo.jpg", mimeType: "image/jpeg", buffer: Buffer.alloc(3 * 1024 * 1024, 9) });
 
@@ -929,7 +982,7 @@ test("explains proxy upload rejections instead of blaming chat context", async (
     await route.fulfill({ status: 413, contentType: "text/html", body: "<html><head><title>413 Request Entity Too Large</title></head><body></body></html>" });
   });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
 
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "IMG_9876.jpg", mimeType: "image/jpeg", buffer: Buffer.alloc(2048, 7) });
 
@@ -942,7 +995,7 @@ test("explains proxy upload rejections instead of blaming chat context", async (
 test("composer retains staged uploads when message acceptance fails", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers composer submission failures.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "retry.txt", mimeType: "text/plain", buffer: Buffer.from("retry me") });
   await composer.fill("Please retry this.");
@@ -974,7 +1027,7 @@ test("composer disables attachment removal while message submission is pending",
     await route.continue();
   });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "pending-submit.txt", mimeType: "text/plain", buffer: Buffer.from("keep staged") });
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Hold this submission.");
   await page.getByRole("button", { name: "Send" }).click();
@@ -998,7 +1051,7 @@ test("composer disables submission while selected files are uploading", async ({
     await route.continue();
   });
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const selecting = page.locator('.composer input[type="file"]').setInputFiles({ name: "pending.txt", mimeType: "text/plain", buffer: Buffer.from("pending") });
   await uploadStarted;
   const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
@@ -1015,7 +1068,7 @@ test("composer disables submission while selected files are uploading", async ({
 test("Escape discards staged composer uploads", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers slash-menu resets.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator('.composer input[type="file"]').setInputFiles({ name: "escape.txt", mimeType: "text/plain", buffer: Buffer.from("discard me") });
   let deleteCount = 0;
   await page.route("**/api/uploads/*", async (route) => { deleteCount += 1; await route.continue(); });
@@ -1033,7 +1086,7 @@ test("Escape discards staged composer uploads", async ({ page }, testInfo) => {
 test("composer shows slash command autocomplete with descriptions", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers slash command suggestions.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const composer = page.getByPlaceholder(/Ask CopilotChat|Reply in/);
   await composer.fill("/");
   const menu = page.getByRole("listbox", { name: "Slash commands" });
@@ -1048,7 +1101,7 @@ test("composer shows slash command autocomplete with descriptions", async ({ pag
 test("installed skills auto-trigger by rules and explicit name", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers skill management.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Skills/ }).click();
   await page.getByRole("button", { name: "Manage" }).click();
@@ -1071,7 +1124,7 @@ test("installed skills auto-trigger by rules and explicit name", async ({ page }
 test("assistant can auto-title chats until the user renames them", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers chat title updates.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Durable chat naming patterns across products need short summaries.");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last()).toBeVisible({ timeout: 15000 });
@@ -1092,7 +1145,7 @@ test("assistant can auto-title chats until the user renames them", async ({ page
 test("chat header reports AI credit usage as it accumulates", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers the header usage readout.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const usagePill = page.locator(".usage-pill");
   await expect(usagePill).toHaveCount(0);
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("First note about credits.");
@@ -1116,7 +1169,7 @@ test("chat header reports AI credit usage as it accumulates", async ({ page }, t
 });
 
 test("long code blocks scroll horizontally without page overflow", async ({ page }, testInfo) => {  await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   if (testInfo.project.name === "desktop") {
     await page.locator(".sidebar-new").click();
     await expect(page).toHaveURL(/\/chats\/[^/]+$/);
@@ -1148,7 +1201,7 @@ test("long code blocks scroll horizontally without page overflow", async ({ page
 test("mobile assistant markdown stays within the viewport", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile viewport regression.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const longToken = `urlcheck_${"segment_".repeat(22)}done`;
   await page.getByPlaceholder(/Ask CopilotChat/).fill(`Recommended sequence:
 
@@ -1172,7 +1225,7 @@ test("mobile assistant markdown stays within the viewport", async ({ page }, tes
 test("mobile tool call details scroll inside the activity card", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile viewport regression.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat/).fill("Please show a long tool payload to test tool overflow.");
   await page.getByRole("button", { name: "Send" }).click();
   const response = page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last();
@@ -1209,7 +1262,7 @@ test("browser back closes app surfaces before leaving", async ({ page }, testInf
   test.skip(testInfo.project.name !== "desktop", "Desktop covers browser back guard.");
   await page.goto("/");
   const appUrl = page.url();
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.locator(".sidebar-preferences-row").click();
   await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible();
   await page.evaluate(() => history.back());
@@ -1223,8 +1276,11 @@ test("browser back closes app surfaces before leaving", async ({ page }, testInf
 test("context menus and popups dismiss when touching elsewhere", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers pointer dismissal behavior.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const contextRing = page.getByRole("button", { name: /Context:/ });
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("Context ring check.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(contextRing).toBeVisible();
   await contextRing.click();
   await expect(page.locator("#context-details")).toBeVisible();
   await page.locator(".scroll").click({ position: { x: 12, y: 12 } });
@@ -1249,7 +1305,7 @@ test("context menus and popups dismiss when touching elsewhere", async ({ page }
 test("refresh reconnects to an in-progress response", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers refresh-safe streaming.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const prompt = `Refresh persistence ${"long context ".repeat(900)}`;
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
@@ -1262,7 +1318,7 @@ test("refresh reconnects to an in-progress response", async ({ page }, testInfo)
 test("chat list indicates running and unread background chats", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers sidebar chat indicators.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Background indicator ${"keep streaming ".repeat(1200)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page).toHaveURL(/\/chats\/[^/]+$/);
@@ -1280,7 +1336,7 @@ test("chat list indicates running and unread background chats", async ({ page },
 test("assistant responses stream incrementally before the final message is saved", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers streaming behavior.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Streaming regression ${"keep streaming ".repeat(1200)}`);
   await page.getByRole("button", { name: "Send" }).click();
   const streamingResponse = page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last();
@@ -1310,7 +1366,7 @@ test("a dropped stream reconnects without losing the running response", async ({
   page.on("request", (request) => { if (request.method() === "GET" && /\/api\/chats\/[^/]+\/messages/.test(request.url())) messageFetches += 1; });
   try {
     await page.goto("http://localhost:4529/");
-    await expect(page.getByText(/Back at it/i)).toBeVisible();
+    await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
     await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`start a long response ${"keep streaming ".repeat(6000)}`);
     await page.getByRole("button", { name: "Send" }).click();
     await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
@@ -1337,7 +1393,7 @@ test("a dropped stream reconnects without losing the running response", async ({
 test("editing works after stopping an in-progress response", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers stop/edit behavior.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Stop then edit ${"keep streaming ".repeat(1200)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.user").filter({ hasText: "Stop then edit" })).toBeVisible();
@@ -1354,7 +1410,7 @@ test("editing works after stopping an in-progress response", async ({ page }, te
 test("assistant thinking and tool use render as expandable activity", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers assistant activity rendering.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Please show thinking and tool use. ${"keep it observable ".repeat(500)}`);
   await page.getByRole("button", { name: "Send" }).click();
   const streamingResponse = page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last();
@@ -1389,7 +1445,7 @@ test("assistant thinking and tool use render as expandable activity", async ({ p
 test("long tool-call runs collapse into an expandable group", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers assistant activity rendering.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please show many tool calls for a tool call group.");
   await page.getByRole("button", { name: "Send" }).click();
   const finalResponse = page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last();
@@ -1420,7 +1476,7 @@ test("long tool-call runs collapse into an expandable group", async ({ page }, t
 test("task lists show progress and can collapse", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers task-list rendering.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please create a task list with progress.");
   await page.getByRole("button", { name: "Send" }).click();
   const finalResponse = page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last();
@@ -1439,7 +1495,7 @@ test("task lists show progress and can collapse", async ({ page }, testInfo) => 
 test("agent questions and tool permissions are interactive, with auto-approval", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers agent interaction prompts.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please ask me a question and request permission.");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("Agent question")).toBeVisible();
@@ -1461,13 +1517,13 @@ test("agent questions and tool permissions are interactive, with auto-approval",
   await expect(urlPermission.locator(".interaction-detail")).toContainText("GET");
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
-  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await enableAutoApprove(page);
   await expect(page.locator(".thread .interaction-card.permission")).toHaveCount(0);
   await expect(page.locator(".msg.assistant").filter({ hasText: "Permission decision: approved." }).last()).toBeVisible({ timeout: 15000 });
 
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
-  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await enableAutoApprove(page, { expectConfirm: false });
   await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please request permission.");
   await page.getByRole("button", { name: "Send" }).click();
@@ -1478,7 +1534,7 @@ test("agent questions and tool permissions are interactive, with auto-approval",
 test("subagent work renders as collapsible activity", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers subagent activity rendering.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Please delegate this to a subagent.");
   await page.getByRole("button", { name: "Send" }).click();
   const finalResponse = page.locator(".msg.assistant").filter({ hasText: "Configure Copilot auth/provider settings" }).last();
@@ -1500,7 +1556,7 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
 test("users can steer and queue while a response is running", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers running composer controls.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
@@ -1511,7 +1567,7 @@ test("users can steer and queue while a response is running", async ({ page }, t
   await expect(page.locator(".attachment-tray").filter({ hasText: "steer-note.txt" })).toBeVisible();
   await page.getByRole("button", { name: "Open composer options" }).click();
   await page.getByRole("dialog", { name: "Composer options" }).getByRole("button", { name: /Tool permissions/ }).click();
-  await page.getByRole("button", { name: "Auto-approve tool requests" }).click();
+  await enableAutoApprove(page);
   await expect(page.getByRole("button", { name: "Tool auto-approval is on" })).toBeVisible();
   await page.getByPlaceholder(/Steer or queue/).fill("Please steer this response.");
   const steerButton = page.getByRole("button", { name: "Steer response" });
@@ -1547,7 +1603,7 @@ test("users can steer and queue while a response is running", async ({ page }, t
 test("message POST rejects payloads while a response is active", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers active response message routing.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
@@ -1567,7 +1623,7 @@ test("message POST rejects payloads while a response is active", async ({ page }
 test("chat viewport follows live updates and can jump back to live", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers chat viewport scrolling.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   const scroll = page.locator(".scroll");
   const distanceFromBottom = () => scroll.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Live scroll seed ${"long content ".repeat(900)}`);
@@ -1629,7 +1685,7 @@ test("a backgrounded response never streams into the visible chat", async ({ pag
 test("guided import starts its chat while another chat is generating", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers guided imports from Preferences.");
   await page.goto("/");
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat/).fill(`Start a long response ${"keep streaming ".repeat(900)}`);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator(".msg.assistant").filter({ has: page.locator(".cursor") }).last()).toBeVisible();
@@ -1644,4 +1700,29 @@ test("guided import starts its chat while another chat is generating", async ({ 
   await expect(page.getByRole("dialog", { name: "Preferences" })).toHaveCount(0);
   await expect(page.locator(".msg.user").filter({ hasText: "Import draft ID:" })).toBeVisible({ timeout: 20000 });
   await expect(page.locator(".msg.user")).toHaveCount(1);
+});
+
+// Runs last: it clears all data to assert a genuine first-run state, so it must
+// not disturb the shared state earlier tests build up.
+test("first run teaches the product instead of greeting a returning user", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Copy is shared; desktop covers it once.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  // Reset to a genuine empty state so this asserts first-run copy, not leftover data.
+  const cleared = await page.evaluate(async () => (await fetch("/api/data", { method: "DELETE", headers: { "x-copilotchat-csrf": "1" } })).ok);
+  expect(cleared).toBe(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toBeVisible();
+  await expect(page.getByText(/sent to GitHub Copilot to generate replies/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Work against a local folder/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Add tools with MCP/ })).toBeVisible();
+  await expect(page.getByText(/Back at it/i)).toHaveCount(0);
+
+  // A chat makes this a returning user, so the greeting must change back.
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("First run check.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").last()).toBeVisible();
+  await page.locator("button.sidebar-new").click();
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toHaveCount(0);
 });

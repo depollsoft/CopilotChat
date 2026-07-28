@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatAic, formatMemoryContext, nanoAiuPerAic } from "./index.js";
+import { formatAic, formatMemoryContext, nanoAiuPerAic, titleFromContent } from "./index.js";
 
 describe("formatAic", () => {
   it("formats nano-AI units as AI credits", () => {
@@ -35,5 +35,47 @@ describe("formatMemoryContext", () => {
 
     expect(context.length).toBeLessThanOrEqual(16_000);
     expect(context).toContain("memories omitted");
+  });
+});
+
+describe("titleFromContent", () => {
+  it("strips markdown so derived chat titles read as plain text", () => {
+    expect(titleFromContent("Show me a **markdown** sample")).toBe("Show me a markdown sample");
+    expect(titleFromContent("## Plan the _next_ release")).toBe("Plan the next release");
+    expect(titleFromContent("- Fix `parseArgs` in the CLI")).toBe("Fix parseArgs in the CLI");
+    expect(titleFromContent("Read [the guide](https://example.com) first")).toBe("Read the guide first");
+    expect(titleFromContent("~~Drop~~ Keep the cache")).toBe("Drop Keep the cache");
+  });
+  it("falls back when a message carries no prose", () => {
+    expect(titleFromContent("```ts\nconst a = 1;\n```")).toBe("New chat");
+    expect(titleFromContent("   ")).toBe("New chat");
+  });
+  it("keeps the six-word bound", () => {
+    expect(titleFromContent("one two three four five six seven eight")).toBe("one two three four five six");
+  });
+  it("leaves developer identifiers intact", () => {
+    expect(titleFromContent("Why does my_var_name crash?")).toBe("Why does my_var_name crash?");
+    expect(titleFromContent("What is __init__ for?")).toBe("What is __init__ for?");
+    expect(titleFromContent("Open _file_name.txt")).toBe("Open _file_name.txt");
+    expect(titleFromContent("value is 5_000_000")).toBe("value is 5_000_000");
+    expect(titleFromContent("Fix snake_case in the parser")).toBe("Fix snake_case in the parser");
+  });
+  it("still strips genuine underscore emphasis", () => {
+    expect(titleFromContent("Plan the _next_ release")).toBe("Plan the next release");
+    expect(titleFromContent("__really important__ fix")).toBe("really important fix");
+  });
+  it("treats tilde fences as code like backtick fences", () => {
+    expect(titleFromContent("~~~ts\nconst a = 1;\n~~~")).toBe("New chat");
+    expect(titleFromContent("~~~\ncode here\n~~~\nExplain this snippet")).toBe("Explain this snippet");
+    expect(titleFromContent("~~~py\n" + "x = 1\n".repeat(600) + "~~~")).toBe("New chat");
+    // Two tildes are strikethrough, not a fence, and must still read as prose.
+    expect(titleFromContent("~~Drop~~ Keep the cache")).toBe("Drop Keep the cache");
+  });
+  it("stays fast on adversarial input", () => {
+    const started = Date.now();
+    titleFromContent("[".repeat(80_000) + "]x");
+    titleFromContent("*".repeat(80_000));
+    titleFromContent("`".repeat(80_000));
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });
