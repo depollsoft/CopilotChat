@@ -696,7 +696,7 @@ function Header(p: { chatTitle: string; projectName: string | null; chatFavorite
   function run(action?: () => void): void { if (!action) return; setShowOverflow(false); action(); }
   return <header className={`header${p.busy ? " thinking" : ""}`}>
     <div className="header-left">
-      <button className="header-pill icon-only" aria-label={p.sidebarHidden ? "Show sidebar" : "Hide sidebar"} aria-expanded={!p.sidebarHidden} onClick={p.onToggleSidebar}><IconMenu/></button>
+      <button data-focus-fallback className="header-pill icon-only" aria-label={p.sidebarHidden ? "Show sidebar" : "Hide sidebar"} aria-expanded={!p.sidebarHidden} onClick={p.onToggleSidebar}><IconMenu/></button>
       {p.projectName ? <button className="header-pill project-pill" aria-label={`Project: ${p.projectName}`} title={p.projectName}><IconFolder width={18}/><span>{p.projectName}</span></button> : null}
     </div>
     <div className="header-controls">
@@ -756,7 +756,7 @@ function AppDialogView(p: { dialog: AppDialog; onClose: () => void; onError: (me
       setWorking(false);
     }
   }
-  return <><div className="modal-scrim" onClick={working ? undefined : p.onClose}/><form className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" ref={dialogRef} onSubmit={(e) => { e.preventDefault(); void confirm(); }}><div className="app-dialog-head"><div><h2 id="app-dialog-title">{p.dialog.title}</h2>{p.dialog.kind === "text" && p.dialog.message ? <p>{p.dialog.message}</p> : p.dialog.kind === "confirm" ? <p>{p.dialog.message}</p> : null}</div><button type="button" className="icon-button" aria-label="Close" disabled={working} onClick={p.onClose}><IconClose/></button></div><div className="app-dialog-body">{p.dialog.kind === "text" ? <FormField label={p.dialog.label}><input autoFocus value={value} placeholder={p.dialog.placeholder} onChange={(e) => setValue(e.target.value)} /></FormField> : p.dialog.requireText ? <FormField label={`Type ${p.dialog.requireText} to confirm`} hint="This extra step protects local data from accidental deletion."><input autoFocus value={confirmValue} onChange={(e) => setConfirmValue(e.target.value)} /></FormField> : null}</div><div className="app-dialog-actions"><button type="button" className="btn" disabled={working} onClick={p.onClose}>Cancel</button><button className={`btn ${p.dialog.kind === "confirm" && p.dialog.danger ? "btn-danger" : "btn-primary"}`} disabled={!canConfirm || working}>{working ? "Working…" : p.dialog.confirmLabel}</button></div></form></>;
+  return <><div className="modal-scrim" onClick={working ? undefined : p.onClose}/><form className="app-dialog" role="dialog" aria-modal="true" aria-labelledby="app-dialog-title" ref={dialogRef} onSubmit={(e) => { e.preventDefault(); void confirm(); }}><div className="app-dialog-head"><div><h2 id="app-dialog-title">{p.dialog.title}</h2>{p.dialog.kind === "text" && p.dialog.message ? <p>{p.dialog.message}</p> : p.dialog.kind === "confirm" ? <p>{p.dialog.message}</p> : null}</div><button type="button" className="icon-button" aria-label="Close" disabled={working} onClick={p.onClose}><IconClose/></button></div><div className="app-dialog-body">{p.dialog.kind === "text" ? <FormField label={p.dialog.label}><input data-autofocus value={value} placeholder={p.dialog.placeholder} onChange={(e) => setValue(e.target.value)} /></FormField> : p.dialog.requireText ? <FormField label={`Type ${p.dialog.requireText} to confirm`} hint="This extra step protects local data from accidental deletion."><input data-autofocus value={confirmValue} onChange={(e) => setConfirmValue(e.target.value)} /></FormField> : null}</div><div className="app-dialog-actions"><button type="button" className="btn" disabled={working} onClick={p.onClose}>Cancel</button><button className={`btn ${p.dialog.kind === "confirm" && p.dialog.danger ? "btn-danger" : "btn-primary"}`} disabled={!canConfirm || working}>{working ? "Working…" : p.dialog.confirmLabel}</button></div></form></>;
 }
 function ShortcutsDialog(p: { onClose: () => void }) { const dialogRef = useModalDialog<HTMLElement>(true, p.onClose); return <><div className="modal-scrim" onClick={p.onClose}/><section className="app-dialog shortcuts-dialog" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" ref={dialogRef}><div className="app-dialog-head"><div><h2 id="shortcuts-title">Keyboard shortcuts</h2><p>Fast paths for the local workbench. These never override typing in the composer or form fields.</p></div><button className="icon-button" aria-label="Close" onClick={p.onClose}><IconClose/></button></div><dl className="shortcut-list"><div><dt><kbd>⌘/Ctrl</kbd><kbd>K</kbd></dt><dd>Open this shortcut guide</dd></div><div><dt><kbd>⌘/Ctrl</kbd><kbd>N</kbd></dt><dd>Start a new chat in the current project/workspace</dd></div><div><dt><kbd>⌘/Ctrl</kbd><kbd>,</kbd></dt><dd>Open Preferences</dd></div><div><dt><kbd>⌘/Ctrl</kbd><kbd>B</kbd></dt><dd>Toggle the sidebar</dd></div><div><dt><kbd>?</kbd></dt><dd>Show shortcuts when focus is not in an input</dd></div><div><dt><kbd>Esc</kbd></dt><dd>Close menus, dialogs, and panels</dd></div></dl></section></>; }
 function ConfirmButton(p: { className?: string; label: string; confirmLabel?: string; disabled?: boolean; onConfirm: () => void | Promise<void> }) { const [confirming, setConfirming] = useState(false); const [working, setWorking] = useState(false); async function click(): Promise<void> { if (p.disabled || working) return; if (!confirming) { setConfirming(true); window.setTimeout(() => setConfirming(false), 3000); return; } setWorking(true); try { await p.onConfirm(); } finally { setWorking(false); setConfirming(false); } } return <button type="button" className={p.className ?? "btn btn-sm btn-danger"} disabled={p.disabled || working} onClick={() => void click()}>{working ? "Working…" : confirming ? p.confirmLabel ?? "Confirm" : p.label}</button>; }
@@ -809,7 +809,7 @@ function ProjectEditorModal(p: { editor: ProjectEditorState; onClose: () => void
   useEffect(() => { setValue(p.editor.value); setReferenceTitle(p.editor.kind === "reference" ? p.editor.referenceTitle : ""); }, [p.editor]);
   const dialogRef = useModalDialog<HTMLDivElement>(true, p.onClose);
   function save(): void { if (p.editor.kind === "reference") p.onSave({ ...p.editor, referenceTitle, value }); else p.onSave({ ...p.editor, value }); }
-  return <><div className="modal-scrim" onClick={p.onClose}/><div className="editor-modal" role="dialog" aria-modal="true" aria-label={p.editor.title} ref={dialogRef}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea data-autofocus aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} autoFocus /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></div></>;
+  return <><div className="modal-scrim" onClick={p.onClose}/><div className="editor-modal" role="dialog" aria-modal="true" aria-label={p.editor.title} ref={dialogRef}><div className="drawer-head"><div><h2>{p.editor.title}</h2><p>Make changes in a larger editor, then save them into project context.</p></div><button className="icon-button" aria-label="Close editor" onClick={p.onClose}><IconClose/></button></div><div className="editor-modal-body">{p.editor.kind === "reference" ? <><label>Reference title</label><input aria-label="Reference title" value={referenceTitle} onChange={(e) => setReferenceTitle(e.target.value)} /></> : null}<label>{p.editor.kind === "instructions" ? "Instructions" : "Reference content"}</label><textarea data-autofocus aria-label="Project context editor" value={value} placeholder={p.editor.kind === "reference" ? "Paste source material every chat should see." : p.editor.placeholder} onChange={(e) => setValue(e.target.value)} /></div><div className="editor-modal-actions"><button className="btn" onClick={p.onClose}>Cancel</button><button className="btn btn-primary" disabled={p.editor.kind === "reference" ? !referenceTitle.trim() || !value.trim() : false} onClick={save}>Save changes</button></div></div></>;
 }
 const Markdown = React.memo(function Markdown(p: { children: string }) { const parts = useMemo(() => splitMarkdownTaskLists(p.children), [p.children]); if (parts.length === 1 && parts[0]?.kind === "markdown") return <MarkdownText>{p.children}</MarkdownText>; return <>{parts.map((part, index) => part.kind === "tasks" ? <TaskListCard key={index} items={part.items} /> : <MarkdownText key={index}>{part.content}</MarkdownText>)}</>; });
 const MarkdownText = React.memo(function MarkdownText(p: { children: string }) { return <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeSanitize]} components={markdownComponents}>{p.children}</ReactMarkdown>; });
@@ -1666,6 +1666,18 @@ function contextRingLabel(status: ContextStatus): string { if (!status.limitToke
 const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
 /** Open modal dialogs, innermost last. Only the topmost one handles Escape and Tab. */
 const modalStack: symbol[] = [];
+let lastFocusOutsideModal: HTMLElement | null = null;
+document.addEventListener("focusin", (event) => {
+  if (modalStack.length > 0) return;
+  if (event.target instanceof HTMLElement) lastFocusOutsideModal = event.target;
+}, true);
+/** A control is only worth restoring focus to if it is still on screen. */
+function isReachable(element: HTMLElement): boolean {
+  if (!document.contains(element)) return false;
+  const rect = element.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
+}
 function useModalDialog<T extends HTMLElement>(active: boolean, onClose: () => void): React.RefObject<T | null> {
   const ref = useRef<T | null>(null);
   const closeRef = useRef(onClose);
@@ -1675,7 +1687,7 @@ function useModalDialog<T extends HTMLElement>(active: boolean, onClose: () => v
     const token = Symbol("modal-dialog");
     modalStack.push(token);
     const isTopmost = (): boolean => modalStack[modalStack.length - 1] === token;
-    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const opener = lastFocusOutsideModal;
     const node = ref.current;
     function focusable(): HTMLElement[] {
       if (!ref.current) return [];
@@ -1708,7 +1720,12 @@ function useModalDialog<T extends HTMLElement>(active: boolean, onClose: () => v
       if (index >= 0) modalStack.splice(index, 1);
       node?.removeEventListener("keydown", keyDown);
       document.removeEventListener("keydown", keyDown, true);
-      if (opener && document.contains(opener)) opener.focus();
+      if (modalStack.length > 0) return;
+      // The opener can be scrolled away or hidden by the time the dialog closes
+      // (a mobile sidebar button, for example), so fall back to a stable control.
+      const fallback = document.querySelector<HTMLElement>("[data-focus-fallback]");
+      if (opener && isReachable(opener)) opener.focus();
+      else fallback?.focus();
     };
   }, [active]);
   return ref;

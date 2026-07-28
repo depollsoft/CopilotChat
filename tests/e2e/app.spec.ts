@@ -152,6 +152,61 @@ test("project model defaults apply to the first turn", async ({ page }, testInfo
   await expect(response).toContainText("Context size: default.");
 });
 
+test("first run teaches the product instead of greeting a returning user", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Copy is shared; desktop covers it once.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  // Reset to a genuine empty state so this asserts first-run copy, not leftover data.
+  const cleared = await page.evaluate(async () => (await fetch("/api/data", { method: "DELETE", headers: { "x-copilotchat-csrf": "1" } })).ok);
+  expect(cleared).toBe(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toBeVisible();
+  await expect(page.getByText(/sent to GitHub Copilot to generate replies/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Work against a local folder/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Add tools with MCP/ })).toBeVisible();
+  await expect(page.getByText(/Back at it/i)).toHaveCount(0);
+
+  // A chat makes this a returning user, so the greeting must change back.
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("First run check.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").last()).toBeVisible();
+  await page.locator("button.sidebar-new").click();
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toHaveCount(0);
+});
+
+test("desktop sidebar collapses, restores, and persists", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop owns the collapsible rail.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  const sidebar = page.locator(".sidebar");
+  const toggle = page.getByRole("button", { name: /(Show|Hide) sidebar/ });
+  const railWidth = async (): Promise<number> => page.evaluate(() => Math.round(document.querySelector(".sidebar")!.getBoundingClientRect().width));
+  const railCollapsed = async (): Promise<boolean> => page.evaluate(() => getComputedStyle(document.querySelector(".app")!).gridTemplateColumns.startsWith("0px") && getComputedStyle(document.querySelector(".sidebar")!).visibility === "hidden");
+
+  await expect(sidebar).toBeVisible();
+  expect(await railWidth()).toBeGreaterThan(200);
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(toggle).toHaveAccessibleName("Hide sidebar");
+
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "false");
+  await expect(toggle).toHaveAccessibleName("Show sidebar");
+  await expect.poll(railCollapsed).toBe(true);
+  // The mobile scrim must never appear on desktop.
+  await expect(page.locator(".sidebar-scrim")).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /(Show|Hide) sidebar/ })).toHaveAttribute("aria-expanded", "false");
+  await expect.poll(railCollapsed).toBe(true);
+
+  // The documented keyboard shortcut must drive the same desktop state.
+  await page.keyboard.press("ControlOrMeta+b");
+  await expect.poll(railWidth).toBeGreaterThan(200);
+  await expect(page.getByRole("button", { name: /(Show|Hide) sidebar/ })).toHaveAttribute("aria-expanded", "true");
+});
+
 test("mobile shell has no horizontal overflow and navigates drawers", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile", "Mobile shell coverage only runs in mobile project.");
   await page.goto("/"); await expect(page.locator('meta[name="viewport"]')).toHaveAttribute("content", /viewport-fit=cover/); await expect(page.locator("body")).toBeVisible(); const modelButton = page.getByRole("button", { name: /Model picker:/ }); await expect(modelButton).toBeVisible(); await modelButton.click(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Reasoning effort")).toBeVisible(); await expect(page.getByRole("dialog", { name: "Model picker" }).getByLabel("Context size")).toBeVisible(); await page.keyboard.press("Escape"); const contextRing = page.getByRole("button", { name: /Context:/ }); await page.getByPlaceholder(/Ask CopilotChat/).fill("Mobile actions check."); await page.getByRole("button", { name: "Send" }).click(); await expect(contextRing).toBeVisible(); await contextRing.click(); await expect(page.locator("#context-details")).toContainText(/Estimated/); await contextRing.click(); await expect(page.locator(".msg.user").filter({ hasText: "Mobile actions check." }).getByRole("button", { name: "Edit message" })).toBeVisible(); await expect(page.locator(".msg.assistant").getByRole("button", { name: "Retry response" }).last()).toBeVisible(); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.locator(".sidebar.open")).toBeVisible(); await page.evaluate(() => history.back()); await expect(page.locator(".sidebar.open")).toHaveCount(0); await page.getByRole("button", { name: /(Show|Hide) sidebar/ }).click(); await expect(page.getByText("Projects")).toBeVisible(); await page.getByText("Preferences").click(); await expect(page.getByRole("dialog", { name: "Preferences" })).toBeVisible(); const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 2); expect(overflow).toBe(false);

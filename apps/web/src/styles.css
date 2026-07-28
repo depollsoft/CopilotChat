@@ -169,7 +169,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .sidebar-scroll { flex: 1; min-height: 0; overflow: auto; padding: 2px; }
 .sidebar-section-label { padding: 12px 10px 4px; color: var(--text-muted); font-size: var(--text-label); font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
 .sidebar-row { display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; width: 100%; padding: 0 10px; text-align: left; }
-.sidebar-row.composite { grid-template-columns: minmax(0,1fr) auto; padding: 0 6px 0 0; }
+.sidebar-row.composite { grid-template-columns: minmax(0,1fr) auto; column-gap: 4px; padding: 0 6px 0 0; }
 .sidebar-row-main { display: grid; grid-template-columns: minmax(0,1fr) auto; align-items: center; gap: 5px; min-width: 0; min-height: 44px; padding: 0 4px 0 10px; border-radius: inherit; color: inherit; text-align: left; }
 .sidebar-row-title { display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sidebar-row-flags { display: inline-flex; align-items: center; gap: 2px; color: var(--accent); }
@@ -527,13 +527,13 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .composer-chip:hover { background: color-mix(in srgb, var(--surface-muted) 72%, var(--accent)); }
 .composer-chip .label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-chip.on { outline: 2px solid color-mix(in srgb, var(--accent) 42%, transparent); }
-.composer-active-chip { display: grid; place-items: center; flex: 0 0 auto; width: 36px; height: 36px; border-radius: var(--radius-pill); background: color-mix(in srgb, var(--accent) 10%, var(--surface-muted)); color: var(--text); }
+.composer-active-chip { position: relative; display: grid; place-items: center; flex: 0 0 auto; width: 40px; height: 40px; border-radius: var(--radius-pill); background: color-mix(in srgb, var(--accent) 10%, var(--surface-muted)); color: var(--text); }
 .composer-active-chip.danger { background: color-mix(in srgb, var(--danger) 10%, var(--surface-muted)); color: var(--danger); }
 .count { min-width: 18px; height: 18px; display: grid; place-items: center; padding: 0 5px; border-radius: var(--radius-pill); background: var(--accent); color: var(--accent-text); font-size: var(--text-label); }
 .composer-send { position: relative; flex: 0 0 auto; display: grid; place-items: center; width: 40px; height: 40px; border-radius: var(--radius-pill); background: var(--accent); color: var(--accent-text); }
 .composer-send.secondary { background: var(--surface-muted); color: var(--text); }
 .composer-running-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; }
-.composer-running-button { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 36px; height: 36px; padding: 0; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface-muted); color: var(--text); font-size: var(--text-label); font-weight: 850; touch-action: manipulation; }
+.composer-running-button { position: relative; display: inline-grid; place-items: center; flex: 0 0 auto; width: 40px; height: 40px; padding: 0; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface-muted); color: var(--text); font-size: var(--text-label); font-weight: 850; touch-action: manipulation; }
 .composer-running-button:hover:not(:disabled), .composer-running-button:focus-visible { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); background: color-mix(in srgb, var(--surface-muted) 76%, var(--accent)); }
 .composer-running-button.danger { background: color-mix(in srgb, var(--danger) 8%, var(--surface)); color: var(--danger); border-color: color-mix(in srgb, var(--danger) 24%, var(--border)); }
 .composer-running-button:disabled { opacity: .52; }
@@ -748,7 +748,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .composer-chip .label { max-width: 60px; }
   .composer-send { width: 40px; height: 40px; }
   .composer-running-actions { gap: 4px; }
-  .composer-running-button { width: 38px; height: 38px; }
+  .composer-running-button { width: 40px; height: 40px; }
   .composer-hint { display: none; }
   .drawer { width: 100%; }
   .drawer-head { padding: calc(18px + env(safe-area-inset-top, 0px)) max(18px, env(safe-area-inset-right, 0px)) 18px max(18px, env(safe-area-inset-left, 0px)); }
@@ -763,7 +763,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .shortcut-list div { grid-template-columns: 1fr; gap: 5px; }
 }
 
-.sidebar-row-menu::after, .composer-plus-button::after, .composer-icon-chip::after, .composer-send::after, .msg-action-button::after {
+.sidebar-row-menu::after, .composer-plus-button::after, .composer-icon-chip::after, .composer-send::after, .composer-active-chip::after, .composer-running-button::after, .msg-action-button::after {
   content: "";
   position: absolute;
   top: 50%;
