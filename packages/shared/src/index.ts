@@ -366,7 +366,8 @@ const STRIP_MARKDOWN_INPUT_LIMIT = 4_000;
 export function stripMarkdown(value: string): string {
   return value
     .slice(0, STRIP_MARKDOWN_INPUT_LIMIT)
-    .replace(/```[\s\S]*?```/g, " ")
+    // A fence left unclosed by the input bound is still a code block, not prose.
+    .replace(/```[\s\S]*?(?:```|$)/g, " ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")

@@ -58,7 +58,7 @@ const FIRST_RUN_STARTERS = [
   ["Work against a local folder", "Register a workspace so Copilot can read files and run commands you approve.", "Walk me through registering a workspace folder, then summarize what is in it."],
   ["Keep context in a project", "Projects carry instructions and reference material into every chat.", "Explain how projects work here, then help me set one up for a TypeScript service."],
   ["Add tools with MCP", "Connect an MCP server to give Copilot new abilities.", "Explain what MCP servers are and suggest a couple that are useful for a developer."],
-  ["Just start a chat", "Everything below stays on this machine.", "Give me a quick tour of what you can do in this app."],
+  ["Just start a chat", "Your history stays here. Prompts go to Copilot to get a reply.", "Give me a quick tour of what you can do in this app."],
 ] as const;
 const PERMISSIONS = ["network", "filesystem:read", "filesystem:write", "shell", "mcp", "github", "artifacts"] as const;
 const EFFORT_OPTIONS = ["default", "none", "low", "medium", "high", "xhigh", "max"] as const;
@@ -199,7 +199,12 @@ function App(): React.ReactElement {
   useEffect(() => { localStorage.setItem(SIDEBAR_COLLAPSED_KEY, sidebarCollapsed ? "1" : "0"); }, [sidebarCollapsed]);
   useEffect(() => {
     const query = window.matchMedia("(max-width: 880px)");
-    function sync(): void { setCompactLayout(query.matches); }
+    function sync(): void {
+      setCompactLayout(query.matches);
+      // The mobile overlay has no meaning on desktop, and a stale open flag would
+      // make the next Back press dismiss an invisible sidebar instead of navigating.
+      if (!query.matches) setSidebarOpen(false);
+    }
     sync();
     query.addEventListener("change", sync);
     return () => query.removeEventListener("change", sync);
@@ -763,7 +768,7 @@ function Welcome(p: { userName: string; project: Project | null; firstRun: boole
   const sub = p.project
     ? "Project instructions will be included with every turn in this conversation."
     : firstRun
-      ? "Your chats, projects, and tools stay in this install. Connect a folder when you want Copilot to read files and run commands you approve."
+      ? "Your chats, projects, and tools are stored here on your machine. Prompts and the context you attach are sent to GitHub Copilot to generate replies."
       : "Start a focused chat, connect tools, or work against a local folder.";
   const starters = firstRun ? FIRST_RUN_STARTERS : STARTERS;
   return <div className={`welcome${firstRun ? " first-run" : ""}`}><div className="welcome-inner"><h1>{heading}</h1><p className="welcome-sub">{sub}</p><div className="welcome-grid">{starters.map(([title, body, prompt]) => <button className="welcome-card" key={title} onClick={() => p.onPrompt(prompt)}><strong>{title}</strong><span>{body}</span></button>)}</div></div></div>;
