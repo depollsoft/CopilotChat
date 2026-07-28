@@ -64,6 +64,13 @@ describe("titleFromContent", () => {
     expect(titleFromContent("Plan the _next_ release")).toBe("Plan the next release");
     expect(titleFromContent("__really important__ fix")).toBe("really important fix");
   });
+  it("treats tilde fences as code like backtick fences", () => {
+    expect(titleFromContent("~~~ts\nconst a = 1;\n~~~")).toBe("New chat");
+    expect(titleFromContent("~~~\ncode here\n~~~\nExplain this snippet")).toBe("Explain this snippet");
+    expect(titleFromContent("~~~py\n" + "x = 1\n".repeat(600) + "~~~")).toBe("New chat");
+    // Two tildes are strikethrough, not a fence, and must still read as prose.
+    expect(titleFromContent("~~Drop~~ Keep the cache")).toBe("Drop Keep the cache");
+  });
   it("stays fast on adversarial input", () => {
     const started = Date.now();
     titleFromContent("[".repeat(80_000) + "]x");

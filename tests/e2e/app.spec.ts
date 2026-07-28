@@ -152,29 +152,6 @@ test("project model defaults apply to the first turn", async ({ page }, testInfo
   await expect(response).toContainText("Context size: default.");
 });
 
-test("first run teaches the product instead of greeting a returning user", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "desktop", "Copy is shared; desktop covers it once.");
-  await page.goto("/");
-  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
-  // Reset to a genuine empty state so this asserts first-run copy, not leftover data.
-  const cleared = await page.evaluate(async () => (await fetch("/api/data", { method: "DELETE", headers: { "x-copilotchat-csrf": "1" } })).ok);
-  expect(cleared).toBe(true);
-  await page.reload();
-  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toBeVisible();
-  await expect(page.getByText(/sent to GitHub Copilot to generate replies/i)).toBeVisible();
-  await expect(page.getByRole("button", { name: /Work against a local folder/ })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Add tools with MCP/ })).toBeVisible();
-  await expect(page.getByText(/Back at it/i)).toHaveCount(0);
-
-  // A chat makes this a returning user, so the greeting must change back.
-  await page.getByPlaceholder(/Ask CopilotChat/).fill("First run check.");
-  await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator(".msg.assistant").last()).toBeVisible();
-  await page.locator("button.sidebar-new").click();
-  await expect(page.getByText(/Back at it/i)).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toHaveCount(0);
-});
-
 test("desktop sidebar collapses, restores, and persists", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop owns the collapsible rail.");
   await page.goto("/");
@@ -1683,4 +1660,29 @@ test("guided import starts its chat while another chat is generating", async ({ 
   await expect(page.getByRole("dialog", { name: "Preferences" })).toHaveCount(0);
   await expect(page.locator(".msg.user").filter({ hasText: "Import draft ID:" })).toBeVisible({ timeout: 20000 });
   await expect(page.locator(".msg.user")).toHaveCount(1);
+});
+
+// Runs last: it clears all data to assert a genuine first-run state, so it must
+// not disturb the shared state earlier tests build up.
+test("first run teaches the product instead of greeting a returning user", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Copy is shared; desktop covers it once.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  // Reset to a genuine empty state so this asserts first-run copy, not leftover data.
+  const cleared = await page.evaluate(async () => (await fetch("/api/data", { method: "DELETE", headers: { "x-copilotchat-csrf": "1" } })).ok);
+  expect(cleared).toBe(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toBeVisible();
+  await expect(page.getByText(/sent to GitHub Copilot to generate replies/i)).toBeVisible();
+  await expect(page.getByRole("button", { name: /Work against a local folder/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Add tools with MCP/ })).toBeVisible();
+  await expect(page.getByText(/Back at it/i)).toHaveCount(0);
+
+  // A chat makes this a returning user, so the greeting must change back.
+  await page.getByPlaceholder(/Ask CopilotChat/).fill("First run check.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.locator(".msg.assistant").last()).toBeVisible();
+  await page.locator("button.sidebar-new").click();
+  await expect(page.getByText(/Back at it/i)).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Copilot, running on your machine." })).toHaveCount(0);
 });

@@ -366,8 +366,10 @@ const STRIP_MARKDOWN_INPUT_LIMIT = 4_000;
 export function stripMarkdown(value: string): string {
   return value
     .slice(0, STRIP_MARKDOWN_INPUT_LIMIT)
-    // A fence left unclosed by the input bound is still a code block, not prose.
+    // Fences are code, not prose. GFM allows tilde fences too, and a fence left
+    // unclosed by the input bound still counts as closed.
     .replace(/```[\s\S]*?(?:```|$)/g, " ")
+    .replace(/~~~[\s\S]*?(?:~~~|$)/g, " ")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
