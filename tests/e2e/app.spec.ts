@@ -1553,6 +1553,35 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
   await expect(subagent.locator(".activity-card.tool .structured-field").filter({ hasText: "Matches" })).toContainText("2");
 });
 
+test("running composer keeps its hint on one line", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Phone widths are where the running controls squeeze the hint.");
+  // Narrower than the project viewport, matching small phones where the row is tightest.
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.goto("/");
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+  const composer = page.getByPlaceholder(/Steer or queue/);
+  // The sent text clears asynchronously, and the row only shrinks back once it does.
+  await expect(composer).toHaveValue("");
+  await expect.poll(async () => composer.evaluate((node: HTMLTextAreaElement) => node.clientHeight)).toBeLessThan(48);
+  const hint = await composer.evaluate((node: HTMLTextAreaElement) => {
+    const style = getComputedStyle(node);
+    const context = document.createElement("canvas").getContext("2d")!;
+    context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    return {
+      text: node.placeholder,
+      textWidth: context.measureText(node.placeholder).width,
+      available: node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      clientHeight: node.clientHeight,
+      lineHeight: parseFloat(style.lineHeight),
+    };
+  });
+  expect(hint.textWidth).toBeLessThanOrEqual(hint.available);
+  expect(hint.clientHeight).toBeLessThan(hint.lineHeight * 2);
+});
+
 test("users can steer and queue while a response is running", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers running composer controls.");
   await page.goto("/");
