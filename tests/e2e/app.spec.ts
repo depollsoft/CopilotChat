@@ -801,6 +801,70 @@ test("composer sends attached files and pasted images", async ({ page }, testInf
   await expect(response).toContainText("pasted.png");
 });
 
+test("uploaded images preview inline before and after they are stored", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers inline media previews.");
+  // A 1x1 PNG, so the browser reports a real natural size once the preview loads.
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await page.locator('.composer input[type="file"]').setInputFiles({ name: "sunset.png", mimeType: "image/png", buffer: png });
+  const composerThumb = page.locator(".attachment-tray .attachment-thumb img");
+  await expect(composerThumb).toBeVisible();
+
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Keep this photo.");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page).toHaveURL(/\/chats\/[^/]+$/);
+  await expect(page.locator(".msg.user .attachment-thumb img")).toBeVisible();
+
+  // Reloading drops the in-memory preview, so the thumbnail must come back from the server.
+  await page.reload();
+  const storedThumb = page.locator(".msg.user .attachment-thumb img");
+  await expect(storedThumb).toBeVisible();
+  await expect.poll(async () => storedThumb.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+  await expect.poll(async () => storedThumb.evaluate((image: HTMLImageElement) => image.currentSrc.startsWith("blob:"))).toBe(true);
+
+  await page.getByRole("button", { name: "Download sunset.png" }).click();
+});
+
+/**
+ * A real workspace file gives the assistant a path it can reference, covering the Markdown image
+ * and link branches plus the policy that active formats are downloads rather than blob previews.
+ */
+test("agent-referenced workspace files render inline, and active formats stay downloads", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "Desktop covers agent-referenced media.");
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const workspaceRoot = testInfo.outputPath("media-workspace");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  // A space in the name also proves percent-encoded Markdown paths resolve.
+  fs.writeFileSync(path.join(workspaceRoot, "site chart.png"), png);
+  fs.writeFileSync(path.join(workspaceRoot, "notes.md"), "# Notes");
+  fs.writeFileSync(path.join(workspaceRoot, "danger.svg"), '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24"><script>window.pwned=1</script></svg>');
+  const csrfHeaders = { "X-CopilotChat-CSRF": "1" };
+  const workspace = await (await request.post("/api/workspaces", { headers: csrfHeaders, data: { name: "Media workspace", rootPath: workspaceRoot } })).json() as { id: string };
+  const chat = await (await request.post("/api/chats", { headers: csrfHeaders, data: { title: "Media chat", workspaceId: workspace.id } })).json() as { id: string };
+
+  await page.goto(`/chats/${chat.id}`);
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill("Show ![chart](site%20chart.png) then ![danger](danger.svg) and [notes](notes.md)");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  // Assert once the response is saved, so streaming re-renders cannot race the counts.
+  await expect(page.getByRole("button", { name: "Stop" })).toBeHidden({ timeout: 20000 });
+  const assistantImage = page.locator(".msg.assistant .markdown-image img").last();
+  await expect(assistantImage).toBeVisible({ timeout: 20000 });
+  await expect.poll(async () => assistantImage.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+  // Only the raster image previews; the SVG and the Markdown file both fall back to download chips.
+  expect(await page.locator(".msg.assistant .markdown-image img").count()).toBe(1);
+  await expect(page.locator(".msg.assistant .chat-file-chip")).toHaveCount(2);
+  expect((await request.get(`/api/chats/${chat.id}/files?path=danger.svg`)).headers()["content-disposition"]).toContain("attachment");
+
+  await assistantImage.click();
+  await expect(page.getByRole("dialog", { name: /chart/ })).toBeVisible();
+  // The viewer must take focus rather than leaving it on the thumbnail behind the scrim.
+  await expect.poll(async () => page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Close image");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: /chart/ })).toBeHidden();
+});
+
 test("upload endpoint reports invalid metadata and limits as client errors", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers upload API errors.");
   const headers = { "Content-Type": "application/x-copilotchat-upload", "X-CopilotChat-CSRF": "1" };
@@ -1511,6 +1575,35 @@ test("subagent work renders as collapsible activity", async ({ page }, testInfo)
   await expect(subagent.locator(".activity-card.tool > summary")).toContainText("context.search");
   await subagent.locator(".activity-card.tool > summary").click();
   await expect(subagent.locator(".activity-card.tool .structured-field").filter({ hasText: "Matches" })).toContainText("2");
+});
+
+test("running composer keeps its hint on one line", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Phone widths are where the running controls squeeze the hint.");
+  // Narrower than the project viewport, matching small phones where the row is tightest.
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.goto("/");
+  await page.getByPlaceholder(/Ask CopilotChat|Reply in/).fill(`Start a long response ${"keep streaming ".repeat(1600)}`);
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible();
+
+  const composer = page.getByPlaceholder(/Steer or queue/);
+  // The sent text clears asynchronously, and the row only shrinks back once it does.
+  await expect(composer).toHaveValue("");
+  await expect.poll(async () => composer.evaluate((node: HTMLTextAreaElement) => node.clientHeight)).toBeLessThan(48);
+  const hint = await composer.evaluate((node: HTMLTextAreaElement) => {
+    const style = getComputedStyle(node);
+    const context = document.createElement("canvas").getContext("2d")!;
+    context.font = `${style.fontStyle} ${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    return {
+      text: node.placeholder,
+      textWidth: context.measureText(node.placeholder).width,
+      available: node.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+      clientHeight: node.clientHeight,
+      lineHeight: parseFloat(style.lineHeight),
+    };
+  });
+  expect(hint.textWidth).toBeLessThanOrEqual(hint.available);
+  expect(hint.clientHeight).toBeLessThan(hint.lineHeight * 2);
 });
 
 test("users can steer and queue while a response is running", async ({ page }, testInfo) => {
