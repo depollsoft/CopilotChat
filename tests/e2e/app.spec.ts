@@ -341,28 +341,32 @@ test("mobile keyboard keeps the header on screen", async ({ page }, testInfo) =>
   await page.goto("/");
   await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
   await page.getByPlaceholder(/Ask CopilotChat/).click();
+  // Simulate a keyboard that shrinks only the visual viewport (layout viewport stays tall).
   await page.evaluate(() => {
-    window.scrollTo(0, 240);
-    document.documentElement.scrollTop = 240;
-    document.body.scrollTop = 240;
-    window.visualViewport?.dispatchEvent(new Event("scroll"));
+    const height = 420;
+    const offsetTop = 160;
+    const mockViewport = {
+      width: window.innerWidth,
+      height,
+      offsetTop,
+      offsetLeft: 0,
+      scale: 1,
+      pageTop: offsetTop,
+      pageLeft: 0,
+      addEventListener() {},
+      removeEventListener() {},
+      dispatchEvent() { return true; },
+    };
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: mockViewport });
     window.dispatchEvent(new Event("resize"));
   });
-  await expect.poll(async () => page.evaluate(() => window.scrollY)).toBe(0);
-  const beforeShrink = await page.evaluate(() => {
-    const header = document.querySelector(".header");
-    if (!(header instanceof HTMLElement)) return null;
-    return header.getBoundingClientRect().top;
-  });
-  expect(beforeShrink).not.toBeNull();
-  expect(beforeShrink!).toBeGreaterThanOrEqual(0);
-  expect(beforeShrink!).toBeLessThanOrEqual(8);
-  await page.setViewportSize({ width: 393, height: 480 });
   await expect.poll(async () => page.evaluate(() => {
-    const app = document.querySelector(".app");
-    if (!(app instanceof HTMLElement)) return null;
-    return Math.round(app.getBoundingClientRect().height);
-  })).toBeLessThanOrEqual(480);
+    const root = document.documentElement;
+    return {
+      height: root.style.getPropertyValue("--app-height").trim(),
+      offsetTop: root.style.getPropertyValue("--app-offset-top").trim(),
+    };
+  })).toEqual({ height: "420px", offsetTop: "160px" });
   const metrics = await page.evaluate(() => {
     const header = document.querySelector(".header");
     const composer = document.querySelector(".composer-shell");
@@ -375,15 +379,19 @@ test("mobile keyboard keeps the header on screen", async ({ page }, testInfo) =>
       headerTop: headerRect.top,
       headerBottom: headerRect.bottom,
       composerBottom: composerRect.bottom,
+      appTop: appRect.top,
       appHeight: appRect.height,
+      appBottom: appRect.bottom,
       innerHeight: window.innerHeight,
     };
   });
   expect(metrics).not.toBeNull();
-  expect(metrics!.headerTop).toBeGreaterThanOrEqual(0);
-  expect(metrics!.headerTop).toBeLessThanOrEqual(8);
-  expect(metrics!.appHeight).toBeLessThanOrEqual(metrics!.innerHeight + 1);
-  expect(metrics!.composerBottom).toBeLessThanOrEqual(metrics!.innerHeight + 1);
+  expect(metrics!.innerHeight).toBeGreaterThan(420);
+  expect(metrics!.appTop).toBeCloseTo(160, 0);
+  expect(metrics!.appHeight).toBeCloseTo(420, 0);
+  expect(metrics!.headerTop).toBeGreaterThanOrEqual(160);
+  expect(metrics!.headerTop).toBeLessThanOrEqual(168);
+  expect(metrics!.composerBottom).toBeLessThanOrEqual(metrics!.appBottom + 1);
   expect(metrics!.headerBottom).toBeLessThan(metrics!.composerBottom);
 });
 

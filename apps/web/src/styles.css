@@ -548,7 +548,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
 .attachment-chip button:not(.attachment-thumb):hover { background: var(--surface); color: var(--text); }
 .msg-body > .attachment-tray { margin-bottom: 8px; }
 .msg-body > .attachment-tray .attachment-chip { background: color-mix(in srgb, var(--surface) 72%, transparent); }
-.slash-command-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 45; display: grid; gap: 4px; max-height: min(340px, calc(100dvh - 180px)); overflow: auto; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow); }
+.slash-command-menu { position: absolute; left: 0; right: 0; bottom: calc(100% + 8px); z-index: 45; display: grid; gap: 4px; max-height: min(340px, calc(var(--app-height, 100dvh) - 180px)); overflow: auto; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface); box-shadow: var(--shadow); }
 .slash-command-option { display: grid; grid-template-columns: minmax(96px, .34fr) minmax(0,1fr); gap: 10px; align-items: center; min-width: 0; padding: 9px 10px; border-radius: var(--radius-sm); color: var(--text); text-align: left; }
 .slash-command-option:hover, .slash-command-option.selected { background: color-mix(in srgb, var(--accent) 10%, var(--surface-muted)); }
 .slash-command-name { color: var(--accent); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: var(--text-caption); font-weight: 850; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -789,6 +789,7 @@ button svg:not([width]), .composer-send svg, .composer-running-button svg, .comp
   .scroll::after { height: calc(64px + env(safe-area-inset-bottom, 0px)); }
   .composer-shell { position: absolute; z-index: 18; padding: 20px max(8px, env(safe-area-inset-right, 0px)) calc(8px + env(safe-area-inset-bottom, 0px)) max(8px, env(safe-area-inset-left, 0px)); }
   .composer-popover { bottom: calc(72px + env(safe-area-inset-bottom, 0px)); max-height: min(460px, calc(var(--app-height, 100dvh) - 96px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))); }
+  .slash-command-menu { max-height: min(280px, calc(var(--app-height, 100dvh) - 160px)); }
   .composer { border-radius: var(--radius-lg); padding: 6px; gap: 5px; }
   .composer-input-row { gap: 5px; }
   .composer textarea { min-height: 40px; max-height: 140px; padding: 7px 6px; font-size: calc(15px * var(--text-scale)); }
