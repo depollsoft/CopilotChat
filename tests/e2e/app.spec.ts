@@ -325,6 +325,68 @@ test("mobile Return inserts a composer newline", async ({ page }, testInfo) => {
   await expect(page.locator(".msg.user").filter({ hasText: "First line" })).toHaveCount(0);
 });
 
+test("new chat closes the sidebar and focuses the composer", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile sidebar + composer focus coverage only runs in mobile project.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await page.getByRole("button", { name: /Show sidebar|Toggle sidebar|Hide sidebar/i }).click();
+  await expect(page.locator(".sidebar.open")).toBeVisible();
+  await page.locator(".sidebar-new").click();
+  await expect(page.locator(".sidebar.open")).toHaveCount(0);
+  await expect(page.getByPlaceholder(/Ask CopilotChat/)).toBeFocused();
+});
+
+test("mobile keyboard keeps the header on screen", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile keyboard layout coverage only runs in mobile project.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).click();
+  await page.evaluate(() => {
+    window.scrollTo(0, 240);
+    document.documentElement.scrollTop = 240;
+    document.body.scrollTop = 240;
+    window.visualViewport?.dispatchEvent(new Event("scroll"));
+    window.dispatchEvent(new Event("resize"));
+  });
+  await expect.poll(async () => page.evaluate(() => window.scrollY)).toBe(0);
+  const beforeShrink = await page.evaluate(() => {
+    const header = document.querySelector(".header");
+    if (!(header instanceof HTMLElement)) return null;
+    return header.getBoundingClientRect().top;
+  });
+  expect(beforeShrink).not.toBeNull();
+  expect(beforeShrink!).toBeGreaterThanOrEqual(0);
+  expect(beforeShrink!).toBeLessThanOrEqual(8);
+  await page.setViewportSize({ width: 393, height: 480 });
+  await expect.poll(async () => page.evaluate(() => {
+    const app = document.querySelector(".app");
+    if (!(app instanceof HTMLElement)) return null;
+    return Math.round(app.getBoundingClientRect().height);
+  })).toBeLessThanOrEqual(480);
+  const metrics = await page.evaluate(() => {
+    const header = document.querySelector(".header");
+    const composer = document.querySelector(".composer-shell");
+    const app = document.querySelector(".app");
+    if (!(header instanceof HTMLElement) || !(composer instanceof HTMLElement) || !(app instanceof HTMLElement)) return null;
+    const headerRect = header.getBoundingClientRect();
+    const composerRect = composer.getBoundingClientRect();
+    const appRect = app.getBoundingClientRect();
+    return {
+      headerTop: headerRect.top,
+      headerBottom: headerRect.bottom,
+      composerBottom: composerRect.bottom,
+      appHeight: appRect.height,
+      innerHeight: window.innerHeight,
+    };
+  });
+  expect(metrics).not.toBeNull();
+  expect(metrics!.headerTop).toBeGreaterThanOrEqual(0);
+  expect(metrics!.headerTop).toBeLessThanOrEqual(8);
+  expect(metrics!.appHeight).toBeLessThanOrEqual(metrics!.innerHeight + 1);
+  expect(metrics!.composerBottom).toBeLessThanOrEqual(metrics!.innerHeight + 1);
+  expect(metrics!.headerBottom).toBeLessThan(metrics!.composerBottom);
+});
+
 test("project navigation shows editable context and project chats", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers project landing page.");
   await page.goto("/");

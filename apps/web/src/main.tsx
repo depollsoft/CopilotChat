@@ -153,6 +153,7 @@ function App(): React.ReactElement {
   const chatScrollStatesRef = useRef<Record<string, ChatScrollState>>({});
   const pendingChatScrollRef = useRef<{ chatId: string; state: ChatScrollState | null } | null>(null);
   const composerRef = useRef<ComposerHandle | null>(null);
+  const pendingComposerFocusRef = useRef(false);
   const seenInitializedRef = useRef(false);
   const drawerRef = useRef<Tab | null>(null);
   const sidebarOpenRef = useRef(false);
@@ -263,6 +264,7 @@ function App(): React.ReactElement {
   useEffect(() => { selectedChatIdRef.current = selectedChatId; appPathRef.current = appPathForSelection(selectedChatId, selectedChat?.projectId ?? activeProjectId); syncAppUrl(appPathRef.current); }, [selectedChatId, selectedChat?.projectId, activeProjectId]);
   useEffect(() => { stopResponseRef.current = () => { void stopActiveResponse(); }; });
   useEffect(() => installBackGuard({ drawerRef, sidebarOpenRef, busyRef, stopResponseRef, currentPath: () => appPathRef.current, closeDrawer: () => setDrawer(null), closeSidebar: () => setSidebarOpen(false), toast: setToast }), []);
+  useEffect(() => installVisualViewportLock(), []);
   useEffect(() => {
     function keyDown(event: KeyboardEvent): void {
       if (isEditableTarget(event.target)) return;
@@ -345,6 +347,15 @@ function App(): React.ReactElement {
     }
     if (liveScrollRef.current) scrollToLive("auto");
   }, [selectedChatId, messages, streamingText, streamingActivities, pendingTurns, pendingInteractions, busy]);
+  useLayoutEffect(() => {
+    if (!pendingComposerFocusRef.current) return;
+    pendingComposerFocusRef.current = false;
+    composerRef.current?.focus();
+  });
+  function focusComposer(): void {
+    pendingComposerFocusRef.current = true;
+    composerRef.current?.focus();
+  }
   async function refreshState(): Promise<void> { const requestedAt = Date.now(); try { const next = await api<AppState>("/api/state", {}, apiToken); stateSnapshotStartedAtRef.current = Math.max(stateSnapshotStartedAtRef.current, requestedAt); setLoginRequired(false); const selectedId = selectedChatIdRef.current; if (selectedId && ![...next.chats, ...next.archivedChats].some((chat) => chat.id === selectedId)) { selectedChatIdRef.current = null; setSelectedChatId(null); setMessages([]); clearStreamingView(); syncAppUrl(appPathForSelection(null, activeProjectId)); } setState(next); setError((current) => current && isNetworkError(current) ? null : current); initializeSeenChatUpdates(next); } catch (e) { const message = toErr(e); if (message.includes("Login required") || message.includes("Unauthorized")) { const status = await api<{mode:string;authenticated?:boolean;githubOAuthConfigured?:boolean}>("/api/auth/status").catch(() => null); if (status?.mode === "github" && !status.authenticated) { setLoginRequired(true); setError(status.githubOAuthConfigured ? null : "GitHub OAuth is not configured on this server."); return; } } if (message.includes("Unauthorized")) setDrawer("preferences"); setError(message); } }
   async function refreshModels(force = false): Promise<void> {
     const now = Date.now();
@@ -372,7 +383,7 @@ function App(): React.ReactElement {
       if (modelRefreshPromiseRef.current === promise) modelRefreshPromiseRef.current = null;
     }
   }
-  async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { saveCurrentChatScroll(); activateLiveScroll(); const configuredProjectDefault = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const projectDefaultModel = configuredProjectDefault && modelsAuthoritative && provider.models.some((model) => model.id === configuredProjectDefault) ? configuredProjectDefault : null; const safeDefaultModel = selectedModel || provider.defaultModel || provider.models[0]?.id || selectedModelInfo?.id || "gpt-4.1"; const model = projectDefaultModel ?? (modelsAuthoritative ? selectedModelInfo?.id ?? safeDefaultModel : safeDefaultModel); const modelInfo = providerModels.find((item) => item.id === model) ?? fallbackProviderModel(model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = modelsAuthoritative ? choices.includes(reasoningEffort) ? reasoningEffort : "default" : reasoningEffort; const nextContextTier = modelsAuthoritative ? modelInfo.supportsLongContext ? contextTier : "default" : contextTier; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); clearStreamingView(); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); composerRef.current?.focus(); return chat; }
+  async function createChat(projectId = activeProjectId, workspaceId = activeWorkspaceId, options: { cleanup?: boolean; refresh?: boolean } = {}): Promise<Chat> { setSidebarOpen(false); focusComposer(); saveCurrentChatScroll(); activateLiveScroll(); const configuredProjectDefault = projectId ? projects.find((project) => project.id === projectId)?.defaultModel : null; const projectDefaultModel = configuredProjectDefault && modelsAuthoritative && provider.models.some((model) => model.id === configuredProjectDefault) ? configuredProjectDefault : null; const safeDefaultModel = selectedModel || provider.defaultModel || provider.models[0]?.id || selectedModelInfo?.id || "gpt-4.1"; const model = projectDefaultModel ?? (modelsAuthoritative ? selectedModelInfo?.id ?? safeDefaultModel : safeDefaultModel); const modelInfo = providerModels.find((item) => item.id === model) ?? fallbackProviderModel(model); const choices = reasoningEffortChoices(modelInfo); const nextEffort = modelsAuthoritative ? choices.includes(reasoningEffort) ? reasoningEffort : "default" : reasoningEffort; const nextContextTier = modelsAuthoritative ? modelInfo.supportsLongContext ? contextTier : "default" : contextTier; const chat = await api<Chat>("/api/chats", { method: "POST", body: { title: "New chat", projectId, workspaceId, model, reasoningEffort: nextEffort, contextTier: nextContextTier } }, apiToken); syncAppUrl(appPathForSelection(chat.id, null)); selectedChatIdRef.current = chat.id; setSelectedChatId(chat.id); setState((current) => current ? { ...current, chats: [chat, ...current.chats.filter((item) => item.id !== chat.id)] } : current); setMessages([]); clearStreamingView(); setError(null); if (options.cleanup !== false) await cleanupAbandonedEmptyChats(chat.id); if (options.refresh !== false) await refreshState(); focusComposer(); return chat; }
   async function renameChat(chat: Chat): Promise<void> { setDialog({ kind: "text", title: "Rename chat", label: "Chat title", initialValue: chat.title, confirmLabel: "Save title", onConfirm: async (title) => { if (!title.trim()) return; await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { title: title.trim() } }, apiToken); await refreshState(); } }); }
   async function archiveChat(chat: Chat): Promise<void> { await api<Chat>(`/api/chats/${chat.id}`, { method: "PATCH", body: { archived: true } }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Archived chat"); }
   async function deleteChat(chat: Chat): Promise<void> { setDialog({ kind: "confirm", title: "Delete chat?", message: `"${chat.title}" will be permanently deleted from this device.`, confirmLabel: "Delete chat", danger: true, onConfirm: async () => { await api<void>(`/api/chats/${chat.id}`, { method: "DELETE", raw: true }, apiToken); if (selectedChatId === chat.id) setSelectedChatId(null); await refreshState(); setToast("Deleted chat"); } }); }
@@ -652,7 +663,7 @@ function App(): React.ReactElement {
   if (loginRequired) return <div className="auth-screen"><div className="auth-panel"><span className="welcome-mark"><IconCopilot width={46} height={46}/></span><h1>Sign in to CopilotChat</h1><p>Use GitHub to access this self-hosted instance. Your chats, projects, tools, and imports are isolated by GitHub login.</p>{error ? <p className="auth-error">{error}</p> : null}<a className="btn btn-primary" href="/api/auth/github/login">Sign in with GitHub</a></div></div>;
   return <ChatMediaContext.Provider value={chatMedia}><div className={`app${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
     {sidebarOpen ? <div className="sidebar-scrim" onClick={() => setSidebarOpen(false)} /> : null}
-    <Sidebar open={sidebarOpen} chats={chats} projects={projects} selectedChatId={selectedChatId} activeProjectId={activeProjectId} runningChatIds={runningChatIds} unreadChatIds={unreadChatIds} searchQuery={searchQuery} owner={state?.owner.login ?? "Local"} providerLabel={provider.id === "sdk" ? "GitHub Copilot" : provider.label} onSearch={setSearchQuery} onSelectChat={(id) => { selectChat(id); setSidebarOpen(false); }} onNewChat={() => void createChat()} onNewProject={() => void createProjectFromSidebar()} onSelectProject={(id) => { selectProject(id); setSidebarOpen(false); }} onToggleChatFavorite={(chat) => void toggleChatFavorite(chat)} onToggleProjectFavorite={(project) => void toggleProjectFavorite(project)} onRenameProject={(project) => void renameProject(project)} onDeleteProject={(project) => void deleteProject(project)} onRenameChat={(chat) => void renameChat(chat)} onArchiveChat={(chat) => void archiveChat(chat)} onDeleteChat={(chat) => void deleteChat(chat)} onOpenDrawer={(tab) => { setDrawer(tab); setSidebarOpen(false); }} />
+    <Sidebar open={sidebarOpen} chats={chats} projects={projects} selectedChatId={selectedChatId} activeProjectId={activeProjectId} runningChatIds={runningChatIds} unreadChatIds={unreadChatIds} searchQuery={searchQuery} owner={state?.owner.login ?? "Local"} providerLabel={provider.id === "sdk" ? "GitHub Copilot" : provider.label} onSearch={setSearchQuery} onSelectChat={(id) => { selectChat(id); setSidebarOpen(false); }} onNewChat={() => { setSidebarOpen(false); void createChat(); }} onNewProject={() => void createProjectFromSidebar()} onSelectProject={(id) => { selectProject(id); setSidebarOpen(false); }} onToggleChatFavorite={(chat) => void toggleChatFavorite(chat)} onToggleProjectFavorite={(project) => void toggleProjectFavorite(project)} onRenameProject={(project) => void renameProject(project)} onDeleteProject={(project) => void deleteProject(project)} onRenameChat={(chat) => void renameChat(chat)} onArchiveChat={(chat) => void archiveChat(chat)} onDeleteChat={(chat) => void deleteChat(chat)} onOpenDrawer={(tab) => { setDrawer(tab); setSidebarOpen(false); }} />
     <main className="main">
       <Header chatTitle={selectedChat?.title ?? "New conversation"} projectName={activeProject?.name ?? null} chatFavorite={selectedChat?.favorite ?? null} projectFavorite={activeProject?.favorite ?? null} provider={provider} model={selectedModelInfo?.id ?? selectedModel} models={providerModels} modelInfo={selectedModelInfo ?? null} effort={reasoningEffort} effortChoices={effortChoices} contextTier={contextTier} context={contextStatus} usage={usageStatus} busy={busy} modelsRefreshing={modelsRefreshing} onModelPickerOpen={() => void refreshModels()} onRefreshModels={() => void refreshModels(true)} onModelChange={changeModel} onEffortChange={changeReasoningEffort} onContextTierChange={changeContextTier} onToggleSidebar={toggleSidebar} sidebarHidden={compactLayout ? !sidebarOpen : sidebarCollapsed} onToggleChatFavorite={selectedChat ? () => void toggleChatFavorite(selectedChat) : undefined} onToggleProjectFavorite={activeProject ? () => void toggleProjectFavorite(activeProject) : undefined} onRenameChat={selectedChat ? () => void renameChat(selectedChat) : undefined} onArchiveChat={selectedChat ? () => void archiveChat(selectedChat) : undefined} onDeleteChat={selectedChat ? () => void deleteChat(selectedChat) : undefined} onRenameProject={activeProject ? () => void renameProject(activeProject) : undefined} onDeleteProject={activeProject ? () => void deleteProject(activeProject) : undefined} onOpenTab={setDrawer} onNewChat={() => void createChat()} onOpenShortcuts={() => setShortcutsOpen(true)} />
       {error ? <ErrorBanner error={error} onDismiss={() => setError(null)} onRetry={() => void refreshState()} /> : null}
@@ -663,7 +674,7 @@ function App(): React.ReactElement {
         {activeProject && !selectedChat && state
           ? <ProjectHome project={activeProject} state={state} models={provider.models} modelsAuthoritative={modelsAuthoritative} chats={chats.filter((chat) => chat.projectId === activeProject.id)} onSelectChat={selectChat} onNewChat={() => void createChat(activeProject.id, activeWorkspaceId)} onOpenContext={() => setDrawer("context")} refresh={refreshState} showToast={setToast} />
           : !showThread
-            ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} firstRun={firstRun} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); composerRef.current?.focus(); }} />
+            ? <Welcome userName={state?.owner.displayName ?? state?.owner.login ?? ""} project={activeProject} firstRun={firstRun} onPrompt={(p) => { setDraft(p); composerRef.current?.setValue(p); focusComposer(); }} />
             : <div className="thread">{renderThreadMessages()}<PendingTurns turns={pendingTurns}/>{streamingText || streamingActivities.length > 0 ? <Message streaming activities={streamingActivities} message={{ id: "streaming", chatId: selectedChatId ?? "", role: "assistant", content: streamingText, provider: provider.id, metadata: {}, createdAt: new Date().toISOString() }} /> : null}{busy && !streamingText && streamingActivities.length === 0 ? <Thinking /> : null}<InteractionDock interactions={pendingInteractions} onResolve={(interaction, resolution) => void resolveInteraction(interaction, resolution)} /></div>}
       </div>
       <Composer ref={composerRef} busy={busy} compact={compactLayout} project={activeProject} projects={projects} workspace={activeWorkspace} workspaces={state?.workspaces ?? []} skills={skills} selectedSkills={selectedSkills} selectedSkillIds={selectedSkillIds} permissionMode={permissionMode} setPermissionMode={changePermissionMode} onDraftPreviewChange={setDraft} onUploadFile={(file, onProgress) => uploadFile(file, apiToken, onProgress)} onDiscardAttachment={(attachment) => discardUploadedFile(attachment, apiToken)} onSubmit={(content, attachments, onAccepted) => busy ? sendWhileBusy("queue", content, attachments, onAccepted) : sendMessage(content, { attachments }, onAccepted)} onSteer={(content, attachments, onAccepted) => sendWhileBusy("steer", content, attachments, onAccepted)} onStop={() => void stopActiveResponse()} onOpenTab={setDrawer} onSelectProject={selectProject} onSelectWorkspace={setActiveWorkspaceId} onSelectSkills={setSelectedSkillIds} />
@@ -1506,6 +1517,42 @@ function installBackGuard(options: BackGuardOptions): () => void {
   }
   window.addEventListener("popstate", onPopState);
   return () => window.removeEventListener("popstate", onPopState);
+}
+function installVisualViewportLock(): () => void {
+  const root = document.documentElement;
+  let frame = 0;
+  function apply(): void {
+    frame = 0;
+    const viewport = window.visualViewport;
+    const height = Math.max(1, Math.round(viewport?.height ?? window.innerHeight));
+    const offsetTop = Math.max(0, Math.round(viewport?.offsetTop ?? 0));
+    root.style.setProperty("--app-height", `${height}px`);
+    root.style.setProperty("--app-offset-top", `${offsetTop}px`);
+    if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
+    if (root.scrollTop) root.scrollTop = 0;
+    if (document.body.scrollTop) document.body.scrollTop = 0;
+  }
+  function schedule(): void {
+    if (frame) return;
+    frame = window.requestAnimationFrame(apply);
+  }
+  apply();
+  const viewport = window.visualViewport;
+  viewport?.addEventListener("resize", schedule);
+  viewport?.addEventListener("scroll", schedule);
+  window.addEventListener("resize", schedule);
+  window.addEventListener("orientationchange", schedule);
+  window.addEventListener("focusin", schedule);
+  return () => {
+    if (frame) window.cancelAnimationFrame(frame);
+    viewport?.removeEventListener("resize", schedule);
+    viewport?.removeEventListener("scroll", schedule);
+    window.removeEventListener("resize", schedule);
+    window.removeEventListener("orientationchange", schedule);
+    window.removeEventListener("focusin", schedule);
+    root.style.removeProperty("--app-height");
+    root.style.removeProperty("--app-offset-top");
+  };
 }
 function appRouteFromLocation(): AppRoute { return appRouteFromPath(location.pathname); }
 function appRouteFromPath(path: string): AppRoute {
