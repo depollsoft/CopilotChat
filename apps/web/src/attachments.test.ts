@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { chatFileUrl, fileNameFromPath, isImageMimeType, isPreservedMarkdownUrl, messageAttachmentUrl, resolveMarkdownSource } from "./attachments.js";
+import { chatFileUrl, fileNameFromPath, isImageMimeType, isPreservedMarkdownUrl, isPreviewableImageType, messageAttachmentUrl, resolveMarkdownSource } from "./attachments.js";
 
 const chatId = "chat 1";
 
@@ -45,6 +45,20 @@ describe("resolveMarkdownSource", () => {
     expect(windowsPath?.kind === "chat-file" ? windowsPath.fileName : null).toBe("photo.jpg");
   });
 
+  it("decodes percent-escaped markdown paths so names with spaces resolve", () => {
+    const spaced = resolveMarkdownSource("artifacts/my%20chart.png", chatId);
+    expect(spaced).toEqual({
+      kind: "chat-file",
+      url: "/api/chats/chat%201/files?path=artifacts%2Fmy%20chart.png",
+      path: "artifacts/my chart.png",
+      fileName: "my chart.png",
+    });
+    expect(resolveMarkdownSource("artifacts/a%2Bb.png", chatId)?.kind === "chat-file" ? resolveMarkdownSource("artifacts/a%2Bb.png", chatId) : null).toMatchObject({ path: "artifacts/a+b.png" });
+    // A literal percent is a legal filename character, so a malformed escape stays as written.
+    expect(resolveMarkdownSource("artifacts/100%done.png", chatId)).toMatchObject({ path: "artifacts/100%done.png" });
+    expect(resolveMarkdownSource("artifacts/chart.png#top", chatId)).toMatchObject({ path: "artifacts/chart.png" });
+  });
+
   it("unwraps file URLs the agent may emit", () => {
     expect(resolveMarkdownSource("file:///tmp/work/my%20photo.png", chatId)).toEqual({
       kind: "chat-file",
@@ -85,5 +99,17 @@ describe("isPreservedMarkdownUrl", () => {
     expect(isPreservedMarkdownUrl("data:text/html;base64,AAAA")).toBe(false);
     expect(isPreservedMarkdownUrl("javascript:alert(1)")).toBe(false);
     expect(isPreservedMarkdownUrl("https://example.com/a.png")).toBe(false);
+  });
+});
+
+describe("isPreviewableImageType", () => {
+  it("allows only raster formats that cannot script from a blob URL", () => {
+    for (const type of ["image/png", "image/jpeg", "image/gif", "image/webp", "image/avif", "IMAGE/PNG", "image/png; charset=binary"]) {
+      expect(isPreviewableImageType(type)).toBe(true);
+    }
+    // A blob URL is same-origin and drops the response CSP, so SVG must never become one.
+    for (const type of ["image/svg+xml", "text/html", "application/pdf", "application/octet-stream", "", null, undefined]) {
+      expect(isPreviewableImageType(type)).toBe(false);
+    }
   });
 });

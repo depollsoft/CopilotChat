@@ -10,6 +10,16 @@ export function isImageMimeType(mimeType: string | null | undefined): boolean {
 }
 
 /**
+ * Raster formats that are safe to hand to `URL.createObjectURL`. A blob URL is same-origin and
+ * carries none of the response's `Content-Disposition`, CSP, or `nosniff` protection, so opening
+ * one as a document runs any script it contains. SVG is therefore never previewed, only downloaded.
+ */
+const previewableImageTypes = new Set(["image/apng", "image/avif", "image/bmp", "image/gif", "image/heic", "image/heif", "image/jpeg", "image/png", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"]);
+export function isPreviewableImageType(mimeType: string | null | undefined): boolean {
+  return previewableImageTypes.has((mimeType ?? "").split(";")[0]?.trim().toLowerCase() ?? "");
+}
+
+/**
  * Sources the markdown renderer must not blank out. Inline images and `file:` paths are
  * already gated by the sanitizer, and both are resolved before anything is rendered.
  */
@@ -48,9 +58,24 @@ export function resolveMarkdownSource(rawValue: string | null | undefined, chatI
   if (protocol && protocol !== "file:") return { kind: "direct", url: value };
   if (value === "/" || appPathPrefixes.some((prefix) => value.startsWith(prefix))) return { kind: "direct", url: value };
   if (!chatId) return null;
-  const filePath = protocol === "file:" ? fileUrlToPath(value) : value;
+  const filePath = protocol === "file:" ? fileUrlToPath(value) : decodeMarkdownPath(value);
   if (!filePath) return null;
   return { kind: "chat-file", url: chatFileUrl(chatId, filePath, options), path: filePath, fileName: fileNameFromPath(filePath) };
+}
+
+/**
+ * Markdown destinations are URLs, so a path with a space arrives percent-encoded. Without
+ * decoding, `artifacts/my%20chart.png` would be looked up as a file literally named `my%20chart.png`.
+ */
+function decodeMarkdownPath(value: string): string | null {
+  const withoutFragment = value.split("#")[0] ?? value;
+  if (!withoutFragment) return null;
+  try {
+    return decodeURIComponent(withoutFragment);
+  } catch {
+    // A stray `%` is a legal filename character, so a malformed escape falls back to the raw path.
+    return withoutFragment;
+  }
 }
 
 function fileUrlToPath(value: string): string | null {

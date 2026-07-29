@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { materializeMessageAttachments, reconcileAttachmentFiles, relocateChatAttachments } from "./attachment-files.js";
 import { syncArtifactFiles, writeFileArtifact } from "./artifact-files.js";
 import { applyChatTurnScope, buildProviderChatRequest } from "./chat-context.js";
-import { ChatFileAccessError, ChatFileNotFoundError, chatFileSystemContext, contentDispositionHeader, fileEtag, isInlineContentType, resolveChatFile } from "./chat-files.js";
+import { bufferEtag, ChatFileAccessError, ChatFileNotFoundError, chatFileSystemContext, contentDispositionHeader, isInlineContentType, resolveChatFile, safeContentType } from "./chat-files.js";
 import { isGitHubLoginAllowed, loadConfig } from "./config.js";
 import { AppDatabase } from "./db.js";
 import { applyImportPreview } from "./import-apply.js";
@@ -2094,13 +2094,27 @@ describe("chat file previews", () => {
       fs.writeFileSync(path.join(outsideRoot, "secret.txt"), "secret");
       fs.symlinkSync(path.join(outsideRoot, "secret.txt"), path.join(workspaceDir, "escape.txt"));
 
-      const relative = await resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" });
+      const open = async (requestedPath: string) => { const file = await resolveChatFile({ workspaceDir, requestedPath }); await file.handle.close(); return file; };
+      const relative = await open("artifacts/chart.png");
       expect(relative.relativePath).toBe("artifacts/chart.png");
       expect(relative.mimeType).toBe("image/png");
       expect(relative.size).toBe(9);
-      expect((await resolveChatFile({ workspaceDir, requestedPath: "./artifacts/chart.png" })).absolutePath).toBe(relative.absolutePath);
-      expect((await resolveChatFile({ workspaceDir, requestedPath: relative.absolutePath })).absolutePath).toBe(relative.absolutePath);
-      expect((await resolveChatFile({ workspaceDir, requestedPath: `file://${relative.absolutePath}` })).absolutePath).toBe(relative.absolutePath);
+      expect((await open("./artifacts/chart.png")).absolutePath).toBe(relative.absolutePath);
+      expect((await open(relative.absolutePath)).absolutePath).toBe(relative.absolutePath);
+      expect((await open(`file://${relative.absolutePath}`)).absolutePath).toBe(relative.absolutePath);
+
+      // The descriptor must be the file the checks ran against, so bytes cannot be swapped after validation.
+      const validated = await resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" });
+      try {
+        fs.rmSync(path.join(workspaceDir, "artifacts", "chart.png"));
+        fs.symlinkSync(path.join(outsideRoot, "secret.txt"), path.join(workspaceDir, "artifacts", "chart.png"));
+        expect((await validated.handle.readFile()).toString()).toBe("png-bytes");
+        await expect(resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" })).rejects.toBeInstanceOf(ChatFileAccessError);
+      } finally {
+        await validated.handle.close();
+        fs.rmSync(path.join(workspaceDir, "artifacts", "chart.png"));
+        fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("png-bytes"));
+      }
 
       await expect(resolveChatFile({ workspaceDir, requestedPath: "../outside.txt" })).rejects.toBeInstanceOf(ChatFileAccessError);
       await expect(resolveChatFile({ workspaceDir, requestedPath: path.join(outsideRoot, "secret.txt") })).rejects.toBeInstanceOf(ChatFileAccessError);
@@ -2111,14 +2125,45 @@ describe("chat file previews", () => {
       await expect(resolveChatFile({ workspaceDir, requestedPath: "artifacts/missing.png" })).rejects.toBeInstanceOf(ChatFileNotFoundError);
 
       // Rewriting a file in place must change its validator so a cached preview is replaced.
-      fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("different-png-bytes"));
-      expect((await resolveChatFile({ workspaceDir, requestedPath: "artifacts/chart.png" })).etag).not.toBe(relative.etag);
-      expect(fileEtag(9, 1_700_000_000_000)).toBe(fileEtag(9, 1_700_000_000_000.4));
-      expect(fileEtag(9, 1_700_000_000_000)).not.toBe(fileEtag(10, 1_700_000_000_000));
+      const beforeRewrite = (await open("artifacts/chart.png")).etag;
+      fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("different-bytes"));
+      expect((await open("artifacts/chart.png")).etag).not.toBe(beforeRewrite);
+      // A same-size rewrite must not reuse the validator either, however fast it lands.
+      const sameSize = (await open("artifacts/chart.png")).etag;
+      fs.writeFileSync(path.join(workspaceDir, "artifacts", "chart.png"), Buffer.from("different-BYTES"));
+      expect((await open("artifacts/chart.png")).etag).not.toBe(sameSize);
+      expect(bufferEtag(Buffer.from("abc"))).not.toBe(bufferEtag(Buffer.from("abd")));
+      expect(bufferEtag(Buffer.from("abc"))).toBe(bufferEtag(Buffer.from("abc")));
     } finally {
       fs.rmSync(workspaceRoot, { recursive: true, force: true });
       fs.rmSync(outsideRoot, { recursive: true, force: true });
     }
+  });
+
+  it("never emits a client-supplied MIME type that Node would reject as a header", () => {
+    // A CR/LF in the stored type throws while the response is already streaming, past Fastify's
+    // error handling, which terminates the process.
+    expect(safeContentType("text/plain\r\nX-Injected: yes")).toBe("application/octet-stream");
+    expect(safeContentType("image/png\u0000")).toBe("application/octet-stream");
+    expect(safeContentType("not-a-type")).toBe("application/octet-stream");
+    expect(safeContentType("", "image/png")).toBe("image/png");
+    expect(safeContentType(undefined)).toBe("application/octet-stream");
+    expect(safeContentType(`text/${"a".repeat(300)}`)).toBe("application/octet-stream");
+    expect(safeContentType("IMAGE/PNG")).toBe("image/png");
+    expect(safeContentType("text/plain; charset=utf-8")).toBe("text/plain");
+    expect(() => new Response("", { headers: { "Content-Type": safeContentType("text/plain\r\nX-Injected: yes") } })).not.toThrow();
+  });
+
+  it("lists only the attachments still in the model's history, and caps the list", () => {
+    const workspaceDir = "/tmp/workspace";
+    const attachments = Array.from({ length: 45 }, (_, index) => ({ name: `file-${index}.png`, filePath: `${workspaceDir}/.copilotchat/uploads/chat-1/file-${index}.png` }));
+    const context = chatFileSystemContext({ workspaceDir, attachments }) ?? "";
+    expect(context).toContain("5 older uploads omitted");
+    expect(context).not.toContain("file-4.png");
+    expect(context).toContain("file-44.png");
+    // A repeated upload keeps its newest position rather than aging out.
+    const repeated = chatFileSystemContext({ workspaceDir, attachments: [attachments[0]!, ...attachments.slice(5), attachments[0]!], limit: 3 }) ?? "";
+    expect(repeated).toContain("file-0.png");
   });
 
   it("only offers inline display to content the browser cannot execute", () => {
@@ -2136,9 +2181,9 @@ describe("chat file previews", () => {
     const context = chatFileSystemContext({
       workspaceDir,
       attachments: [
-        { id: "a1", name: "photo.jpg", mimeType: "image/jpeg", size: 4, filePath: `${workspaceDir}/.copilotchat/uploads/chat-1/abc-photo.jpg` },
-        { id: "a2", name: "outside.jpg", mimeType: "image/jpeg", size: 4, filePath: "/elsewhere/outside.jpg" },
-        { id: "a3", name: "pending.jpg", mimeType: "image/jpeg", size: 4 },
+        { name: "photo.jpg", filePath: `${workspaceDir}/.copilotchat/uploads/chat-1/abc-photo.jpg` },
+        { name: "outside.jpg", filePath: "/elsewhere/outside.jpg" },
+        { name: "pending.jpg" },
       ],
     });
     expect(context).toContain("![description](path/to/image.png)");

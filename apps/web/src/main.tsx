@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 import type { AppState, Chat, ChatMessage, ContextTier, ImportDraft, LocationLevel, McpServer, Memory, MemoryPage, MessageAttachment, PermissionMode, Project, ProjectChatReference, ProjectChatSearchResult, ProjectReference, ProviderModel, ProviderStatus, Skill, UserLocation, Workspace } from "@copilotchat/shared";
 import { formatAic } from "@copilotchat/shared";
 import { IconBell, IconCheck, IconClose, IconCopy, IconCopilot, IconDownload, IconEdit, IconFolder, IconMenu, IconMore, IconPlug, IconPlus, IconRetry, IconSearch, IconSend, IconSettings, IconSparkle, IconStar, IconStop, IconTerminal, IconUpload, IconUser } from "./icons.js";
-import { chatFileUrl, fileNameFromPath, isImageMimeType, isPreservedMarkdownUrl, messageAttachmentUrl, resolveMarkdownSource } from "./attachments.js";
+import { chatFileUrl, fileNameFromPath, isPreservedMarkdownUrl, isPreviewableImageType, messageAttachmentUrl, resolveMarkdownSource } from "./attachments.js";
 import type { MarkdownSource } from "./attachments.js";
 import { ChatStreamRegistry, pruneLocalRunningChats } from "./chat-streams.js";
 import type { LocalRunningChats } from "./chat-streams.js";
@@ -80,13 +80,14 @@ type SlashCommand = { command: string; title: string; description: string; body:
 type ComposerHandle = { focus: () => void; setValue: (value: string) => void; clear: () => void };
 type ChatScrollState = { top: number; atLive: boolean };
 type MessageProps = { message: ChatMessage; streaming?: boolean; activities?: AssistantActivity[]; editing?: boolean; editValue?: string; canEdit?: boolean; canRetry?: boolean; onEditStart?: (message: ChatMessage) => void; onEditChange?: (content: string) => void; onEditCancel?: () => void; onEditSave?: (message: ChatMessage, content: string) => void; onRetry?: (message: ChatMessage) => void };
-/** An image opened full size, addressed by a URL the browser can already load. */
-type ViewerImage = { url: string; name: string; downloadName?: string };
+/**
+ * An image opened full size. The viewer resolves its own URL from this descriptor so its blob
+ * outlives the thumbnail that opened it; holding a thumbnail's URL broke when that component
+ * unmounted (for example on a chat switch) and revoked it.
+ */
+type ViewerImage = { name: string; blob?: Blob; apiUrl?: string; directUrl?: string; downloadName?: string };
 type ChatMedia = { chatId: string | null; openImage: (image: ViewerImage) => void };
 const ChatMediaContext = React.createContext<ChatMedia>({ chatId: null, openImage: () => {} });
-/** Uploaded images the browser still holds, so a just-sent attachment previews without a round trip. */
-const ATTACHMENT_PREVIEW_LIMIT = 24;
-const attachmentPreviews = new Map<string, string>();
 const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "preferences", label: "Preferences", icon: <IconSettings width={14} height={14} /> },
   { id: "context", label: "Personal context", icon: <IconUser width={14} height={14} /> },
@@ -222,6 +223,7 @@ function App(): React.ReactElement {
   }, []);
   const compactLayoutRef = useRef(compactLayout);
   useEffect(() => { compactLayoutRef.current = compactLayout; }, [compactLayout]);
+  useEffect(() => { setViewerImage(null); }, [selectedChatId]);
   const toggleSidebar = useCallback(() => {
     if (compactLayoutRef.current) setSidebarOpen((open) => !open);
     else setSidebarCollapsed((collapsed) => !collapsed);
@@ -870,20 +872,26 @@ function MarkdownImage(props: React.ComponentPropsWithoutRef<"img"> & { node?: u
   const alt = typeof props.alt === "string" ? props.alt : "";
   const source = resolveMarkdownSource(typeof props.src === "string" ? props.src : null, media.chatId);
   if (!source) return alt ? <span className="markdown-image-missing">{alt}</span> : null;
-  if (source.kind === "direct") return <MarkdownImageFrame url={source.url} alt={alt} name={alt || fileNameFromPath(source.url)} />;
+  const name = alt || fileNameFromPath(source.kind === "direct" ? source.url : source.fileName);
+  if (source.kind === "direct") return <MarkdownImageFrame url={source.url} alt={alt} name={name} viewer={{ name, directUrl: source.url }} />;
   return <ChatFileImage source={source} alt={alt} />;
 }
 /** Loads a workspace image through the chat file endpoint, which needs the request to carry credentials. */
 function ChatFileImage(p: { source: Extract<MarkdownSource, { kind: "chat-file" }>; alt: string }) {
   const [placeholderRef, nearViewport] = useNearViewport<HTMLSpanElement>();
-  const { objectUrl, error } = useAuthedObjectUrl(nearViewport ? p.source.url : null);
-  if (error) return <ChatFileChip path={p.source.path} fileName={p.source.fileName} label={p.alt || p.source.fileName} unavailable />;
+  const { blob, error } = useAuthedImageBlob(nearViewport ? p.source.url : null);
+  const objectUrl = useObjectUrl(blob);
+  const [decodeFailed, setDecodeFailed] = useState(false);
+  useEffect(() => { setDecodeFailed(false); }, [objectUrl]);
+  const name = p.alt || p.source.fileName;
+  // Anything that is not a decodable inline image still reaches the user as a download.
+  if (error || decodeFailed) return <ChatFileChip path={p.source.path} fileName={p.source.fileName} label={name} unavailable />;
   if (!objectUrl) return <span ref={placeholderRef} className="markdown-image-loading" role="status" aria-label={`Loading ${p.source.fileName}`} />;
-  return <MarkdownImageFrame url={objectUrl} alt={p.alt} name={p.alt || p.source.fileName} downloadName={p.source.fileName} />;
+  return <MarkdownImageFrame url={objectUrl} alt={p.alt} name={name} viewer={{ name, blob: blob ?? undefined, downloadName: p.source.fileName }} onError={() => setDecodeFailed(true)} />;
 }
-function MarkdownImageFrame(p: { url: string; alt: string; name: string; downloadName?: string }) {
+function MarkdownImageFrame(p: { url: string; alt: string; name: string; viewer: ViewerImage; onError?: () => void }) {
   const media = React.useContext(ChatMediaContext);
-  return <button type="button" className="markdown-image" aria-label={`Open ${p.name} full size`} title={p.name} onClick={() => media.openImage({ url: p.url, name: p.name, downloadName: p.downloadName })}><img src={p.url} alt={p.alt} loading="lazy" /></button>;
+  return <button type="button" className="markdown-image" aria-label={`Open ${p.name} full size`} title={p.name} onClick={() => media.openImage(p.viewer)}><img src={p.url} alt={p.alt} loading="lazy" onError={p.onError} /></button>;
 }
 /** A chat file the user can download, also used when an image referenced by the agent cannot be read. */
 function ChatFileChip(p: { path: string; fileName: string; label: string; unavailable?: boolean }) {
@@ -902,12 +910,35 @@ function ChatFileChip(p: { path: string; fileName: string; label: string; unavai
   </button>;
 }
 function ImageViewer(p: { image: ViewerImage; onClose: () => void }) {
-  const onClose = p.onClose;
-  useEffect(() => { const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); }; window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [onClose]);
-  return <><div className="modal-scrim" onClick={onClose} /><section className="image-viewer" role="dialog" aria-modal="true" aria-label={p.image.name}>
-    <div className="image-viewer-head"><strong>{p.image.name}</strong><span className="image-viewer-actions"><a className="icon-button" href={p.image.url} download={p.image.downloadName ?? p.image.name} aria-label="Download image" title="Download"><IconDownload/></a><button className="icon-button" aria-label="Close image" onClick={onClose}><IconClose/></button></span></div>
-    <img src={p.image.url} alt={p.image.name} />
+  const dialogRef = useModalDialog<HTMLElement>(true, p.onClose);
+  const fetched = useAuthedImageBlob(p.image.blob ? null : p.image.apiUrl ?? null);
+  const ownUrl = useObjectUrl(p.image.blob ?? fetched.blob);
+  const [error, setError] = useState<string | null>(null);
+  const src = ownUrl ?? p.image.directUrl ?? null;
+  async function download(): Promise<void> {
+    setError(null);
+    try {
+      if (p.image.apiUrl) { await downloadApiFile(withDownloadFlag(p.image.apiUrl), p.image.downloadName ?? p.image.name); return; }
+      if (ownUrl) { saveObjectUrl(ownUrl, p.image.downloadName ?? p.image.name); return; }
+      // A cross-origin image cannot be saved with a download attribute, so it opens instead.
+      if (p.image.directUrl) window.open(p.image.directUrl, "_blank", "noopener,noreferrer");
+    } catch (e) { setError(toErr(e)); }
+  }
+  const downloadable = Boolean(p.image.apiUrl || ownUrl);
+  return <><div className="modal-scrim" onClick={p.onClose} /><section className="image-viewer" role="dialog" aria-modal="true" aria-label={p.image.name} ref={dialogRef}>
+    <div className="image-viewer-head"><strong>{p.image.name}</strong><span className="image-viewer-actions">{error ? <small className="image-viewer-error">{error}</small> : null}<button className="icon-button" aria-label={downloadable ? "Download image" : "Open image in a new tab"} title={downloadable ? "Download" : "Open in a new tab"} onClick={() => void download()}><IconDownload/></button><button className="icon-button" data-autofocus aria-label="Close image" onClick={p.onClose}><IconClose/></button></span></div>
+    {src ? <img src={src} alt={p.image.name} /> : <span className="markdown-image-loading" role="status" aria-label={`Loading ${p.image.name}`} />}
   </section></>;
+}
+function withDownloadFlag(url: string): string { return `${url}${url.includes("?") ? "&" : "?"}download=1`; }
+function saveObjectUrl(objectUrl: string, fileName: string): void {
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  anchor.rel = "noopener";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
 }
 function CodeBlock(p: { children?: React.ReactNode }) { const code = textFromNode(p.children).replace(/\n$/, ""); return <div className="code-block"><button type="button" className="code-copy" aria-label="Copy code block" title="Copy code" onClick={() => void copyText(code)}><IconCopy width={15}/></button><pre>{p.children}</pre></div>; }
 type MarkdownTaskPart = { kind: "markdown"; content: string } | { kind: "tasks"; items: TaskListItem[] };
@@ -1097,6 +1128,9 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<MessageAttachment[]>([]);
+  // Staged files stay here so their previews render before the message exists on the server, and
+  // they are released as soon as the composer clears rather than lingering in a global cache.
+  const [previews, setPreviews] = useState<Record<string, File>>({});
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [pendingUploads, setPendingUploads] = useState(0);
   const [uploadProgress, setUploadProgress] = useState<{ files: number; uploaded: number; total: number } | null>(null);
@@ -1111,7 +1145,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
   const showSlashCommands = slashQuery !== null && slashMatches.length > 0;
   useEffect(() => resizeComposerTextarea(textareaRef.current), [value]);
   useEffect(() => { const id = window.setTimeout(() => p.onDraftPreviewChange(value), 140); return () => window.clearTimeout(id); }, [p, value]);
-  React.useImperativeHandle(ref, () => ({ focus: () => textareaRef.current?.focus(), setValue: (next) => { setValue(next); p.onDraftPreviewChange(next); }, clear: () => { setValue(""); setAttachments([]); setAttachmentError(null); p.onDraftPreviewChange(""); } }), [p]);
+  React.useImperativeHandle(ref, () => ({ focus: () => textareaRef.current?.focus(), setValue: (next) => { setValue(next); p.onDraftPreviewChange(next); }, clear: () => { setValue(""); setAttachments([]); setPreviews({}); setAttachmentError(null); p.onDraftPreviewChange(""); } }), [p]);
   useEffect(() => { setSlashIndex(0); }, [slashQuery, slashMatches.length]);
   function setTextareaRef(node: HTMLTextAreaElement | null): void { textareaRef.current = node; }
   function choosePermissionMode(mode: PermissionMode): void { p.setPermissionMode(mode); setOpenPicker(null); }
@@ -1121,7 +1155,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
   function toggleSkill(id: string): void { p.onSelectSkills(p.selectedSkillIds.includes(id) ? p.selectedSkillIds.filter((skillId) => skillId !== id) : [...p.selectedSkillIds, id]); }
   function openNestedPicker(next: ComposerPicker): void { setOpenPicker(next); }
   function updateValue(next: string): void { setValue(next); }
-  function clearValue(): void { setValue(""); setAttachments([]); setAttachmentError(null); p.onDraftPreviewChange(""); }
+  function clearValue(): void { setValue(""); setAttachments([]); setPreviews({}); setAttachmentError(null); p.onDraftPreviewChange(""); }
   async function discardValue(): Promise<void> { const discarded = attachments; clearValue(); const results = await Promise.allSettled(discarded.map(p.onDiscardAttachment)); const failed = results.filter((result) => result.status === "rejected"); if (failed.length > 0) setAttachmentError(`${failed.length} attachment${failed.length === 1 ? "" : "s"} could not be discarded.`); }
   async function addFiles(files: FileList | File[]): Promise<void> {
     setAttachmentError(null);
@@ -1137,9 +1171,12 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
         batch.uploadedByFile.set(index, bytes);
         setUploadProgress(totalUploadProgress(uploadBatchesRef.current));
       })));
-      const uploaded = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+      const uploaded = results.flatMap((result, index) => result.status === "fulfilled" ? [[result.value, nextFiles[index]!] as const] : []);
       const failed = results.flatMap((result) => result.status === "rejected" ? [toErr(result.reason)] : []);
-      if (uploaded.length > 0) setAttachments((current) => [...current, ...uploaded]);
+      if (uploaded.length > 0) {
+        setAttachments((current) => [...current, ...uploaded.map(([attachment]) => attachment)]);
+        setPreviews((current) => ({ ...current, ...Object.fromEntries(uploaded.filter(([, file]) => isPreviewableImageType(file.type)).map(([attachment, file]) => [attachment.id, file])) }));
+      }
       if (failed.length > 0) setAttachmentError(failed.length === 1 ? failed[0]! : `${failed.length} files failed to upload. ${failed[0]}`);
     } finally {
       uploadBatchesRef.current.delete(batch);
@@ -1147,7 +1184,7 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
       setPendingUploads((current) => Math.max(0, current - nextFiles.length));
     }
   }
-  function removeAttachment(id: string): void { const attachment = attachments.find((item) => item.id === id); setAttachments((current) => current.filter((item) => item.id !== id)); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); }
+  function removeAttachment(id: string): void { const attachment = attachments.find((item) => item.id === id); setAttachments((current) => current.filter((item) => item.id !== id)); setPreviews((current) => { const next = { ...current }; delete next[id]; return next; }); if (attachment) void p.onDiscardAttachment(attachment).catch((error) => setAttachmentError(toErr(error))); }
   function paste(e: React.ClipboardEvent<HTMLTextAreaElement>): void {
     const files = [...e.clipboardData.files];
     if (files.length === 0) return;
@@ -1168,24 +1205,32 @@ const Composer = React.forwardRef<ComposerHandle, { busy: boolean; compact: bool
   async function submit(action: (content: string, attachments: MessageAttachment[], onAccepted: () => void) => Promise<void>): Promise<void> { const content = value.trim(); if (submitting || pendingUploads > 0 || (!content && attachments.length === 0)) return; const submittedAttachments = attachments; setSubmitting(true); setAttachmentError(null); let accepted = false; const onAccepted = () => { if (accepted) return; accepted = true; clearValue(); setSubmitting(false); }; try { await action(content, submittedAttachments, onAccepted); } catch (error) { setAttachmentError(toErr(error)); } finally { setSubmitting(false); } }
   function submitSteer(): void { void submit(p.onSteer); }
   function submitMessage(): void { void submit(p.onSubmit); }
-  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{uploadProgress ? <p className="attachment-progress" role="status">{`Uploading ${uploadProgress.files === 1 ? "1 file" : `${uploadProgress.files} files`}… ${formatBytes(uploadProgress.uploaded)} of ${formatBytes(uploadProgress.total)}`}</p> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? (p.compact ? "Steer or queue" : "Steer or queue a follow-up") : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
+  return <div className="composer-shell"><form className="composer" onSubmit={(e) => { e.preventDefault(); void submitMessage(); }}>{showSlashCommands ? <div className="slash-command-menu" role="listbox" aria-label="Slash commands">{slashMatches.map((command, index) => <button key={command.command} type="button" role="option" aria-selected={index === slashIndex} className={`slash-command-option${index === slashIndex ? " selected":""}`} onMouseEnter={() => setSlashIndex(index)} onClick={() => chooseSlash(command)}><span className="slash-command-name">/{command.command}</span><span className="slash-command-copy"><strong>{command.title}</strong><small>{command.description}</small></span></button>)}</div> : null}{attachments.length > 0 ? <AttachmentTray attachments={attachments} previews={previews} onRemove={removeAttachment} removeDisabled={submitting} /> : null}{uploadProgress ? <p className="attachment-progress" role="status">{`Uploading ${uploadProgress.files === 1 ? "1 file" : `${uploadProgress.files} files`}… ${formatBytes(uploadProgress.uploaded)} of ${formatBytes(uploadProgress.total)}`}</p> : null}{attachmentError ? <p className="attachment-error">{attachmentError}</p> : null}  <div ref={pickerRef} className="composer-input-row"><input ref={fileInputRef} type="file" multiple aria-label="Attach files" disabled={submitting} style={{display:"none"}} onChange={(e)=>{const files=e.currentTarget.files;if(files)void addFiles(files);e.currentTarget.value="";}}/><button type="button" aria-label="Open composer options" title="Add context or attachments" aria-expanded={openPicker === "menu"} className="composer-plus-button" disabled={submitting} onClick={() => togglePicker("menu")}><IconPlus width={16}/></button>{p.project ? <button type="button" className="composer-active-chip" aria-label={`Project: ${p.project.name}`} title={p.project.name} disabled={submitting} onClick={() => togglePicker("project")}><IconFolder width={15}/></button> : null}{p.permissionMode === "yolo" ? <button type="button" className="composer-active-chip danger" aria-label="Tool auto-approval is on" title="Tool auto-approval is on" disabled={submitting} onClick={() => togglePicker("permissions")}><IconPlug width={15}/></button> : null}<textarea ref={setTextareaRef} aria-label={p.busy ? "Steer or queue a follow-up" : "Message composer"} value={value} placeholder={p.busy ? (p.compact ? "Steer or queue" : "Steer or queue a follow-up") : "Ask CopilotChat"} rows={1} disabled={submitting} onChange={(e) => { updateValue(e.target.value); resizeComposerTextarea(e.currentTarget); }} onKeyDown={keyDown} onPaste={paste}/>{p.busy ? <div className="composer-running-actions"><RunningActionButton label="Steer response" tooltip="Send this text and any attachments into the response that is currently running." icon={<IconSend width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitSteer} /><RunningActionButton label="Queue message" tooltip="Run this text and any attachments as the next user message after the current response finishes." icon={<IconPlus width={15}/>} disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)} onClick={submitMessage} /><RunningActionButton label="Stop" tooltip="Stop the current response." icon={<IconStop width={15}/>} variant="danger" onClick={p.onStop} /></div> : <button type="submit" aria-label="Send" title="Send" className="composer-send" disabled={submitting || pendingUploads > 0 || (!value.trim() && attachments.length === 0)}><IconSend/></button>}{openPicker ? <div id={openPicker === "permissions" ? "composer-permissions" : undefined} className={`composer-popover ${openPicker}-popover`} role="dialog" aria-label={composerPickerTitle(openPicker)}><ComposerPickerContent picker={openPicker} busy={p.busy} projects={p.projects} activeProjectId={p.project?.id ?? null} workspaces={p.workspaces} activeWorkspaceId={p.workspace?.id ?? null} skills={p.skills} selectedSkillIds={p.selectedSkillIds} permissionMode={p.permissionMode} selectedSkillCount={p.selectedSkills.length} activeProjectName={p.project?.name ?? null} activeWorkspaceName={p.workspace?.name ?? null} onAttach={() => { fileInputRef.current?.click(); setOpenPicker(null); }} onOpenPicker={openNestedPicker} onSelectProject={chooseProject} onSelectWorkspace={chooseWorkspace} onToggleSkill={toggleSkill} onPermissionMode={choosePermissionMode} onManage={(tab) => { setOpenPicker(null); p.onOpenTab(tab); }} /></div> : null}</div></form></div>;
 });
-function AttachmentTray(p: { attachments: MessageAttachment[]; message?: ChatMessage; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => <AttachmentChip key={attachment.id} attachment={attachment} message={p.message} onRemove={p.onRemove} removeDisabled={p.removeDisabled} />)}</div>; }
-function AttachmentChip(p: { attachment: MessageAttachment; message?: ChatMessage; onRemove?: (id: string) => void; removeDisabled?: boolean }) {
+function AttachmentTray(p: { attachments: MessageAttachment[]; message?: ChatMessage; previews?: Record<string, File>; onRemove?: (id: string) => void; removeDisabled?: boolean }) { return <div className="attachment-tray" aria-label="Attached files">{p.attachments.map((attachment) => <AttachmentChip key={attachment.id} attachment={attachment} message={p.message} preview={p.previews?.[attachment.id]} onRemove={p.onRemove} removeDisabled={p.removeDisabled} />)}</div>; }
+function AttachmentChip(p: { attachment: MessageAttachment; message?: ChatMessage; preview?: File; onRemove?: (id: string) => void; removeDisabled?: boolean }) {
   const media = React.useContext(ChatMediaContext);
   const [chipRef, nearViewport] = useNearViewport<HTMLDivElement>();
-  const isImage = isImageMimeType(p.attachment.mimeType);
-  const localPreview = attachmentPreviews.get(p.attachment.id) ?? null;
+  // SVG and other active formats are never turned into a same-origin blob, only downloaded.
+  const isImage = isPreviewableImageType(p.attachment.mimeType);
+  const localPreview = isImage && p.preview ? p.preview : null;
   const message = isStoredMessage(p.message) ? p.message : null;
-  const stored = useAuthedObjectUrl(isImage && !localPreview && message && nearViewport ? messageAttachmentUrl(message.chatId, message.id, p.attachment.id) : null);
-  const previewUrl = localPreview ?? stored.objectUrl;
-  const downloadUrl = message ? messageAttachmentUrl(message.chatId, message.id, p.attachment.id, { download: true }) : null;
+  const apiUrl = message ? messageAttachmentUrl(message.chatId, message.id, p.attachment.id) : null;
+  const stored = useAuthedImageBlob(isImage && !localPreview && apiUrl && nearViewport ? apiUrl : null);
+  const previewBlob = localPreview ?? stored.blob;
+  const previewUrl = useObjectUrl(previewBlob);
+  const [error, setError] = useState<string | null>(null);
+  async function download(): Promise<void> {
+    if (!apiUrl) return;
+    setError(null);
+    try { await downloadApiFile(withDownloadFlag(apiUrl), p.attachment.name); } catch (e) { setError(toErr(e)); }
+  }
   return <div ref={chipRef} className={`attachment-chip${isImage ? " image" : ""}`}>
     {previewUrl
-      ? <button type="button" className="attachment-thumb" aria-label={`Open ${p.attachment.name}`} onClick={() => media.openImage({ url: previewUrl, name: p.attachment.name })}><img alt="" src={previewUrl} /></button>
-      : <span className={`attachment-file-icon${isImage && !stored.error ? " loading" : ""}`}><IconUpload width={15}/></span>}
-    <span className="attachment-copy"><strong>{p.attachment.name}</strong><small>{p.attachment.mimeType} · {formatBytes(p.attachment.size)}</small></span>
-    {downloadUrl ? <button type="button" aria-label={`Download ${p.attachment.name}`} title="Download" onClick={() => void downloadApiFile(downloadUrl, p.attachment.name)}><IconDownload width={14}/></button> : null}
+      ? <button type="button" className="attachment-thumb" aria-label={`Open ${p.attachment.name}`} onClick={() => media.openImage({ name: p.attachment.name, blob: previewBlob ?? undefined, apiUrl: apiUrl ?? undefined })}><img alt="" src={previewUrl} /></button>
+      : <span className={`attachment-file-icon${isImage && stored.loading ? " loading" : ""}`}><IconUpload width={15}/></span>}
+    <span className="attachment-copy"><strong>{p.attachment.name}</strong><small>{error ?? `${p.attachment.mimeType} · ${formatBytes(p.attachment.size)}`}</small></span>
+    {apiUrl ? <button type="button" aria-label={`Download ${p.attachment.name}`} title="Download" onClick={() => void download()}><IconDownload width={14}/></button> : null}
     {p.onRemove ? <button type="button" aria-label={`Remove ${p.attachment.name}`} disabled={p.removeDisabled} onClick={() => p.onRemove?.(p.attachment.id)}><IconClose width={14}/></button> : null}
   </div>;
 }
@@ -1487,13 +1532,7 @@ async function apiBlob(url: string, signal?: AbortSignal, token = localStorage.g
 }
 async function downloadApiFile(url: string, fileName: string): Promise<void> {
   const objectUrl = URL.createObjectURL(await apiBlob(url));
-  const anchor = document.createElement("a");
-  anchor.href = objectUrl;
-  anchor.download = fileName;
-  anchor.rel = "noopener";
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
+  saveObjectUrl(objectUrl, fileName);
   window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
 }
 /** Defers a preview fetch until its placeholder is close to the viewport, so a long chat does not download every image at once. */
@@ -1509,24 +1548,51 @@ function useNearViewport<T extends HTMLElement>(): [React.RefObject<T | null>, b
   }, [near]);
   return [ref, near];
 }
-/** Loads a protected file into an object URL that image tags and download links can use. */
-function useAuthedObjectUrl(url: string | null): { objectUrl: string | null; error: string | null; loading: boolean } {
-  const [state, setState] = useState<{ objectUrl: string | null; error: string | null; loading: boolean }>({ objectUrl: null, error: null, loading: Boolean(url) });
+/** Largest response the app will turn into an inline preview, so a huge workspace file is never pulled down to render. */
+const PREVIEW_MAX_BYTES = 32 * 1024 * 1024;
+/**
+ * Fetches a chat image for preview. The response type is checked before the body is read so a
+ * non-image (or an SVG, which would become a scriptable same-origin blob) is rejected without
+ * downloading it, and the declared length bounds what a preview may cost.
+ */
+async function fetchPreviewBlob(url: string, signal: AbortSignal, token = localStorage.getItem(API_TOKEN_KEY) ?? ""): Promise<Blob> {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(url, { headers: Object.keys(headers).length ? headers : undefined, signal });
+  if (!response.ok) throw new Error(httpErrorMessage(response.status, await response.text()));
+  if (!isPreviewableImageType(response.headers.get("content-type"))) { void response.body?.cancel(); throw new Error("This file cannot be shown inline."); }
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > PREVIEW_MAX_BYTES) { void response.body?.cancel(); throw new Error("This image is too large to preview."); }
+  const blob = await response.blob();
+  if (blob.size > PREVIEW_MAX_BYTES || !isPreviewableImageType(blob.type)) throw new Error("This image is too large to preview.");
+  return blob;
+}
+/** Creates an object URL for a blob this component owns, revoking it when the blob or component goes away. */
+function useObjectUrl(blob: Blob | null | undefined): string | null {
+  const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
-    if (!url) { setState({ objectUrl: null, error: null, loading: false }); return; }
+    if (!blob) { setUrl(null); return; }
+    const objectUrl = URL.createObjectURL(blob);
+    setUrl(objectUrl);
+    return () => { URL.revokeObjectURL(objectUrl); setUrl(null); };
+  }, [blob]);
+  return url;
+}
+/** Loads a protected image into a blob this component owns, so no other component can revoke it. */
+function useAuthedImageBlob(url: string | null): { blob: Blob | null; error: string | null; loading: boolean } {
+  const [state, setState] = useState<{ blob: Blob | null; error: string | null; loading: boolean }>({ blob: null, error: null, loading: Boolean(url) });
+  useEffect(() => {
+    if (!url) { setState({ blob: null, error: null, loading: false }); return; }
     let active = true;
-    let objectUrl: string | null = null;
     const controller = new AbortController();
-    setState({ objectUrl: null, error: null, loading: true });
-    void apiBlob(url, controller.signal).then((blob) => {
-      if (!active) return;
-      objectUrl = URL.createObjectURL(blob);
-      setState({ objectUrl, error: null, loading: false });
+    setState({ blob: null, error: null, loading: true });
+    void fetchPreviewBlob(url, controller.signal).then((blob) => {
+      if (active) setState({ blob, error: null, loading: false });
     }).catch((error: unknown) => {
       if (!active || (error as Error).name === "AbortError") return;
-      setState({ objectUrl: null, error: toErr(error), loading: false });
+      setState({ blob: null, error: toErr(error), loading: false });
     });
-    return () => { active = false; controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+    return () => { active = false; controller.abort(); };
   }, [url]);
   return state;
 }
@@ -1552,26 +1618,7 @@ function writeSeenChatUpdates(value: Record<string, string>): Record<string, str
 async function registerServiceWorker(){if("serviceWorker" in navigator)try{await navigator.serviceWorker.register("/sw.js");}catch{return;}}
 function notify(title:string,body:string){if(typeof Notification==="undefined"||Notification.permission!=="granted"||document.visibilityState!=="hidden")return;if(navigator.serviceWorker.controller)navigator.serviceWorker.controller.postMessage({type:"notify",title,body});else new Notification(title,{body});}
 async function uploadFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
-  const attachment = file.size > SINGLE_REQUEST_UPLOAD_LIMIT ? await uploadFileInChunks(file, token, onProgress) : await uploadWholeFile(file, token, onProgress);
-  rememberAttachmentPreview(attachment.id, file);
-  return attachment;
-}
-/** Holds an image the user just picked so its preview shows before, during, and right after sending. */
-function rememberAttachmentPreview(attachmentId: string, file: File): void {
-  if (!isImageMimeType(file.type)) return;
-  forgetAttachmentPreview(attachmentId);
-  attachmentPreviews.set(attachmentId, URL.createObjectURL(file));
-  while (attachmentPreviews.size > ATTACHMENT_PREVIEW_LIMIT) {
-    const oldest = attachmentPreviews.keys().next().value;
-    if (typeof oldest !== "string") break;
-    forgetAttachmentPreview(oldest);
-  }
-}
-function forgetAttachmentPreview(attachmentId: string): void {
-  const url = attachmentPreviews.get(attachmentId);
-  if (!url) return;
-  URL.revokeObjectURL(url);
-  attachmentPreviews.delete(attachmentId);
+  return file.size > SINGLE_REQUEST_UPLOAD_LIMIT ? await uploadFileInChunks(file, token, onProgress) : await uploadWholeFile(file, token, onProgress);
 }
 async function uploadWholeFile(file: File, token: string, onProgress?: (bytes: number) => void): Promise<MessageAttachment> {
   const query = new URLSearchParams({ fileName: file.name || "Pasted image", mimeType: file.type || "application/octet-stream", size: String(file.size) });
@@ -1666,7 +1713,6 @@ function uploadErrorMessage(status: number, body: string, file: File): string {
   return serverErrorText(body) ?? `${file.name || "That file"} is too large to upload at ${formatBytes(file.size)}. Raise the upload size limit on CopilotChat or on the reverse proxy in front of it, such as the nginx client_max_body_size setting.`;
 }
 async function discardUploadedFile(attachment: MessageAttachment, token: string): Promise<void> {
-  forgetAttachmentPreview(attachment.id);
   if (!attachment.uploadId) return;
   await api<void>(`/api/uploads/${encodeURIComponent(attachment.uploadId)}`, { method: "DELETE", raw: true }, token);
 }

@@ -228,7 +228,7 @@ CopilotChat uses a hybrid of tonal layering and ambient elevation. Flat surfaces
 - **Style:** Floating absolute overlay, 24px shell radius, sheet surface, ambient lift, and a gradient fade to the page background.
 - **Controls:** Send, stop, permission, attachment, and active context controls share the pill vocabulary.
 - **Behavior:** Attachment trays add rows only when files exist; default composition stays one row.
-- **Media:** Image attachments show a rounded thumbnail that opens a full-size viewer; other files keep the icon chip with a download action. Markdown images and links that point at workspace files render the same way inside messages.
+- **Media:** Raster image attachments show a rounded thumbnail that opens a full-size viewer; every other file, including SVG, keeps the icon chip with a download action. Markdown images and links that point at workspace files render the same way inside messages, and previews load only once they approach the viewport.
 
 ### Activity and Interaction Cards
 - **Style:** Tool activity is compact and collapsible with tonal surfaces; permission and interaction cards float above the composer.
