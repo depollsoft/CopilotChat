@@ -21,6 +21,6 @@
   },
   "dependencies": {
     "@copilotchat/shared": "workspace:*",
-    "@github/copilot-sdk": "1.0.9"
+    "@github/copilot-sdk": "1.0.11"
   }
 }
