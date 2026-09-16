@@ -325,6 +325,76 @@ test("mobile Return inserts a composer newline", async ({ page }, testInfo) => {
   await expect(page.locator(".msg.user").filter({ hasText: "First line" })).toHaveCount(0);
 });
 
+test("new chat closes the sidebar and focuses the composer", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile sidebar + composer focus coverage only runs in mobile project.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await page.getByRole("button", { name: /Show sidebar|Toggle sidebar|Hide sidebar/i }).click();
+  await expect(page.locator(".sidebar.open")).toBeVisible();
+  await page.locator(".sidebar-new").click();
+  await expect(page.locator(".sidebar.open")).toHaveCount(0);
+  await expect(page.getByPlaceholder(/Ask CopilotChat/)).toBeFocused();
+});
+
+test("mobile keyboard keeps the header on screen", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile", "Mobile keyboard layout coverage only runs in mobile project.");
+  await page.goto("/");
+  await expect(page.getByText(/Back at it|running on your machine/i)).toBeVisible();
+  await page.getByPlaceholder(/Ask CopilotChat/).click();
+  // Simulate a keyboard that shrinks only the visual viewport (layout viewport stays tall).
+  await page.evaluate(() => {
+    const height = 420;
+    const offsetTop = 160;
+    const mockViewport = {
+      width: window.innerWidth,
+      height,
+      offsetTop,
+      offsetLeft: 0,
+      scale: 1,
+      pageTop: offsetTop,
+      pageLeft: 0,
+      addEventListener() {},
+      removeEventListener() {},
+      dispatchEvent() { return true; },
+    };
+    Object.defineProperty(window, "visualViewport", { configurable: true, value: mockViewport });
+    window.dispatchEvent(new Event("resize"));
+  });
+  await expect.poll(async () => page.evaluate(() => {
+    const root = document.documentElement;
+    return {
+      height: root.style.getPropertyValue("--app-height").trim(),
+      offsetTop: root.style.getPropertyValue("--app-offset-top").trim(),
+    };
+  })).toEqual({ height: "420px", offsetTop: "160px" });
+  const metrics = await page.evaluate(() => {
+    const header = document.querySelector(".header");
+    const composer = document.querySelector(".composer-shell");
+    const app = document.querySelector(".app");
+    if (!(header instanceof HTMLElement) || !(composer instanceof HTMLElement) || !(app instanceof HTMLElement)) return null;
+    const headerRect = header.getBoundingClientRect();
+    const composerRect = composer.getBoundingClientRect();
+    const appRect = app.getBoundingClientRect();
+    return {
+      headerTop: headerRect.top,
+      headerBottom: headerRect.bottom,
+      composerBottom: composerRect.bottom,
+      appTop: appRect.top,
+      appHeight: appRect.height,
+      appBottom: appRect.bottom,
+      innerHeight: window.innerHeight,
+    };
+  });
+  expect(metrics).not.toBeNull();
+  expect(metrics!.innerHeight).toBeGreaterThan(420);
+  expect(metrics!.appTop).toBeCloseTo(160, 0);
+  expect(metrics!.appHeight).toBeCloseTo(420, 0);
+  expect(metrics!.headerTop).toBeGreaterThanOrEqual(160);
+  expect(metrics!.headerTop).toBeLessThanOrEqual(168);
+  expect(metrics!.composerBottom).toBeLessThanOrEqual(metrics!.appBottom + 1);
+  expect(metrics!.headerBottom).toBeLessThan(metrics!.composerBottom);
+});
+
 test("project navigation shows editable context and project chats", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop", "Desktop covers project landing page.");
   await page.goto("/");
